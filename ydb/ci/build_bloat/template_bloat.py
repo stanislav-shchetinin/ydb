@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 
-THRESHHOLD_TO_SHOW_ON_TREE_VIEW = 1024*10 
+THRESHHOLD_TO_SHOW_ON_TREE_VIEW = 0 
 
 class Walker:
     def __init__(self):
