@@ -38,6 +38,48 @@ TReadActor
             ...
 */
 
+class TReadActor : public NActors::TActorBootstrapped<TReadActor> {
+    NActors::TActorId WriteActor;
+    int64_t Requests = 0;
+    bool Readable = true;
+    std::istream& Stream;
+
+public:
+    TReadActor(NActors::TActorId target, std::istream& strm)
+        : WriteActor(target)
+        , Stream(strm)
+    {}
+
+    void Bootstrap(){
+        Become(&TThis::StateProgress);
+        Send(SelfId(), new NActors::TEvents::TEvWakeup());
+    }
+
+    STRICT_STFUNC(StateProgress,
+        hFunc(NActors::TEvents::TEvWakeup, Handle);
+        hFunc(TEvents::TEvDone, Handle);
+    )
+
+    void Handle(TEvents::TEvDone::TPtr&){
+        Requests--;
+        if (!Requests && !Readable){
+            Send(WriteActor, new NActors::TEvents::TEvPoisonPill());
+            PassAway();
+        }
+    }
+
+    void Handle(NActors::TEvents::TEvWakeup::TPtr&){
+        int64_t value;
+        if (Stream >> value){
+            Register(CreateMaximumPrimeDevisorActor(SelfId(), WriteActor, value));
+            Requests++;
+            Send(SelfId(), new NActors::TEvents::TEvWakeup());
+        } else {
+            Readable = false;
+        }
+    }
+};
+
 // TODO: напишите реализацию TReadActor
 
 /*
@@ -70,6 +112,65 @@ TMaximumPrimeDevisorActor
 
 // TODO: напишите реализацию TMaximumPrimeDevisorActor
 
+class TMaximumPrimeDevisorActor : public NActors::TActorBootstrapped<TMaximumPrimeDevisorActor> {
+    NActors::TActorId ReadActor;
+    NActors::TActorId WriteActor;
+    int64_t Number;
+
+public:
+    TMaximumPrimeDevisorActor(const NActors::TActorId& readActor, NActors::TActorId writeTarget, int64_t number)
+        : ReadActor(readActor)
+        , WriteActor(writeTarget)
+        , Number(number)
+    {}
+
+    STRICT_STFUNC(StateCalculation,
+        hFunc(NActors::TEvents::TEvWakeup, Handle);
+    )
+
+    void Bootstrap(){
+        Become(&TThis::StateCalculation);
+        Send(SelfId(), new NActors::TEvents::TEvWakeup());
+    }
+
+    void Handle(NActors::TEvents::TEvWakeup::TPtr&){
+        auto end = TInstant::Now() + TDuration::MilliSeconds(10);
+        int64_t currentNumber = 2;
+        int64_t maxPrime = 1;
+
+        while(TInstant::Now() < end && currentNumber <= Number){
+            if (Number % currentNumber == 0 && IsPrime(currentNumber)) {
+                maxPrime = currentNumber;
+            }
+            currentNumber++;
+        }
+
+        if (currentNumber <= Number) {
+            Send(SelfId(), new NActors::TEvents::TEvWakeup());
+            return;
+        }
+
+        Send(WriteActor, new TEvents::TEvWriteValueRequest(maxPrime));
+        Send(ReadActor, new TEvents::TEvDone());
+        PassAway();
+    }
+
+private:
+    bool IsPrime(int64_t number) {
+        if (number <= 1) {
+            return false;
+        }
+
+        for (int64_t i = 2; i * i <= number; ++i) {
+            if (number % i == 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+};
+
 /*
 Требования к TWriteActor:
 1. Рекомендуется отнаследовать этот актор от NActors::TActor
@@ -88,6 +189,31 @@ TWriteActor
 */
 
 // TODO: напишите реализацию TWriteActor
+
+class TWriteActor : public NActors::TActor<TWriteActor> {
+    int64_t Sum = 0;
+
+public:
+    TWriteActor()
+        : TActor(&TThis::StateProgress)
+    {}
+
+    STRICT_STFUNC(StateProgress,
+        hFunc(TEvents::TEvWriteValueRequest, Handle);
+        hFunc(NActors::TEvents::TEvPoisonPill, Handle);
+    )
+
+    void Handle(TEvents::TEvWriteValueRequest::TPtr& ev){
+        Sum += ev->Get()->Value;
+    }
+
+    void Handle(NActors::TEvents::TEvPoisonPill::TPtr&){
+        Cout << Sum << Endl;
+        ShouldContinue->ShouldStop(0);
+        PassAway();
+    }
+
+};
 
 class TSelfPingActor : public NActors::TActorBootstrapped<TSelfPingActor> {
     TDuration Latency;
@@ -116,6 +242,18 @@ public:
         Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
     }
 };
+
+NActors::IActor* CreateReadActor(NActors::TActorId writer, std::istream& strm){
+    return new TReadActor(writer, strm);
+}
+
+NActors::IActor* CreateMaximumPrimeDevisorActor(const NActors::TActorId& reader, const NActors::TActorId& writer, int64_t value){
+    return new TMaximumPrimeDevisorActor(reader, writer, value);
+}
+
+NActors::IActor* CreateWriteActor(){
+    return new TWriteActor();
+}
 
 THolder<NActors::IActor> CreateSelfPingActor(const TDuration& latency) {
     return MakeHolder<TSelfPingActor>(latency);

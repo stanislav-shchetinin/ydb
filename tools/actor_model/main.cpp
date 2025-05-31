@@ -2,6 +2,7 @@
 #include <library/cpp/actors/core/executor_pool_basic.h>
 #include <library/cpp/actors/core/scheduler_basic.h>
 #include <util/generic/xrange.h>
+#include <util/system/compiler.h>
 
 THolder<NActors::TActorSystemSetup> BuildActorSystemSetup(ui32 threads, ui32 pools) {
     auto setup = MakeHolder<NActors::TActorSystemSetup>();
@@ -24,13 +25,16 @@ int main(int argc, const char* argv[])
     actorSystem.Register(CreateSelfPingActor(TDuration::Seconds(1)).Release());
 
     // Зарегистрируйте Write и Read акторы здесь
+    auto writer = actorSystem.Register(CreateWriteActor());
+    auto reader = actorSystem.Register(CreateReadActor(writer, std::cin));
+    Y_UNUSED(reader);
 
     // Раскомментируйте этот код
-    // auto shouldContinue = GetProgramShouldContinue();
-    // while (shouldContinue->PollState() == TProgramShouldContinue::Continue) {
-    //     Sleep(TDuration::MilliSeconds(200));
-    // }
+    auto shouldContinue = GetProgramShouldContinue();
+    while (shouldContinue->PollState() == TProgramShouldContinue::Continue) {
+        Sleep(TDuration::MilliSeconds(200));
+    }
     actorSystem.Stop();
     actorSystem.Cleanup();
-    // return shouldContinue->GetReturnCode();
+    return shouldContinue->GetReturnCode();
 }
