@@ -243,7 +243,7 @@ public:
     }
 };
 
-NActors::IActor* CreateReadActor(NActors::TActorId writer, std::istream& strm){
+NActors::IActor* CreateReadActor(const NActors::TActorId& writer, std::istream& strm){
     return new TReadActor(writer, strm);
 }
 
