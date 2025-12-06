@@ -155,6 +155,7 @@ SRCS(
     export_common.cpp
     export_fs_uploader.cpp
     export_iface.cpp
+    import_fs.cpp
     export_iface.h
     export_scan.cpp
     finalize_build_index_unit.cpp

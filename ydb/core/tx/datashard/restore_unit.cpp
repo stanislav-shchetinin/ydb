@@ -1,6 +1,7 @@
 #include "backup_restore_common.h"
 #include "execution_unit_ctors.h"
 #include "import_common.h"
+#include "import_fs.h"
 #include "import_s3.h"
 
 namespace NKikimr {
@@ -49,7 +50,8 @@ protected:
         #endif
 
         case NKikimrSchemeOp::TRestoreTask::kFSSettings:
-            op->SetAsyncJobResult(new TImportJobProduct(true, TString(), 0, 0));
+            tx->SetAsyncJobActor(ctx.Register(CreateFsDownloader(DataShard.SelfId(), op->GetTxId(), restore, tableInfo),
+                TMailboxType::HTSwap, AppData(ctx)->IOPoolId));
             break;
 
         default:
