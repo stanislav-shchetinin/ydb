@@ -145,7 +145,7 @@ class TFsUploader: public TActorBootstrapped<TFsUploader> {
 
     bool WriteMessageWithChecksum(const google::protobuf::Message& message, const TString& path, TString& error) {
         TString data;
-        if (!message.SerializeToString(&data)) {
+        if (!google::protobuf::TextFormat::PrintToString(message, &data)) {
             error = TStringBuilder() << "Failed to serialize message to " << path;
             return false;
         }

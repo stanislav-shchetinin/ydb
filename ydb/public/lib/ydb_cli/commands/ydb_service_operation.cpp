@@ -90,12 +90,18 @@ int TCommandGetOperation::Run(TConfig& config) {
     case TOperationId::EXPORT:
         if (OperationId.GetSubKind() == "s3") {
             return GetOperation<NExport::TExportToS3Response>(client, OperationId, OutputFormat);
-        } else { // fallback to "yt"
+        } else if (OperationId.GetSubKind() == "fs") {
+            return GetOperation<NExport::TExportToFsResponse>(client, OperationId, OutputFormat);
+        } else if (OperationId.GetSubKind() == "yt") {
             return GetOperation<NExport::TExportToYtResponse>(client, OperationId, OutputFormat);
+        } else {
+            throw TMisuseException() << "Invalid operation ID (unexpected sub-kind of operation)";
         }
     case TOperationId::IMPORT:
         if (OperationId.GetSubKind() == "s3") {
             return GetOperation<NImport::TImportFromS3Response>(client, OperationId, OutputFormat);
+        } else if (OperationId.GetSubKind() == "fs") {
+            return GetOperation<NImport::TImportFromFsResponse>(client, OperationId, OutputFormat);
         } else {
             throw TMisuseException() << "Invalid operation ID (unexpected sub-kind of operation)";
         }

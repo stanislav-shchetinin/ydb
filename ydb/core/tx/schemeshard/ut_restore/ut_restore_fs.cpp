@@ -119,7 +119,7 @@ private:
         }
 
         TString serialized;
-        Y_ABORT_UNLESS(table.SerializeToString(&serialized));
+        Y_ABORT_UNLESS(google::protobuf::TextFormat::PrintToString(table, &serialized));
 
         TFileOutput file(dirPath + "/" + NYdb::NDump::NFiles::TableScheme().FileName);
         file.Write(serialized);
@@ -129,7 +129,7 @@ private:
         Ydb::Scheme::ModifyPermissionsRequest permissions;
 
         TString serialized;
-        Y_ABORT_UNLESS(permissions.SerializeToString(&serialized));
+        Y_ABORT_UNLESS(google::protobuf::TextFormat::PrintToString(permissions, &serialized));
 
         TFileOutput file(dirPath + "/permissions.pb");
         file.Write(serialized);
