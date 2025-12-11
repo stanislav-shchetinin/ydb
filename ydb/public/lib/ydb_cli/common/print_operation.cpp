@@ -509,6 +509,24 @@ void PrintOperationsList(const NOperation::TOperationsList<NImport::TImportFromS
     PrintOperationsListImpl(operations, format);
 }
 
+/// FS
+// export
+void PrintOperation(const NExport::TExportToFsResponse& operation, EDataFormat format) {
+    PrintOperationImpl(operation, format);
+}
+
+void PrintOperationsList(const NOperation::TOperationsList<NExport::TExportToFsResponse>& operations, EDataFormat format) {
+    PrintOperationsListImpl(operations, format);
+}
+
+// import
+void PrintOperation(const NImport::TImportFromFsResponse& operation, EDataFormat format) {
+    PrintOperationImpl(operation, format);
+}
+
+void PrintOperationsList(const NOperation::TOperationsList<NImport::TImportFromFsResponse>& operations, EDataFormat format) {
+    PrintOperationsListImpl(operations, format);
+}
 /// Index build
 void PrintOperation(const NYdb::NTable::TBuildIndexOperation& operation, EDataFormat format) {
     PrintOperationImpl(operation, format);
