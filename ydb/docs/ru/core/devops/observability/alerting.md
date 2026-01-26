@@ -61,7 +61,7 @@
     ) / (
       sum by(instance, execpool) (
         utils_CurrentThreadCount
-      ) 
+      )
     ) > 0.9
   for: 1m
   labels:
