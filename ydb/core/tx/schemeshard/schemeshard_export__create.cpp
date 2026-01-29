@@ -12,6 +12,7 @@
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
 #include <ydb/core/backup/common/encryption.h>
+#include <ydb/core/backup/common/uploader_common.h>
 
 #include <util/generic/algorithm.h>
 #include <util/generic/ptr.h>
@@ -63,7 +64,7 @@ namespace NKikimr {
 namespace NSchemeShard {
 
 using namespace NTabletFlatExecutor;
-
+using namespace NBackup::NFieldsWrappers;
 // Erases encryption key from settings, if settings type supports it
 // Returns true if settings changed
 template <class TSettings, class = decltype(std::declval<TSettings>().encryption_settings())> // Function for TSettings that have encryption_settings()
@@ -483,7 +484,19 @@ private:
         }, exportInfo);
     }
 
-    // template <typename TSettings>
+    void UploadScheme(TExportInfo& exportInfo, ui32 itemIdx, const TActorContext& ctx) {
+        DispatchByExportKind([&]<typename TSettings>() {
+            return UploadScheme<TSettings>(exportInfo, itemIdx, ctx);
+        }, exportInfo);
+    }
+
+    bool UploadExportMetadata(TExportInfo& exportInfo, const TActorContext& ctx) {
+        return DispatchByExportKind([&]<typename TSettings>() {
+            return UploadExportMetadata<TSettings>(exportInfo, ctx);
+        }, exportInfo);
+    }
+
+    template <typename TSettings>
     void UploadScheme(TExportInfo& exportInfo, ui32 itemIdx, const TActorContext& ctx) {
         Y_ABORT_UNLESS(itemIdx < exportInfo.Items.size());
         auto& item = exportInfo.Items[itemIdx];
@@ -497,7 +510,7 @@ private:
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
         if (IsPathTypeSchemeObject(item)) {
-            Ydb::Export::ExportToS3Settings exportSettings;
+            TSettings exportSettings;
             Y_ABORT_UNLESS(exportSettings.ParseFromString(exportInfo.Settings));
             const auto databaseRoot = CanonizePath(Self->RootPathElements);
 
@@ -518,32 +531,6 @@ private:
             ));
             Self->RunningExportSchemeUploaders.emplace(item.SchemeUploader);
         }
-    }
-
-    template <typename TSettings>
-    TString GetCommonDestination(const TSettings&);
-
-    template <typename TItem>
-    TString& GetMutableItemDestination(TItem&);
-
-    template <>
-    TString GetCommonDestination(const Ydb::Export::ExportToS3Settings& settings) {
-        return settings.destination_prefix();
-    }
-
-    template <>
-    TString GetCommonDestination(const Ydb::Export::ExportToFsSettings& settings) {
-        return settings.base_path();
-    }
-
-    template <>
-    TString& GetMutableItemDestination(Ydb::Export::ExportToS3Settings::Item& item) {
-        return *item.mutable_destination_prefix();
-    }
-
-    template <>
-    TString& GetMutableItemDestination(Ydb::Export::ExportToFsSettings::Item& item) {
-        return *item.mutable_destination_path();
     }
 
     template <typename TSettings>
@@ -584,7 +571,7 @@ private:
             schemaMappingItem.SetSourcePath(exportPath);
 
             TString destinationPrefix;
-            if (!GetMutableItemDestination(exportItem).empty()) {
+            if (!GetItemDestination(exportItem).empty()) {
                 TString& itemPrefix = GetMutableItemDestination(exportItem);
                 destinationPrefix = itemPrefix = NBackup::NormalizeItemPrefix(itemPrefix);
             } else {
@@ -611,15 +598,13 @@ private:
         return true;
     }
 
+    template <typename TSettings>
     bool UploadExportMetadata(TExportInfo& exportInfo, const TActorContext& ctx) { // returns true if we need to change state to UploadExportMetadata
-        if (exportInfo.Kind != TExportInfo::EKind::S3) {
-            return false;
-        }
 
         Ydb::Export::ExportToS3Settings exportSettings;
         Y_ABORT_UNLESS(exportSettings.ParseFromString(exportInfo.Settings));
 
-        if (exportSettings.destination_prefix().empty()) { // No place to save backup metadata
+        if (GetCommonDestination(exportSettings).empty()) { // No place to save backup metadata
             return false;
         }
 

@@ -310,11 +310,11 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
         Finish(success, error);
     }
 
-    static TString GetDestinationPrefix(const Ydb::Export::ExportToS3Settings& settings, ui32 itemIdx) {
+    static TString GetDestinationPrefix(const TSettings& settings, ui32 itemIdx) {
         if (itemIdx < ui32(settings.items_size())) {
-            return settings.items(itemIdx).destination_prefix();
+            return GetItemDestination(settings.items(itemIdx));
         }
-        return settings.destination_prefix();
+        return GetCommonDestination(settings);
     }
 
 public:
@@ -487,16 +487,18 @@ private:
     TMaybe<NBackup::TEncryptionIV> IV;
 };
 
+template <typename TSettings>
 IActor* CreateSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
-    const Ydb::Export::ExportToS3Settings& settings, const TString& databaseRoot, const TString& metadata,
+    const TSettings& settings, const TString& databaseRoot, const TString& metadata,
     bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
 ) {
     return new TSchemeUploader(schemeShard, exportId, itemIdx, sourcePathId, settings, databaseRoot,
         metadata, enablePermissions, enableChecksums, iv);
 }
 
+template <typename TSettings>
 NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui64 exportId,
-    const Ydb::Export::ExportToS3Settings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
+    const TSettings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
     bool enableChecksums
 ) {
     return new TExportMetadataUploader(schemeShard, exportId, settings, exportMetadata, enableChecksums);

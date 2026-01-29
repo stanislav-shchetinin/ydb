@@ -28,4 +28,9 @@ IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const NKikimrSche
     return std::make_shared<TFsExternalStorageConfig>(settings);
 }
 
+template <>
+IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Export::ExportToFsSettings& settings) {
+    return std::make_shared<TFsExternalStorageConfig>(settings);
+}
+
 }
