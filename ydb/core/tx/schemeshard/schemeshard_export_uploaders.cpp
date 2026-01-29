@@ -170,7 +170,7 @@ protected:
     }
 
 private:
-    Ydb::Export::ExportToS3Settings Settings;
+    TSettings Settings;
     TString DestinationPrefix;
     TMaybe<NBackup::TEncryptionKey> Key;
     NWrappers::IExternalStorageConfig::TPtr ExternalStorageConfig;
@@ -312,9 +312,9 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
 
     static TString GetDestinationPrefix(const TSettings& settings, ui32 itemIdx) {
         if (itemIdx < ui32(settings.items_size())) {
-            return GetItemDestination(settings.items(itemIdx));
+            return NBackup::NFieldsWrappers::GetItemDestination(settings.items(itemIdx));
         }
-        return GetCommonDestination(settings);
+        return NBackup::NFieldsWrappers::GetCommonDestination(settings);
     }
 
 public:
@@ -384,7 +384,7 @@ public:
         const NKikimrSchemeOp::TExportMetadata& exportMetadata,
         bool enableChecksums
     )
-        : TExportFilesUploader<TExportMetadataUploader<TSettings>, TSettings>(settings, settings.destination_prefix())
+        : TExportFilesUploader<TExportMetadataUploader<TSettings>, TSettings>(settings, NBackup::NFieldsWrappers::GetCommonDestination(settings))
         , SchemeShard(schemeShard)
         , ExportId(exportId)
         , EnableChecksums(enableChecksums)
@@ -503,5 +503,30 @@ NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui6
 ) {
     return new TExportMetadataUploader(schemeShard, exportId, settings, exportMetadata, enableChecksums);
 }
+
+// Explicit template instantiations
+template IActor* CreateSchemeUploader<Ydb::Export::ExportToS3Settings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToS3Settings& settings, const TString& databaseRoot, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template IActor* CreateSchemeUploader<Ydb::Export::ExportToFsSettings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToFsSettings& settings, const TString& databaseRoot, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template NActors::IActor* CreateExportMetadataUploader<Ydb::Export::ExportToS3Settings>(
+    NActors::TActorId schemeShard, ui64 exportId,
+    const Ydb::Export::ExportToS3Settings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
+    bool enableChecksums
+);
+
+template NActors::IActor* CreateExportMetadataUploader<Ydb::Export::ExportToFsSettings>(
+    NActors::TActorId schemeShard, ui64 exportId,
+    const Ydb::Export::ExportToFsSettings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
+    bool enableChecksums
+);
 
 } // NKikimr::NSchemeShard

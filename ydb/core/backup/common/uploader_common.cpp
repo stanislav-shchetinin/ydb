@@ -50,14 +50,14 @@ TString& GetMutableItemDestination(
 
 template <>
 TString GetItemDestination(
-    Ydb::Export::ExportToS3Settings::Item& item)
+    const Ydb::Export::ExportToS3Settings::Item& item)
 {
     return item.destination_prefix();
 }
 
 template <>
 TString GetItemDestination(
-    Ydb::Export::ExportToFsSettings::Item& item)
+    const Ydb::Export::ExportToFsSettings::Item& item)
 {
     return item.destination_path();
 }

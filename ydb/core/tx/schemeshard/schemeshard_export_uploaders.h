@@ -6,6 +6,7 @@
 
 namespace Ydb::Export {
     class ExportToS3Settings;
+    class ExportToFsSettings;
 }
 
 namespace NKikimrSchemeOp {
