@@ -504,7 +504,6 @@ NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui6
     return new TExportMetadataUploader(schemeShard, exportId, settings, exportMetadata, enableChecksums);
 }
 
-// Explicit template instantiations
 template IActor* CreateSchemeUploader<Ydb::Export::ExportToS3Settings>(
     TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
     const Ydb::Export::ExportToS3Settings& settings, const TString& databaseRoot, const TString& metadata,
