@@ -139,6 +139,20 @@ void FillTableDescription(TSchemeShard* ss, NKikimrSchemeOp::TBackupTask& task, 
     task.MutableTable()->CopyFrom(sourceDescription);
 }
 
+template <typename TSettings>
+void FillEncryptionSettings(NKikimrSchemeOp::TBackupTask& task, const TSettings& exportSettings,
+                            const TExportInfo& exportInfo, ui32 itemIdx) {
+    if (exportSettings.has_encryption_settings()) {
+        auto& encryptionSettings = *task.MutableEncryptionSettings();
+        encryptionSettings.SetEncryptionAlgorithm(exportInfo.ExportMetadata.GetEncryptionAlgorithm());
+        Cerr << "exportInfo.ExportMetadata.SchemaMappingSize(): " << exportInfo.ExportMetadata.SchemaMappingSize() << Endl;
+        Cerr << "itemIdx: " << itemIdx << Endl;
+        Y_ABORT_UNLESS(itemIdx < exportInfo.ExportMetadata.SchemaMappingSize());
+        encryptionSettings.SetIV(exportInfo.ExportMetadata.GetSchemaMapping(itemIdx).GetIV());
+        *encryptionSettings.MutableSymmetricKey() = exportSettings.encryption_settings().symmetric_key();
+    }
+}
+
 THolder<TEvSchemeShard::TEvModifySchemeTransaction> BackupPropose(
     TSchemeShard* ss,
     TTxId txId,
@@ -313,13 +327,7 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> BackupPropose(
             task.SetEnableChecksums(exportInfo.EnableChecksums);
             task.SetEnablePermissions(exportInfo.EnablePermissions);
 
-            if (exportSettings.has_encryption_settings()) {
-                auto& encryptionSettings = *task.MutableEncryptionSettings();
-                encryptionSettings.SetEncryptionAlgorithm(exportInfo.ExportMetadata.GetEncryptionAlgorithm());
-                Y_ABORT_UNLESS(itemIdx < exportInfo.ExportMetadata.SchemaMappingSize());
-                encryptionSettings.SetIV(exportInfo.ExportMetadata.GetSchemaMapping(itemIdx).GetIV());
-                *encryptionSettings.MutableSymmetricKey() = exportSettings.encryption_settings().symmetric_key();
-            }
+            FillEncryptionSettings(task, exportSettings, exportInfo, itemIdx);
         }
         break;
     case TExportInfo::EKind::FS:
@@ -338,6 +346,8 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> BackupPropose(
 
             task.SetEnableChecksums(exportInfo.EnableChecksums);
             task.SetEnablePermissions(exportInfo.EnablePermissions);
+
+            FillEncryptionSettings(task, exportSettings, exportInfo, itemIdx);
         }
         break;
     }
