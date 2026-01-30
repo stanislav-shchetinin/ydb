@@ -575,7 +575,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
         )");
         env.TestWaitNotification(runtime, txId);
 
-        // Write some data to tables
         for (ui32 i = 1; i <= 10; ++i) {
             WriteRow(runtime, ++txId, "/MyRoot/Table1", 0, i, Sprintf("value1_%u", i));
             WriteRow(runtime, ++txId, "/MyRoot/Table1", 1, i + 100, Sprintf("value1_%u", i + 100));
@@ -589,7 +588,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
         TString requestStr = Sprintf(R"(
             ExportToFsSettings {
               base_path: "%s"
-              source_path: "/MyRoot"
               items {
                 source_path: "/MyRoot/Table1"
               }
@@ -612,7 +610,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
         const auto& entry = desc.GetResponse().GetEntry();
         UNIT_ASSERT_VALUES_EQUAL(entry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_DONE);
 
-        // Check that all expected encrypted files exist
         TFsPath baseDir(basePath);
         TVector<TFsPath> expectedFiles = {
             baseDir / "metadata.json",
@@ -630,21 +627,33 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
             UNIT_ASSERT_C(FileExists(file.GetPath()), "File not found: " << file.GetPath());
         }
 
-        // Check that all encrypted files can be decrypted with the correct key and have unique IVs
+        TVector<TFsPath> allFiles;
+        std::function<void(const TFsPath&)> collectFiles = [&](const TFsPath& dir) {
+            TVector<TString> children;
+            dir.ListNames(children);
+            for (const auto& child : children) {
+                TFsPath childPath = dir / child;
+                if (childPath.IsDirectory()) {
+                    collectFiles(childPath);
+                } else if (childPath.IsFile()) {
+                    allFiles.push_back(childPath);
+                }
+            }
+        };
+        collectFiles(baseDir);
+
         THashSet<TString> ivs;
-        for (const auto& file : expectedFiles) {
+        for (const auto& file : allFiles) {
             TString filePath = file.GetPath();
             if (filePath.EndsWith("metadata.json") || filePath.EndsWith(".sha256")) {
                 continue;
             }
 
-            // All files except backup metadata and checksums must be encrypted
             UNIT_ASSERT_C(filePath.EndsWith(".enc"), filePath);
 
             TString content = ReadFileContent(filePath);
             UNIT_ASSERT_C(!content.empty(), "File is empty: " << filePath);
 
-            // Check that we can decrypt content with our key
             TBuffer decryptedData;
             NBackup::TEncryptionIV iv;
             UNIT_ASSERT_NO_EXCEPTION_C(
@@ -653,7 +662,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
                     TBuffer(content.data(), content.size())
                 ), filePath);
 
-            // All IVs are unique
             UNIT_ASSERT_C(ivs.insert(iv.GetBinaryString()).second, "Duplicate IV for: " << filePath);
         }
     }
