@@ -442,7 +442,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
         const auto& entry = desc.GetResponse().GetEntry();
         UNIT_ASSERT_VALUES_EQUAL(entry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_DONE);
 
-        // Check SchemaMapping files
         TFsPath baseDir(basePath);
         UNIT_ASSERT(FileExists((baseDir / "metadata.json").GetPath()));
         UNIT_ASSERT(FileExists((baseDir / "SchemaMapping" / "metadata.json").GetPath()));
@@ -546,7 +545,12 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
             }
         )", basePath.c_str());
 
-        TestExport(runtime, ++txId, "/MyRoot", requestStr, "", "", Ydb::StatusIds::CANCELLED);
+        TestExport(runtime, ++txId, "/MyRoot", requestStr, "", "", Ydb::StatusIds::SUCCESS);
+        env.TestWaitNotification(runtime, txId);
+
+        auto desc = TestGetExport(runtime, txId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        const auto& entry = desc.GetResponse().GetEntry();
+        UNIT_ASSERT_VALUES_EQUAL(entry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_CANCELLED);
     }
 
     Y_UNIT_TEST(EncryptedExport) {
