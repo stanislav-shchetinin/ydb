@@ -253,9 +253,14 @@ public:
 
         // Check key length
         const int keyLength = EVP_CIPHER_key_length(cipher);
+        Cerr << "ResetCtx: Key.Size(): " << Key.Size() << Endl;
+        Cerr << "ResetCtx: key: " << Key.GetBinaryString() << Endl;
+        Cerr << "ResetCtx: key length: " << keyLength << Endl;
         if (static_cast<int>(Key.Size()) != keyLength) {
+            Cerr << "ResetCtx: Invalid key length " << Key.Size() << ". Expected: " << keyLength << Endl;
             throw yexception() << "Invalid key length " << Key.Size() << ". Expected: " << keyLength;
         }
+        Cerr << "ResetCtx: key length check passed" << Endl;
 
         // Check IV length
         const int ivLength = EVP_CIPHER_iv_length(cipher);

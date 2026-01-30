@@ -491,13 +491,16 @@ private:
     }
 
     bool UploadExportMetadata(TExportInfo& exportInfo, const TActorContext& ctx) {
+        Cerr << "UploadExportMetadata1111" << Endl;
         return DispatchByExportKind([&]<typename TSettings>() {
+            Cerr << "UploadExportMetadata: DispatchByExportKind" << Endl;
             return UploadExportMetadata<TSettings>(exportInfo, ctx);
         }, exportInfo);
     }
 
     template <typename TSettings>
     void UploadScheme(TExportInfo& exportInfo, ui32 itemIdx, const TActorContext& ctx) {
+        Cerr << "UploadScheme1111" << Endl;
         Y_ABORT_UNLESS(itemIdx < exportInfo.Items.size());
         auto& item = exportInfo.Items[itemIdx];
 
@@ -523,6 +526,7 @@ private:
                 iv = NBackup::TEncryptionIV::FromBinaryString(exportInfo.ExportMetadata.GetSchemaMapping(itemIdx).GetIV());
             }
 
+            Cerr << "UploadScheme: CreateSchemeUploader" << Endl;
             item.SchemeUploader = ctx.Register(CreateSchemeUploader(
                 Self->SelfId(), exportInfo.Id, itemIdx, item.SourcePathId,
                 exportSettings, databaseRoot, metadata.Serialize(),
@@ -543,7 +547,11 @@ private:
             return true;
         }
 
-        TString commonDestinationPrefix = NBackup::NormalizeExportPrefix(destination);
+        TString commonDestinationPrefix;
+        if constexpr (!std::is_same_v<TSettings, Ydb::Export::ExportToFsSettings>) {
+            // For FS, the concatenation of the base_path and the item path occurs in the DataShard
+            commonDestinationPrefix = NBackup::NormalizeExportPrefix(destination);
+        }
 
         TMaybe<NBackup::TEncryptionIV> iv;
         if (exportSettings.has_encryption_settings()) {
@@ -600,8 +608,9 @@ private:
 
     template <typename TSettings>
     bool UploadExportMetadata(TExportInfo& exportInfo, const TActorContext& ctx) { // returns true if we need to change state to UploadExportMetadata
+        Cerr << "UploadExportMetadata" << Endl;
 
-        Ydb::Export::ExportToS3Settings exportSettings;
+        TSettings exportSettings;
         Y_ABORT_UNLESS(exportSettings.ParseFromString(exportInfo.Settings));
 
         if (GetCommonDestination(exportSettings).empty()) { // No place to save backup metadata
@@ -894,18 +903,27 @@ private:
             break;
 
         case EState::UploadExportMetadata:
+            Cerr << "Resume: UploadExportMetadata" << Endl;
             Y_ABORT_UNLESS(UploadExportMetadata(*exportInfo, ctx));
             break;
 
         case EState::Transferring: {
+            Cerr << "Resume: Transferring" << Endl;
             TDeque<ui32> pendingTables;
             for (ui32 itemIdx : xrange(exportInfo->Items.size())) {
                 const auto& item = exportInfo->Items.at(itemIdx);
 
+                Cerr << "Resume: Transferring: itemIdx: " << itemIdx << Endl;
+                Cerr << "Resume: Transferring: item.WaitTxId: " << item.WaitTxId << Endl;
+                Cerr << "Resume: Transferring: item.State: " << item.State << Endl;
+                Cerr << "Resume: Transferring: IsPathTypeTransferrable(item): " << IsPathTypeTransferrable(item) << Endl;
+
                 if (item.WaitTxId == InvalidTxId) {
                     if (IsPathTypeTransferrable(item) && item.State <= EState::Transferring) {
                         pendingTables.emplace_back(itemIdx);
+                        Cerr << "Resume: Transferring: pendingTables.emplace_back(itemIdx): " << itemIdx << Endl;
                     } else {
+                        Cerr << "Resume: UploadScheme" << Endl;
                         UploadScheme(*exportInfo, itemIdx, ctx);
                     }
                 } else {
@@ -1369,6 +1387,7 @@ private:
         }
 
         Y_ABORT_UNLESS(exportInfo->State == EState::UploadExportMetadata);
+        Cerr << "Resume: UploadExportMetadata: AnyOf(exportInfo->Items, &IsPathTypeTable)" << Endl;
         if (AnyOf(exportInfo->Items, &IsPathTypeTable)) {
             exportInfo->State = EState::CopyTables;
             AllocateTxId(*exportInfo);
@@ -1384,6 +1403,7 @@ private:
                 if (item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
                     columnTables.emplace_back(i);
                 } else {
+                    Cerr << "UploadExportMetadata: UploadScheme" << Endl;
                     UploadScheme(*exportInfo, i, ctx);
                 }
             }
@@ -1455,8 +1475,9 @@ private:
                 Self->EraseEncryptionKey(db, *exportInfo);
                 break;
             }
-
+            Cerr << "OnNotifyResult: supportEncryptedExport: " << supportEncryptedExport << Endl;
             if (supportEncryptedExport && UploadExportMetadata(*exportInfo, ctx)) {
+                Cerr << "OnNotifyResult: UploadExportMetadata" << Endl;
                 exportInfo->State = EState::UploadExportMetadata;
 
                 // Persist modified metadata and new settings
@@ -1476,6 +1497,7 @@ private:
                     if (item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
                         columnTables.emplace_back(i);
                     } else {
+                        Cerr << "OnNotifyResult: UploadScheme" << Endl;
                         UploadScheme(*exportInfo, i, ctx);
                     }
                 }
@@ -1509,6 +1531,7 @@ private:
                 if (IsPathTypeTransferrable(item)) {
                     tables.emplace_back(itemIdx);
                 } else {
+                    Cerr << "CopyTables: UploadScheme" << Endl;
                     UploadScheme(*exportInfo, itemIdx, ctx);
                 }
             }

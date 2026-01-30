@@ -260,10 +260,12 @@ void TSchemeShard::Handle(TEvExport::TEvListExportsRequest::TPtr& ev, const TAct
 }
 
 void TSchemeShard::Handle(TEvPrivate::TEvExportSchemeUploadResult::TPtr& ev, const TActorContext& ctx) {
+    Cerr << "Handle: TEvExportSchemeUploadResult" << Endl;
     Execute(CreateTxProgressExport(ev), ctx);
 }
 
 void TSchemeShard::Handle(TEvPrivate::TEvExportUploadMetadataResult::TPtr& ev, const TActorContext& ctx) {
+    Cerr << "Handle: TEvExportUploadMetadataResult" << Endl;
     Execute(CreateTxProgressExport(ev), ctx);
 }
 

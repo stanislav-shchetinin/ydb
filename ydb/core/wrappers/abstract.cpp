@@ -12,24 +12,29 @@ IExternalStorageOperator::TPtr IExternalStorageConfig::ConstructStorageOperator(
 template <>
 IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const NKikimrSchemeOp::TS3Settings& settings) {
     if (settings.GetEndpoint() == "fake.fake") {
+        Cerr << "Constructing TFakeExternalStorageConfig" << Endl;
         return std::make_shared<TFakeExternalStorageConfig>(settings.GetBucket(), settings.GetSecretKey());
     } else {
+        Cerr << "Constructing TS3ExternalStorageConfig2" << Endl;
         return std::make_shared<TS3ExternalStorageConfig>(settings);
     }
 }
 
 template <>
 IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Export::ExportToS3Settings& settings) {
+    Cerr << "Constructing TS3ExternalStorageConfig1" << Endl;
     return std::make_shared<TS3ExternalStorageConfig>(settings);
 }
 
 template <>
 IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const NKikimrSchemeOp::TFSSettings& settings) {
+    Cerr << "Constructing TFsExternalStorageConfig1" << Endl;
     return std::make_shared<TFsExternalStorageConfig>(settings);
 }
 
 template <>
 IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Export::ExportToFsSettings& settings) {
+    Cerr << "Constructing TFsExternalStorageConfig2" << Endl;
     return std::make_shared<TFsExternalStorageConfig>(settings);
 }
 

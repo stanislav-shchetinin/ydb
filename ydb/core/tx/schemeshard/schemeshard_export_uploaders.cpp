@@ -46,6 +46,7 @@ protected:
         , DestinationPrefix(destinationPrefix)
         , ExternalStorageConfig(NWrappers::IExternalStorageConfig::Construct(settings))
     {
+        Cerr << "TExportFilesUploader constructor" << Endl;
         if (Settings.has_encryption_settings()) {
             Key = NBackup::TEncryptionKey(Settings.encryption_settings().symmetric_key().key());
         }
@@ -63,6 +64,8 @@ protected:
         TString content,
         const TMaybe<NBackup::TEncryptionIV>& iv = Nothing())
     {
+        Cerr << "AddFile: " << filePath << Endl;
+        Cerr << "AddFile: content size: " << content.size() << Endl;
         if (iv) {
             if (!Key) {
                 Fail(TStringBuilder() << "Internal error: no encryption key");
@@ -70,16 +73,25 @@ protected:
             }
             filePath += ".enc";
             try {
+                Cerr << "AddFile: encrypting data" << Endl;
+                Cerr << "AddFile: algorithm: " << Settings.encryption_settings().encryption_algorithm() << Endl;
+                Cerr << "AddFile: key: " << Key->Size() << Endl;
+                Cerr << "AddFile: key: " << Key->GetBinaryString() << Endl;
+                Cerr << "AddFile: iv: " << iv->GetBinaryString() << Endl;
+                Cerr << "AddFile: data size: " << content.size() << Endl;
                 TBuffer encContent = NBackup::TEncryptedFileSerializer::EncryptFullFile(
                     Settings.encryption_settings().encryption_algorithm(),
                     *Key, *iv,
                     content);
+                Cerr << "AddFile: encrypted data size: " << encContent.Size() << Endl;
                 content.assign(encContent.Data(), encContent.Size());
             } catch (const std::exception& ex) {
+                Cerr << "AddFile: error: " << ex.what() << Endl;
                 Fail(TStringBuilder() << "Failed to encrypt " << filePath << ": " << ex.what());
                 return false;
             }
         }
+        Cerr << "AddFile: adding to queue" << Endl;
         Files.emplace_back(TFileUpload{
             .Path = filePath,
             .Content = content
@@ -89,7 +101,9 @@ protected:
 
     // Starting function for upload already added files
     void UploadFiles() {
+        Cerr << "UploadFiles" << Endl;
         if (!StorageOperator) {
+            Cerr << "UploadFiles: registering with same mailbox" << Endl;
             StorageOperator = this->RegisterWithSameMailbox(
                 NWrappers::CreateS3Wrapper(ExternalStorageConfig->ConstructStorageOperator())
             );
@@ -111,11 +125,14 @@ protected:
         path << NBackup::NormalizeExportPrefix(DestinationPrefix) << '/' << upload.Path;
 
         auto request = Aws::S3::Model::PutObjectRequest().WithKey(path);
-
+        Cerr << "Handle: sending request to storage operator" << Endl;
+        Cerr << "Handle: path: " << path << Endl;
+        Cerr << "Handle: content size: " << upload.Content.size() << Endl;
         this->Send(StorageOperator, new TEvExternalStorage::TEvPutObjectRequest(request, TString(upload.Content)));
     }
 
     void Handle(TEvExternalStorage::TEvPutObjectResponse::TPtr& ev) {
+        Cerr << "Handle PutObjectResponse: " << ev->Get()->Result << Endl;
         const auto& result = ev->Get()->Result;
         TFileUpload& upload = Files.front();
 
@@ -159,6 +176,7 @@ protected:
     }
 
     void Fail(const TString& error) {
+        Cerr << "Fail: sending result to scheme shard" << Endl;
         OnFilesUploaded(false, error);
     }
 
@@ -240,9 +258,11 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
     }
 
     void StartUploadFiles() {
+        Cerr << "StartUploadFiles" << Endl;
         if (!Scheme) {
             return Finish(false, "cannot infer scheme");
         }
+        Cerr << "StartUploadFiles: adding scheme to queue" << Endl;
 
         if (!this->AddFile(FileName, Scheme, MakeIV(SchemeFileType))) {
             return;
@@ -273,7 +293,7 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
         if (!Metadata) {
             return Finish(false, "empty metadata");
         }
-
+        Cerr << "StartUploadFiles: adding metadata to queue" << Endl;
         if (!this->AddFile("metadata.json", Metadata, IV)) {
             return;
         }
@@ -302,11 +322,15 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
             << ", error: " << error
         );
 
+        Cerr << "Finish: sending result to scheme shard" << Endl;
+
         this->Send(SchemeShard, new TEvPrivate::TEvExportSchemeUploadResult(ExportId, ItemIdx, success, error));
         this->PassAway();
     }
 
     void OnFilesUploaded(bool success, const TString& error) override {
+        Cerr << "OnFilesUploaded: success: " << success << Endl;
+        Cerr << "OnFilesUploaded: error: " << error << Endl;
         Finish(success, error);
     }
 
@@ -341,9 +365,11 @@ public:
         , EnableChecksums(enableChecksums)
         , Metadata(metadata)
     {
+        Cerr << "TSchemeUploader constructor" << Endl;
     }
 
     void Bootstrap() {
+        Cerr << "TSchemeUploader Bootstrap" << Endl;
         GetDescription();
     }
 
@@ -390,9 +416,11 @@ public:
         , EnableChecksums(enableChecksums)
         , ExportMetadata(exportMetadata)
     {
+        Cerr << "TExportMetadataUploader constructor" << Endl;
     }
 
     void Bootstrap() {
+        Cerr << "TExportMetadataUploader Bootstrap" << Endl;
         if (ExportMetadata.HasIV()) {
             IV = NBackup::TEncryptionIV::FromBinaryString(ExportMetadata.GetIV());
         }
@@ -406,6 +434,7 @@ public:
 
 private:
     bool AddBackupMetadata() {
+        Cerr << "AddBackupMetadata" << Endl;
         TString content;
         TStringOutput ss(content);
         NJson::TJsonWriter writer(&ss, false);
@@ -426,11 +455,13 @@ private:
         writer.Flush();
         ss.Flush();
 
+        Cerr << "AddBackupMetadata: adding to queue" << Endl;
         return this->AddFile("metadata.json", content)
             && (!EnableChecksums || this->AddFile(NBackup::ChecksumKey("metadata.json"), NBackup::ComputeChecksum(content)));
     }
 
     bool AddSchemaMappingMetadata() {
+        Cerr << "AddSchemaMappingMetadata" << Endl;
         TString content;
         TStringOutput ss(content);
         NJson::TJsonWriter writer(&ss, false);
@@ -442,11 +473,13 @@ private:
         writer.Flush();
         ss.Flush();
 
+        Cerr << "AddSchemaMappingMetadata: adding to queue" << Endl;
         return this->AddFile("SchemaMapping/metadata.json", content, IV)
             && (!EnableChecksums || this->AddFile(NBackup::ChecksumKey("SchemaMapping/metadata.json"), NBackup::ComputeChecksum(content)));
     }
 
     bool AddSchemaMappingJson() {
+        Cerr << "AddSchemaMappingJson" << Endl;
         NBackup::TSchemaMapping schemaMapping;
         for (const auto& item : ExportMetadata.GetSchemaMapping()) {
             schemaMapping.Items.emplace_back(NBackup::TSchemaMapping::TItem{
@@ -460,7 +493,7 @@ private:
         if (IV) {
             iv = NBackup::TEncryptionIV::Combine(*IV, NBackup::EBackupFileType::SchemaMapping, 0, 0);
         }
-
+        Cerr << "AddSchemaMappingJson: schemaMapping.Items.size(): " << schemaMapping.Items.size() << Endl;
         const TString content = schemaMapping.Serialize();
         return this->AddFile("SchemaMapping/mapping.json", content, iv)
             && (!EnableChecksums || this->AddFile(NBackup::ChecksumKey("SchemaMapping/mapping.json"), NBackup::ComputeChecksum(content)));
@@ -472,6 +505,9 @@ private:
             << ", success: " << success
             << ", error: " << error
         );
+        Cerr << "OnFilesUploaded: sending result to scheme shard" << Endl;
+        Cerr << "OnFilesUploaded: success: " << success << Endl;
+        Cerr << "OnFilesUploaded: error: " << error << Endl;
 
         this->Send(SchemeShard, new TEvPrivate::TEvExportUploadMetadataResult(ExportId, success, error));
         this->PassAway();
@@ -492,6 +528,7 @@ IActor* CreateSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, 
     const TSettings& settings, const TString& databaseRoot, const TString& metadata,
     bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
 ) {
+    Cerr << "CreateSchemeUploader" << Endl;
     return new TSchemeUploader(schemeShard, exportId, itemIdx, sourcePathId, settings, databaseRoot,
         metadata, enablePermissions, enableChecksums, iv);
 }
@@ -501,6 +538,7 @@ NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui6
     const TSettings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
     bool enableChecksums
 ) {
+    Cerr << "CreateExportMetadataUploader" << Endl;
     return new TExportMetadataUploader(schemeShard, exportId, settings, exportMetadata, enableChecksums);
 }
 

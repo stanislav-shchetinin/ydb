@@ -104,6 +104,7 @@ public:
 
     template <>
     static TStorageSettings FromBackupTask<NKikimrSchemeOp::TFSSettings>(const NKikimrSchemeOp::TBackupTask& task) {
+        Cerr << "FromBackupTask<TFSSettings>: " << task.GetFSSettings().GetBasePath() << "/" << task.GetFSSettings().GetPath() << Endl;
         return TStorageSettings(CanonizePath(TStringBuilder() << task.GetFSSettings().GetBasePath() << "/" << task.GetFSSettings().GetPath()), task.GetShardNum(), TEncryptionSettings::FromBackupTask(task));
     }
 

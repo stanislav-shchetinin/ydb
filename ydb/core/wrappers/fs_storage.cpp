@@ -190,23 +190,28 @@ public:
     }
 
     void Handle(TEvPutObjectRequest::TPtr& ev) {
+        Cerr << "Handle: PutObject" << Endl;
+        Cerr << "Handle: body size: " << ev->Get()->Body.size() << Endl;
         const auto& request = ev->Get()->GetRequest();
         const auto& body = ev->Get()->Body;
         const TString key = TString(request.GetKey().data(), request.GetKey().size());
+        Cerr << "Handle: key: " << key << Endl;
 
         FS_LOG_D("PutObject"
             << ": key# " << key
             << ", size# " << body.size());
 
         try {
+            Cerr << "Handle: create dirs: " << key << Endl;
             TFsPath fsPath(key);
             fsPath.Parent().MkDirs();
-
+            Cerr << "Handle: create file: " << fsPath.GetPath() << Endl;
             TFile file(fsPath.GetPath(), CreateAlways | WrOnly);
             file.Flock(LOCK_EX | LOCK_NB);
             file.Write(body.data(), body.size());
             file.Flush();
             file.Close();
+            Cerr << "Handle: close file: " << fsPath.GetPath() << Endl;
             ReplySuccess<TEvPutObjectResponse>(ev->Sender, key);
         } catch (const TSystemError& ex) {
             if (!HandleFileLockError<TEvPutObjectResponse>(ex, ev->Sender, key, "PutObject")) {

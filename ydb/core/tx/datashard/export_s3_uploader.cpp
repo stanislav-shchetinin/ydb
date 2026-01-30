@@ -214,6 +214,12 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         }
         if (iv) {
             try {
+                Cerr << "PutDataWithChecksum: encrypting data" << Endl;
+                Cerr << "PutDataWithChecksum: algorithm: " << Settings.EncryptionSettings.EncryptionAlgorithm << Endl;
+                Cerr << "PutDataWithChecksum: key: " << Settings.EncryptionSettings.Key->Size() << Endl;
+                Cerr << "PutDataWithChecksum: key: " << Settings.EncryptionSettings.Key->GetBinaryString() << Endl;
+                Cerr << "PutDataWithChecksum: iv: " << iv->GetBinaryString() << Endl;
+                Cerr << "PutDataWithChecksum: data size: " << data.size() << Endl;
                 TBuffer encryptedData = TEncryptedFileSerializer::EncryptFullFile(Settings.EncryptionSettings.EncryptionAlgorithm, *Settings.EncryptionSettings.Key, *iv, data);
                 data = TString(encryptedData.Data(), encryptedData.Size());
             } catch (const std::exception& ex) {
@@ -221,6 +227,8 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
                 return;
             }
         }
+        Cerr << "PutDataWithChecksum: putting data" << Endl;
+        Cerr << "PutDataWithChecksum: data size: " << data.size() << Endl;
         PutData(std::move(data), key, stateFunc);
     }
 
@@ -965,12 +973,14 @@ IActor* CreateUploaderBySettingsType(
     TMaybe<Ydb::Scheme::ModifyPermissionsRequest>&& permissions,
     TString&& metadata)
 {
+    Cerr << "CreateUploaderBySettingsType" << Endl;
     if (task.HasS3Settings()) {
         return new TS3Uploader<NKikimrSchemeOp::TS3Settings>(
             dataShard, txId, task,
             std::move(scheme), std::move(changefeeds),
             std::move(permissions), std::move(metadata));
     } else if (task.HasFSSettings()) {
+        Cerr << "CreateUploaderBySettingsType: FSSettings" << Endl;
         return new TS3Uploader<NKikimrSchemeOp::TFSSettings>(
             dataShard, txId, task,
             std::move(scheme), std::move(changefeeds),

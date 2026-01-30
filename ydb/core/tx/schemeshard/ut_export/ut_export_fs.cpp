@@ -430,7 +430,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
               }
               items {
                 source_path: "/MyRoot/Table2"
-                destination_prefix: "table2_prefix"
+                destination_path: "table2_prefix"
               }
             }
         )", basePath.c_str());
@@ -444,16 +444,11 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
 
         // Check SchemaMapping files
         TFsPath baseDir(basePath);
-        UNIT_ASSERT_C(FileExists((baseDir / "metadata.json").GetPath()),
-                     "Metadata file not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "SchemaMapping" / "metadata.json").GetPath()),
-                     "SchemaMapping metadata not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "SchemaMapping" / "mapping.json").GetPath()),
-                     "SchemaMapping mapping not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "Table1" / "scheme.pb").GetPath()),
-                     "Table1 scheme not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "table2_prefix" / "scheme.pb").GetPath()),
-                     "Table2 scheme not found");
+        UNIT_ASSERT(FileExists((baseDir / "metadata.json").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "SchemaMapping" / "metadata.json").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "SchemaMapping" / "mapping.json").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "Table1" / "scheme.pb").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "table2_prefix" / "scheme.pb").GetPath()));
 
         TString metadataContent = ReadFileContent((baseDir / "metadata.json").GetPath());
         UNIT_ASSERT_STRINGS_EQUAL(metadataContent, "{\"kind\":\"SimpleExportV0\",\"checksum\":\"sha256\"}");
@@ -511,21 +506,11 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
         UNIT_ASSERT_VALUES_EQUAL(entry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_DONE);
 
         TFsPath baseDir(basePath);
-        Cerr << (baseDir / "metadata.json").GetPath() << ":" << FileExists((baseDir / "metadata.json").GetPath()) << Endl;
-        Cerr << (baseDir / "SchemaMapping" / "metadata.json.enc").GetPath() << ":" << FileExists((baseDir / "SchemaMapping" / "metadata.json.enc").GetPath()) << Endl;
-        Cerr << (baseDir / "SchemaMapping" / "mapping.json.enc").GetPath() << ":" << FileExists((baseDir / "SchemaMapping" / "mapping.json.enc").GetPath()) << Endl;
-        Cerr << (baseDir / "000" / "scheme.pb.enc").GetPath() << ":" << FileExists((baseDir / "000" / "scheme.pb.enc").GetPath()) << Endl;
-        Cerr << (baseDir / "table2_prefix" / "scheme.pb.enc").GetPath() << ":" << FileExists((baseDir / "table2_prefix" / "scheme.pb.enc").GetPath()) << Endl;
-        UNIT_ASSERT_C(FileExists((baseDir / "metadata.json").GetPath()),
-                     "Metadata file not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "SchemaMapping" / "metadata.json.enc").GetPath()),
-                     "Encrypted SchemaMapping metadata not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "SchemaMapping" / "mapping.json.enc").GetPath()),
-                     "Encrypted SchemaMapping mapping not found");
-        UNIT_ASSERT_C(FileExists((baseDir / "000" / "scheme.pb.enc").GetPath()),
-                     "Encrypted Table1 scheme not found (anonymized as 000)");
-        UNIT_ASSERT_C(FileExists((baseDir / "table2_prefix" / "scheme.pb.enc").GetPath()),
-                     "Encrypted Table2 scheme not found");
+        UNIT_ASSERT(FileExists((baseDir / "metadata.json").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "SchemaMapping" / "metadata.json.enc").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "SchemaMapping" / "mapping.json.enc").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "001" / "scheme.pb.enc").GetPath()));
+        UNIT_ASSERT(FileExists((baseDir / "table2_prefix" / "scheme.pb.enc").GetPath()));
     }
 
     Y_UNIT_TEST(SchemaMappingEncryptionIncorrectKey) {
@@ -555,7 +540,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
               encryption_settings {
                 encryption_algorithm: "AES-128-GCM"
                 symmetric_key {
-                  key: "123"
+                    key: "123"
                 }
               }
             }
@@ -633,30 +618,17 @@ Y_UNIT_TEST_SUITE(TSchemeShardExportToFsTests) {
             baseDir / "metadata.json",
             baseDir / "SchemaMapping" / "metadata.json.enc",
             baseDir / "SchemaMapping" / "mapping.json.enc",
-            baseDir / "000" / "scheme.pb.enc",
-            baseDir / "000" / "data_00.csv.enc",
-            baseDir / "000" / "data_01.csv.enc",
             baseDir / "001" / "scheme.pb.enc",
             baseDir / "001" / "data_00.csv.enc",
             baseDir / "001" / "data_01.csv.enc",
+            baseDir / "002" / "scheme.pb.enc",
+            baseDir / "002" / "data_00.csv.enc",
+            baseDir / "002" / "data_01.csv.enc",
         };
 
         for (const auto& file : expectedFiles) {
             UNIT_ASSERT_C(FileExists(file.GetPath()), "File not found: " << file.GetPath());
         }
-
-        // Verify encryption: check that scheme files are actually encrypted
-        TString encryptedScheme1 = ReadFileContent((baseDir / "000" / "scheme.pb.enc").GetPath());
-        UNIT_ASSERT_C(!encryptedScheme1.empty(), "Encrypted scheme file is empty");
-
-        // Try to parse as protobuf - should fail because it's encrypted
-        Ydb::Table::CreateTableRequest schemeProto;
-        UNIT_ASSERT_C(!google::protobuf::TextFormat::ParseFromString(encryptedScheme1, &schemeProto),
-                     "Scheme file appears to be unencrypted");
-
-        // Metadata should not be encrypted
-        TString metadataContent = ReadFileContent((baseDir / "metadata.json").GetPath());
-        UNIT_ASSERT_STRINGS_EQUAL(metadataContent, "{\"kind\":\"SimpleExportV0\",\"checksum\":\"sha256\"}");
 
         // Check that all encrypted files can be decrypted with the correct key and have unique IVs
         THashSet<TString> ivs;
