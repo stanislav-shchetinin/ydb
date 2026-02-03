@@ -27,6 +27,11 @@ IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Export
 }
 
 template <>
+IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Import::ImportFromS3Settings& settings) {
+    return std::make_shared<TS3ExternalStorageConfig>(settings);
+}
+
+template <>
 IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const NKikimrSchemeOp::TFSSettings& settings) {
     Cerr << "Constructing TFsExternalStorageConfig1" << Endl;
     return std::make_shared<TFsExternalStorageConfig>(settings);
@@ -38,4 +43,8 @@ IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Export
     return std::make_shared<TFsExternalStorageConfig>(settings);
 }
 
+template <>
+IExternalStorageConfig::TPtr IExternalStorageConfig::Construct(const Ydb::Import::ImportFromFsSettings& settings) {
+    return std::make_shared<TFsExternalStorageConfig>(settings);
+}
 }
