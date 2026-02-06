@@ -10,6 +10,7 @@
 #include <ydb/core/protos/datashard_config.pb.h>
 #include <ydb/core/protos/fs_settings.pb.h>
 #include <ydb/core/protos/s3_settings.pb.h>
+#include <ydb/core/protos/fs_settings.pb.h>
 #include <ydb/core/tablet_flat/flat_row_state.h>
 #include <yql/essentials/types/binary_json/read.h>
 #include <ydb/public/api/protos/ydb_export.pb.h>

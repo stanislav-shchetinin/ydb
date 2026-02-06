@@ -3,7 +3,10 @@
 #include "abstract.h"
 
 #include <ydb/library/accessor/accessor.h>
-#include <ydb/public/api/protos/ydb_export.pb.h>
+
+namespace Ydb::Export {
+class ExportToFsSettings;
+} // namespace Ydb::Export
 
 namespace NKikimrSchemeOp {
     class TFSSettings;
