@@ -4,6 +4,10 @@
 
 #include <ydb/library/accessor/accessor.h>
 
+namespace NKikimrSchemeOp {
+class TFSSettings;
+} // namespace NKikimrSchemeOp
+
 namespace Ydb::Export {
 class ExportToFsSettings;
 } // namespace Ydb::Export
