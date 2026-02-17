@@ -8,7 +8,9 @@
 #include <util/generic/scope.h>
 #include <util/generic/size_literals.h>
 #include <util/stream/buffer.h>
+#include <util/stream/file.h>
 #include <util/stream/str.h>
+#include <util/system/fs.h>
 
 #include <contrib/libs/fmt/include/fmt/format.h>
 #include <ydb/library/testlib/helpers.h>
@@ -1052,25 +1054,26 @@ protected:
                 continue;
             }
 
-            allKeyNames.insert(key);
+                allKeyNames.insert(key);
 
-            // Check that files are encrypted
-            UNIT_ASSERT_C(key.EndsWith(".enc"), key);
+                // Check that files are encrypted
+                UNIT_ASSERT_C(key.EndsWith(".enc"), key);
 
-            // Check that we can decrypt content with our key (== it is really encrypted with our key)
-            TBuffer decryptedData;
-            NBackup::TEncryptionIV iv;
-            UNIT_ASSERT_NO_EXCEPTION_C(std::tie(decryptedData, iv) = NBackup::TEncryptedFileDeserializer::DecryptFullFile(
-                encryptionKey,
-                TBuffer(content.data(), content.size())
-            ), key);
+                // Check that we can decrypt content with our key (== it is really encrypted with our key)
+                TBuffer decryptedData;
+                NBackup::TEncryptionIV iv;
+                UNIT_ASSERT_NO_EXCEPTION_C(std::tie(decryptedData, iv) = NBackup::TEncryptedFileDeserializer::DecryptFullFile(
+                    encryptionKey,
+                    TBuffer(content.data(), content.size())
+                ), key);
 
-            // All ivs are unique
-            UNIT_ASSERT_C(ivs.insert(iv.GetBinaryString()).second, key);
+                // All ivs are unique
+                UNIT_ASSERT_C(ivs.insert(iv.GetBinaryString()).second, key);
 
-            // Encrypted export must not show objects real names
-            UNIT_ASSERT_C(key.find("Anonymized") == TString::npos, key);
-            UNIT_ASSERT_C(key.find("anonymized") == TString::npos, key); // user/group
+                // Encrypted export must not show objects real names
+                UNIT_ASSERT_C(key.find("Anonymized") == TString::npos, key);
+                UNIT_ASSERT_C(key.find("anonymized") == TString::npos, key); // user/group
+            }
         }
 
         if (isFsBackup) {
@@ -1084,7 +1087,6 @@ protected:
         importSettings
             .SymmetricKey("Cool random key!");
 
-        size_t importIndex = 0;
         auto copySettings = [&]() {
             NYdb::NImport::TImportFromS3Settings settings = importSettings;
             settings.DestinationPath(TStringBuilder() << "/Root/Prefix_" << importIndex++);
