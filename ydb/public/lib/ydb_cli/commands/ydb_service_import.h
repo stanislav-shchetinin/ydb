@@ -18,9 +18,39 @@ public:
     TCommandImport();
 };
 
-class TCommandImportFromS3 : public TYdbOperationCommand,
-                           public TCommandWithAwsCredentials,
+class TCommandImportBase : public TYdbOperationCommand,
                            public TCommandWithOutput {
+public:
+    using TYdbOperationCommand::TYdbOperationCommand;
+
+protected:
+    struct TItemFields {
+        TString Source;
+        TString Destination;
+    };
+    DEFINE_PARSEABLE_STRUCT(TItem, TItemFields, Source, Destination);
+
+    void ConfigCommonImportOptions(TConfig& config);
+    void ParseCommonImportOptions(TConfig& config);
+    void ExtractCommonImportParams(TConfig& config);
+
+    TVector<TItem> Items;
+    TVector<TRegExMatch> ExclusionPatterns;
+    TVector<TString> IncludePaths;
+    TString Description;
+    ui32 NumberOfRetries = 10;
+    NImport::EIndexPopulationMode IndexPopulationMode = NImport::EIndexPopulationMode::Build;
+    bool NoACL = false;
+    bool SkipChecksumValidation = false;
+    TString CommonDestinationPath;
+
+    // Encryption params
+    TString EncryptionKey;
+    TString EncryptionKeyFile;
+};
+
+class TCommandImportFromS3 : public TCommandImportBase,
+                             public TCommandWithAwsCredentials {
 public:
     TCommandImportFromS3();
     void Config(TConfig& config) override;
@@ -35,31 +65,24 @@ public:
     TSettings MakeSettings();
 
 private:
-    struct TItemFields {
-        TString Source;
-        TString Destination;
-    };
-    DEFINE_PARSEABLE_STRUCT(TItem, TItemFields, Source, Destination);
-
     TString AwsEndpoint;
     ES3Scheme AwsScheme = ES3Scheme::HTTPS;
     TString AwsBucket;
-    TVector<TItem> Items;
-    TVector<TRegExMatch> ExclusionPatterns;
-    TVector<TString> IncludePaths;
-    TString Description;
-    ui32 NumberOfRetries = 10;
-    NImport::EIndexPopulationMode IndexPopulationMode = NImport::EIndexPopulationMode::Build;
     bool UseVirtualAddressing = true;
-    bool NoACL = false;
-    bool SkipChecksumValidation = false;
     TString CommonSourcePrefix;
-    TString CommonDestinationPath;
     bool ListObjectsInExistingExport = false;
+};
 
-    // Encryption params
-    TString EncryptionKey;
-    TString EncryptionKeyFile;
+class TCommandImportFromFs : public TCommandImportBase {
+public:
+    TCommandImportFromFs();
+    void Config(TConfig& config) override;
+    void Parse(TConfig& config) override;
+    void ExtractParams(TConfig& config) override;
+    int Run(TConfig& config) override;
+
+private:
+    TString BasePath;
 };
 
 class TCommandImportFromFile : public TClientCommandTree {

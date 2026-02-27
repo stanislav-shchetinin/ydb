@@ -29,16 +29,147 @@
 
 namespace NYdb::NConsoleClient {
 
+namespace {
+
+    // Returns EXIT_SUCCESS on success, EXIT_FAILURE on error (with message printed to Cerr)
+    int DecodeEncryptionKey(TString& encryptionKey, const TString& encryptionKeyFile) {
+        if (encryptionKey && !encryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
+            try {
+                encryptionKey = HexDecode(encryptionKey);
+            } catch (const std::exception&) {
+                // Don't print error, it may contain secret.
+                Cerr << "Failed to decode encryption key from hex" << Endl;
+                return EXIT_FAILURE;
+            }
+        }
+        return EXIT_SUCCESS;
+    }
+
+    void ConfigEncryptionKeyOption(TClientCommand::TConfig& config, TString& encryptionKey, TString& encryptionKeyFile) {
+        config.Opts->AddLongOption("encryption-key-file", "File path that contains encryption key or env that contains hex encoded key value")
+            .Env("YDB_ENCRYPTION_KEY_FILE", true, "encryption key file")
+            .Env("YDB_ENCRYPTION_KEY", false)
+            .FileName("encryption key file").RequiredArgument("PATH")
+            .StoreFilePath(&encryptionKeyFile)
+            .StoreResult(&encryptionKey);
+    }
+
+    void ConfigIndexPopulationModeOption(TClientCommand::TConfig& config, NImport::EIndexPopulationMode& indexPopulationMode) {
+        auto colors = NConsoleClient::AutoColors(Cout);
+        TStringBuilder help;
+        help << "Index population mode. Supported values: ";
+        bool first = true;
+        for (auto mode : GetEnumAllValues<NImport::EIndexPopulationMode>()) {
+            if (mode == NImport::EIndexPopulationMode::Unknown) {
+                continue;
+            }
+
+            if (!first && config.HelpCommandVerbosiltyLevel < 2) {
+                help << ", ";
+            }
+
+            if (config.HelpCommandVerbosiltyLevel >= 2) {
+                help << Endl;
+                switch (mode) {
+                case NImport::EIndexPopulationMode::Build:
+                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": build index";
+                    break;
+                case NImport::EIndexPopulationMode::Import:
+                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": import index data";
+                    break;
+                case NImport::EIndexPopulationMode::Auto:
+                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": try to import index data, build otherwise";
+                    break;
+                case NImport::EIndexPopulationMode::Unknown:
+                    break;
+                }
+            } else {
+                help << colors.BoldColor() << mode << colors.OldColor();
+            }
+
+            first = false;
+        }
+        config.Opts->AddLongOption("index-population-mode", help)
+            .RequiredArgument("STRING").StoreResult(&indexPopulationMode).DefaultValue(indexPopulationMode);
+    }
+
+} // anonymous namespace
+
 TCommandImport::TCommandImport()
     : TClientCommandTree("import", {}, "Import service operations")
 {
     AddCommand(std::make_unique<TCommandImportFromS3>());
+    AddCommand(std::make_unique<TCommandImportFromFs>());
     AddCommand(std::make_unique<TCommandImportFromFile>());
+}
+
+/// Import base
+void TCommandImportBase::ConfigCommonImportOptions(TConfig& config) {
+    config.Opts->AddLongOption("destination-path", "Destination folder in database for the objects being imported")
+        .RequiredArgument("PATH").StoreResult(&CommonDestinationPath);
+
+    config.Opts->AddLongOption("include", "Schema objects to be included in the import. Directories are traversed recursively. The option can be used multiple times")
+        .RequiredArgument("PATH").AppendTo(&IncludePaths);
+
+    config.Opts->AddLongOption("exclude", "Pattern (PCRE) for paths excluded from import operation")
+        .RequiredArgument("STRING").Handler([this](const TString& arg) {
+            ExclusionPatterns.emplace_back(TRegExMatch(arg));
+        });
+
+    config.Opts->AddLongOption("item", TItem::FormatHelp("Item specification", config.HelpCommandVerbosiltyLevel, 2))
+        .RequiredArgument("PROPERTY=VALUE,...");
+
+    config.Opts->AddLongOption("description", "Textual description of import operation")
+        .RequiredArgument("STRING").StoreResult(&Description);
+
+    config.Opts->AddLongOption("retries", "Number of retries")
+        .RequiredArgument("NUM").StoreResult(&NumberOfRetries).DefaultValue(NumberOfRetries);
+
+    ConfigIndexPopulationModeOption(config, IndexPopulationMode);
+
+    config.Opts->AddLongOption("no-acl", "Prevent importing of ACL and owner")
+        .RequiredArgument("BOOL").StoreTrue(&NoACL).DefaultValue("false");
+
+    config.Opts->AddLongOption("skip-checksum-validation", "Skip checksum validation during import")
+        .RequiredArgument("BOOL").StoreTrue(&SkipChecksumValidation).DefaultValue("false");
+
+    ConfigEncryptionKeyOption(config, EncryptionKey, EncryptionKeyFile);
+
+    AddDeprecatedJsonOption(config);
+    AddOutputFormats(config, { EDataFormat::Pretty, EDataFormat::ProtoJsonBase64 });
+    config.Opts->MutuallyExclusive("json", "format");
+}
+
+void TCommandImportBase::ParseCommonImportOptions(TConfig& config) {
+    TClientCommand::Parse(config);
+    ParseOutputFormats();
+
+    Items = TItem::Parse(config, "item");
+
+    if (!Items.empty() && !IncludePaths.empty()) {
+        throw TMisuseException() << "Both --item and --include parameters are not supported together";
+    }
+
+    if (!Items.empty() && (!EncryptionKey.empty() || !EncryptionKeyFile.empty())) {
+        throw TMisuseException() << "Cannot use --item parameter with encrypted exports";
+    }
+}
+
+void TCommandImportBase::ExtractCommonImportParams(TConfig& config) {
+    TClientCommand::ExtractParams(config);
+    for (auto& item : Items) {
+        if (item.Destination) {
+            if (CommonDestinationPath && item.Destination[0] != '/') {
+                item.Destination = CommonDestinationPath + "/" + item.Destination;
+            }
+            NConsoleClient::AdjustPath(item.Destination, config);
+        }
+    }
 }
 
 /// S3
 TCommandImportFromS3::TCommandImportFromS3()
-    : TYdbOperationCommand("s3", {}, "Create import from S3.\nFor more info go to: ydb.tech/docs/en/reference/ydb-cli/export-import/import-s3")
+    : TCommandImportBase("s3", {}, "Create import from S3.\nFor more info go to: ydb.tech/docs/en/reference/ydb-cli/export-import/import-s3")
 {
     TItem::DefineFields({
         {"Source", {{"source", "src", "s"}, "S3 object key prefix", true}},
@@ -81,64 +212,6 @@ void TCommandImportFromS3::Config(TConfig& config) {
     config.Opts->AddLongOption("source-prefix", "Source prefix for export in the bucket")
         .RequiredArgument("PREFIX").StoreResult(&CommonSourcePrefix);
 
-    config.Opts->AddLongOption("destination-path", "Destination folder in database for the objects being imported")
-        .RequiredArgument("PATH").StoreResult(&CommonDestinationPath);
-
-    config.Opts->AddLongOption("include", "Schema objects to be included in the import. Directories are traversed recursively. The option can be used multiple times")
-        .RequiredArgument("PATH").AppendTo(&IncludePaths);
-
-    config.Opts->AddLongOption("exclude", "Pattern (PCRE) for paths excluded from import operation")
-        .RequiredArgument("STRING").Handler([this](const TString& arg) {
-            ExclusionPatterns.emplace_back(TRegExMatch(arg));
-        });
-
-    config.Opts->AddLongOption("item", TItem::FormatHelp("Item specification", config.HelpCommandVerbosiltyLevel, 2))
-        .RequiredArgument("PROPERTY=VALUE,...");
-
-    config.Opts->AddLongOption("description", "Textual description of import operation")
-        .RequiredArgument("STRING").StoreResult(&Description);
-
-    config.Opts->AddLongOption("retries", "Number of retries")
-        .RequiredArgument("NUM").StoreResult(&NumberOfRetries).DefaultValue(NumberOfRetries);
-
-    {
-        TStringBuilder help;
-        help << "Index population mode. Supported values: ";
-        bool first = true;
-        for (auto mode : GetEnumAllValues<NImport::EIndexPopulationMode>()) {
-            if (mode == NImport::EIndexPopulationMode::Unknown) {
-                continue;
-            }
-
-            if (!first && config.HelpCommandVerbosiltyLevel < 2) {
-                help << ", ";
-            }
-
-            if (config.HelpCommandVerbosiltyLevel >= 2) {
-                help << Endl;
-                switch (mode) {
-                case NImport::EIndexPopulationMode::Build:
-                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": build index";
-                    break;
-                case NImport::EIndexPopulationMode::Import:
-                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": import index data";
-                    break;
-                case NImport::EIndexPopulationMode::Auto:
-                    help << "    - " << colors.BoldColor() << mode << colors.OldColor() << ": try to import index data, build otherwise";
-                    break;
-                case NImport::EIndexPopulationMode::Unknown:
-                    break;
-                }
-            } else {
-                help << colors.BoldColor() << mode << colors.OldColor();
-            }
-
-            first = false;
-        }
-        config.Opts->AddLongOption("index-population-mode", help)
-            .RequiredArgument("STRING").StoreResult(&IndexPopulationMode).DefaultValue(IndexPopulationMode);
-    }
-
     config.Opts->AddLongOption("use-virtual-addressing", TStringBuilder()
             << "Sets bucket URL style. Value "
             << colors.BoldColor() << "true" << colors.OldColor()
@@ -147,63 +220,30 @@ void TCommandImportFromS3::Config(TConfig& config) {
             << " - Path-Style URL.")
         .RequiredArgument("BOOL").StoreResult<bool>(&UseVirtualAddressing).DefaultValue("true");
 
-    config.Opts->AddLongOption("no-acl", "Prevent importing of ACL and owner")
-        .RequiredArgument("BOOL").StoreTrue(&NoACL).DefaultValue("false");
-
-    config.Opts->AddLongOption("skip-checksum-validation", "Skip checksum validation during import")
-        .RequiredArgument("BOOL").StoreTrue(&SkipChecksumValidation).DefaultValue("false");
-
-    config.Opts->AddLongOption("encryption-key-file", "File path that contains encryption key or env that contains hex encoded key value")
-        .Env("YDB_ENCRYPTION_KEY_FILE", true, "encryption key file")
-        .Env("YDB_ENCRYPTION_KEY", false)
-        .FileName("encryption key file").RequiredArgument("PATH")
-        .StoreFilePath(&EncryptionKeyFile)
-        .StoreResult(&EncryptionKey);
-
     config.Opts->AddLongOption('l', "list", "List objects in an existing export")
         .RequiredArgument("BOOL").StoreTrue(&ListObjectsInExistingExport).DefaultValue("false");
 
-    AddDeprecatedJsonOption(config);
-    AddOutputFormats(config, { EDataFormat::Pretty, EDataFormat::ProtoJsonBase64 });
-    config.Opts->MutuallyExclusive("json", "format");
+    ConfigCommonImportOptions(config);
 }
 
 void TCommandImportFromS3::Parse(TConfig& config) {
-    TClientCommand::Parse(config);
-    ParseOutputFormats();
+    ParseCommonImportOptions(config);
 
     ParseAwsProfile(config, "aws-profile");
     ParseAwsAccessKey(config, "access-key");
     ParseAwsSecretKey(config, "secret-key");
 
-    Items = TItem::Parse(config, "item");
     if (Items.empty() && !CommonSourcePrefix) {
         throw TMisuseException() << "No source prefix was provided";
-    }
-
-    if (!Items.empty() && !IncludePaths.empty()) {
-        throw TMisuseException() << "Both --item and --include parameters are not supported together";
     }
 
     if (!Items.empty() && ListObjectsInExistingExport) {
         throw TMisuseException() << "Cannot use --item parameter with --list";
     }
-
-    if (!Items.empty() && (!EncryptionKey.empty() || !EncryptionKeyFile.empty())) {
-        throw TMisuseException() << "Cannot use --item parameter with encrypted exports";
-    }
 }
 
 void TCommandImportFromS3::ExtractParams(TConfig& config) {
-    TClientCommand::ExtractParams(config);
-    for (auto& item : Items) {
-        if (item.Destination) {
-            if (CommonDestinationPath && item.Destination[0] != '/') {
-                item.Destination = CommonDestinationPath + "/" + item.Destination;
-            }
-            NConsoleClient::AdjustPath(item.Destination, config);
-        }
-    }
+    ExtractCommonImportParams(config);
 }
 
 bool IsSupportedObject(TStringBuf& key) {
@@ -375,14 +415,8 @@ static int PrintListObjectResult(const NImport::TListObjectsInS3ExportResult& re
 }
 
 int TCommandImportFromS3::Run(TConfig& config) {
-    if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
-        try {
-            EncryptionKey = HexDecode(EncryptionKey);
-        } catch (const std::exception&) {
-            // Don't print error, it may contain secret.
-            Cerr << "Failed to decode encryption key from hex" << Endl;
-            return EXIT_FAILURE;
-        }
+    if (DecodeEncryptionKey(EncryptionKey, EncryptionKeyFile) != EXIT_SUCCESS) {
+        return EXIT_FAILURE;
     }
 
     const bool encryption = !EncryptionKey.empty();
@@ -410,6 +444,80 @@ int TCommandImportFromS3::Run(TConfig& config) {
     return returnCode;
 }
 
+/// FS
+TCommandImportFromFs::TCommandImportFromFs()
+    : TCommandImportBase("fs", {}, "Create import from file system")
+{
+    TItem::DefineFields({
+        {"Source", {{"source", "src", "s"}, "FS path (relative to base-path)", true}},
+        {"Destination", {{"destination", "dst", "d"}, "Database path to a table to import to", true}},
+    });
+}
+
+void TCommandImportFromFs::Config(TConfig& config) {
+    TYdbOperationCommand::Config(config);
+
+    config.Opts->AddLongOption("base-path", "Base path on FS where the export is located (must be an absolute path)")
+        .Required().RequiredArgument("PATH").StoreResult(&BasePath);
+
+    ConfigCommonImportOptions(config);
+}
+
+void TCommandImportFromFs::Parse(TConfig& config) {
+    ParseCommonImportOptions(config);
+}
+
+void TCommandImportFromFs::ExtractParams(TConfig& config) {
+    ExtractCommonImportParams(config);
+}
+
+int TCommandImportFromFs::Run(TConfig& config) {
+    if (DecodeEncryptionKey(EncryptionKey, EncryptionKeyFile) != EXIT_SUCCESS) {
+        return EXIT_FAILURE;
+    }
+
+    const bool encryption = !EncryptionKey.empty();
+
+    using namespace NImport;
+    TImportFromFsSettings settings = FillSettings(TImportFromFsSettings());
+
+    settings.BasePath(BasePath);
+
+    for (const auto& item : Items) {
+        settings.AppendItem({item.Source, item.Destination});
+    }
+
+    for (const TString& path : IncludePaths) {
+        settings.AppendItem({.Src = path, .Dst = {}});
+    }
+
+    if (Description) {
+        settings.Description(Description);
+    }
+
+    settings.NumberOfRetries(NumberOfRetries);
+    settings.IndexPopulationMode(IndexPopulationMode);
+    settings.NoACL(NoACL);
+    settings.SkipChecksumValidation(SkipChecksumValidation);
+
+    if (CommonDestinationPath) {
+        settings.DestinationPath(CommonDestinationPath);
+    }
+
+    if (encryption) {
+        settings.SymmetricKey(EncryptionKey);
+    }
+
+    ExcludeItems(settings, ExclusionPatterns);
+
+    TImportClient client(CreateDriver(config));
+    TImportFromFsResponse response = client.ImportFromFs(std::move(settings)).GetValueSync();
+    ThrowOnError(response);
+    PrintOperation(response, OutputFormat);
+
+    return EXIT_SUCCESS;
+}
+
 /// File
 
 TCommandImportFromFile::TCommandImportFromFile()
@@ -428,9 +536,9 @@ void TCommandImportFileBase::Config(TConfig& config) {
 
     config.Opts->GetOpts().SetTrailingArgTitle("<input files...>",
             "One or more file paths to import from. If a directory is provided, all files in the directory with supported extension will be imported.");
-    config.Opts->AddLongOption("timeout", "Operation timeout. Supports time units (e.g., '5s', '1m'). Plain number interpreted as milliseconds. "
-            "There could also be a delay up to 200ms to receive timeout error from server.")
-        .RequiredArgument("DURATION").StoreMappedResult(&OperationTimeout, &ParseDurationMilliseconds).DefaultValue(TDuration::Seconds(5 * 60));
+    config.Opts->AddLongOption("timeout", "Operation timeout. Operation should be executed on server within this timeout. "
+            "There could also be a delay up to 200ms to receive timeout error from server")
+        .RequiredArgument("VAL").StoreResult(&OperationTimeout).DefaultValue(TDuration::Seconds(5 * 60));
 
     config.Opts->AddLongOption('p', "path", "Database path to table")
         .Required().RequiredArgument("STRING").StoreResult(&Path);

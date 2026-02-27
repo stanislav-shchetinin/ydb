@@ -109,6 +109,84 @@ namespace {
         ExcludeItems(settings, exclusionPatterns);
     }
 
+    // Returns EXIT_SUCCESS on success, EXIT_FAILURE on error (with message printed to Cerr)
+    int DecodeEncryptionKey(TString& encryptionKey, const TString& encryptionKeyFile) {
+        if (encryptionKey && !encryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
+            try {
+                encryptionKey = HexDecode(encryptionKey);
+            } catch (const std::exception&) {
+                // Don't print error, it may contain secret.
+                Cerr << "Failed to decode encryption key from hex" << Endl;
+                return EXIT_FAILURE;
+            }
+        }
+        return EXIT_SUCCESS;
+    }
+
+    bool ValidateEncryptionParams(const TString& encryptionAlgorithm, const TString& encryptionKey) {
+        if (encryptionAlgorithm && !encryptionKey) {
+            Cerr << "No encryption key provided" << Endl;
+            return false;
+        }
+        if (encryptionKey && !encryptionAlgorithm) {
+            Cerr << "No encryption algorithm provided" << Endl;
+            return false;
+        }
+        return true;
+    }
+
+    void ConfigCompressionOption(TClientCommand::TConfig& config, TString& compression) {
+        auto colors = NConsoleClient::AutoColors(Cout);
+        TStringBuilder codecHelp;
+        codecHelp << "Codec used to compress data. Available options: ";
+        if (config.HelpCommandVerbosiltyLevel >= 2) {
+            codecHelp << Endl
+                << "    - " << colors.BoldColor() << "zstd" << colors.OldColor() << Endl
+                << "    - " << colors.BoldColor() << "zstd-N" << colors.OldColor() << " (N is compression level in range [1, 22], e.g. zstd-3)" << Endl;
+        } else {
+            codecHelp << colors.BoldColor() << "zstd" << colors.OldColor() << ", "
+                << colors.BoldColor() << "zstd-N" << colors.OldColor();
+        }
+        config.Opts->AddLongOption("compression", codecHelp)
+            .RequiredArgument("STRING").StoreResult(&compression);
+    }
+
+    void ConfigIncludeIndexDataOption(TClientCommand::TConfig& config, bool& includeIndexData) {
+        TStringBuilder help;
+        help << "Include index data or not";
+        if (config.HelpCommandVerbosiltyLevel >= 2) {
+            help << Endl << "    By default, only index metadata is uploaded and indexes are built during import — it"
+                 << Endl << "    saves space and reduces export time, but it can potentially increase the import time."
+                 << Endl << "    Index data can be uploaded and downloaded back during import.";
+        }
+        config.Opts->AddLongOption("include-index-data", help)
+            .RequiredArgument("BOOL").StoreResult<bool>(&includeIndexData).DefaultValue("false");
+    }
+
+    void ConfigEncryptionOptions(TClientCommand::TConfig& config, TString& encryptionAlgorithm, TString& encryptionKey, TString& encryptionKeyFile) {
+        auto colors = NConsoleClient::AutoColors(Cout);
+        TStringBuilder encryptionAlgorithmHelp;
+        encryptionAlgorithmHelp << "Encryption algorithm. Supported values: ";
+        bool first = true;
+        for (const auto& alg : {"AES-128-GCM", "AES-256-GCM", "ChaCha20-Poly1305"}) {
+            if (first) {
+                first = false;
+            } else {
+                encryptionAlgorithmHelp << ", ";
+            }
+            encryptionAlgorithmHelp << colors.BoldColor() << alg << colors.OldColor();
+        }
+        config.Opts->AddLongOption("encryption-algorithm", encryptionAlgorithmHelp)
+            .RequiredArgument("NAME").StoreResult(&encryptionAlgorithm);
+
+        config.Opts->AddLongOption("encryption-key-file", "File path that contains encryption key or env that contains hex encoded key value")
+            .Env("YDB_ENCRYPTION_KEY_FILE", true, "encryption key file")
+            .Env("YDB_ENCRYPTION_KEY", false)
+            .FileName("encryption key file").RequiredArgument("PATH")
+            .StoreFilePath(&encryptionKeyFile)
+            .StoreResult(&encryptionKey);
+    }
+
 } // anonymous namespace
 
 TCommandExport::TCommandExport(bool useExportToYt)
@@ -118,6 +196,61 @@ TCommandExport::TCommandExport(bool useExportToYt)
         AddCommand(std::make_unique<TCommandExportToYt>());
     }
     AddCommand(std::make_unique<TCommandExportToS3>());
+    AddCommand(std::make_unique<TCommandExportToFs>());
+}
+
+/// Export base
+void TCommandExportBase::ConfigCommonExportOptions(TConfig& config) {
+    config.Opts->AddLongOption("root-path", "Root directory in database for the objects being exported, database root if not provided")
+        .RequiredArgument("PATH").StoreResult(&CommonSourcePath);
+
+    config.Opts->AddLongOption("include", "Schema objects to be included in the export. Directories are traversed recursively. The option can be used multiple times")
+        .RequiredArgument("PATH").Handler([this](const TString& arg) {
+            TItem item;
+            item.Source = arg;
+            Items.emplace_back(std::move(item));
+        });
+
+    config.Opts->AddLongOption("exclude", "Pattern (PCRE) for paths excluded from export operation")
+        .RequiredArgument("STRING").Handler([this](const TString& arg) {
+            ExclusionPatterns.emplace_back(TRegExMatch(arg));
+        });
+
+    config.Opts->AddLongOption("item", TItem::FormatHelp("Item specification", config.HelpCommandVerbosiltyLevel, 2))
+        .RequiredArgument("PROPERTY=VALUE,...");
+
+    config.Opts->AddLongOption("description", "Textual description of export operation")
+        .RequiredArgument("STRING").StoreResult(&Description);
+
+    config.Opts->AddLongOption("retries", "Number of retries")
+        .RequiredArgument("NUM").StoreResult(&NumberOfRetries).DefaultValue(NumberOfRetries);
+
+    ConfigCompressionOption(config, Compression);
+    ConfigIncludeIndexDataOption(config, IncludeIndexData);
+    ConfigEncryptionOptions(config, EncryptionAlgorithm, EncryptionKey, EncryptionKeyFile);
+
+    AddDeprecatedJsonOption(config);
+    AddOutputFormats(config, { EDataFormat::Pretty, EDataFormat::ProtoJsonBase64 });
+    config.Opts->MutuallyExclusive("json", "format");
+}
+
+void TCommandExportBase::ParseCommonExportOptions(TConfig& config) {
+    TClientCommand::Parse(config);
+    ParseOutputFormats();
+
+    auto items = TItem::Parse(config, "item");
+    Items.insert(Items.end(), items.begin(), items.end());
+}
+
+void TCommandExportBase::ExtractCommonExportParams(TConfig& config) {
+    TClientCommand::ExtractParams(config);
+
+    for (auto& item : Items) {
+        if (CommonSourcePath && item.Source && item.Source[0] != '/') {
+            item.Source = CommonSourcePath + "/" + item.Source;
+        }
+        NConsoleClient::AdjustPath(item.Source, config);
+    }
 }
 
 /// YT
@@ -241,7 +374,7 @@ int TCommandExportToYt::Run(TConfig& config) {
 
 /// S3
 TCommandExportToS3::TCommandExportToS3()
-    : TYdbOperationCommand("s3", {}, "Create export to S3.\nFor more info go to: ydb.tech/docs/en/reference/ydb-cli/export-import/export-s3")
+    : TCommandExportBase("s3", {}, "Create export to S3.\nFor more info go to: ydb.tech/docs/en/reference/ydb-cli/export-import/export-s3")
 {
     TItem::DefineFields({
         {"Source", {{"source", "src", "s"}, "Database path to a directory or a table to be exported", true}},
@@ -308,45 +441,6 @@ void TCommandExportToS3::Config(TConfig& config) {
     config.Opts->AddLongOption("destination-prefix", "Destination prefix for export in bucket")
         .RequiredArgument("PREFIX").StoreResult(&CommonDestinationPrefix);
 
-    config.Opts->AddLongOption("root-path", "Root directory in database for the objects being exported, database root if not provided")
-        .RequiredArgument("PATH").StoreResult(&CommonSourcePath);
-
-    config.Opts->AddLongOption("include", "Schema objects to be included in the export. Directories are traversed recursively. The option can be used multiple times")
-        .RequiredArgument("PATH").Handler([this](const TString& arg) {
-            TItem item;
-            item.Source = arg;
-            Items.emplace_back(std::move(item));
-        });
-
-    config.Opts->AddLongOption("exclude", "Pattern (PCRE) for paths excluded from export operation")
-        .RequiredArgument("STRING").Handler([this](const TString& arg) {
-            ExclusionPatterns.emplace_back(TRegExMatch(arg));
-        });
-
-    config.Opts->AddLongOption("item", TItem::FormatHelp("Item specification", config.HelpCommandVerbosiltyLevel, 2))
-        .RequiredArgument("PROPERTY=VALUE,...");
-
-    config.Opts->AddLongOption("description", "Textual description of export operation")
-        .RequiredArgument("STRING").StoreResult(&Description);
-
-    config.Opts->AddLongOption("retries", "Number of retries")
-        .RequiredArgument("NUM").StoreResult(&NumberOfRetries).DefaultValue(NumberOfRetries);
-
-    {
-        TStringBuilder codecHelp;
-        codecHelp << "Codec used to compress data. Available options: ";
-        if (config.HelpCommandVerbosiltyLevel >= 2) {
-            codecHelp << Endl
-                << "    - " << colors.BoldColor() << "zstd" << colors.OldColor() << Endl
-                << "    - " << colors.BoldColor() << "zstd-N" << colors.OldColor() << " (N is compression level in range [1, 22], e.g. zstd-3)" << Endl;
-        } else {
-            codecHelp << colors.BoldColor() << "zstd" << colors.OldColor() << ", "
-                << colors.BoldColor() << "zstd-N" << colors.OldColor();
-        }
-        config.Opts->AddLongOption("compression", codecHelp)
-            .RequiredArgument("STRING").StoreResult(&Compression);
-    }
-
     config.Opts->AddLongOption("use-virtual-addressing", TStringBuilder()
             << "Sets bucket URL style. Value "
             << colors.BoldColor() << "true" << colors.OldColor()
@@ -355,90 +449,31 @@ void TCommandExportToS3::Config(TConfig& config) {
             << " - Path-Style URL")
         .RequiredArgument("BOOL").StoreResult<bool>(&UseVirtualAddressing).DefaultValue("true");
 
-    {
-        TStringBuilder help;
-        help << "Include index data or not";
-        if (config.HelpCommandVerbosiltyLevel >= 2) {
-            help << Endl << "    By default, only index metadata is uploaded and indexes are built during import — it"
-                 << Endl << "    saves space and reduces export time, but it can potentially increase the import time."
-                 << Endl << "    Index data can be uploaded and downloaded back during import.";
-        }
-        config.Opts->AddLongOption("include-index-data", help)
-            .RequiredArgument("BOOL").StoreResult<bool>(&IncludeIndexData).DefaultValue("false");
-    }
-
-    {
-        TStringBuilder encryptionAlgorithmHelp;
-        encryptionAlgorithmHelp << "Encryption algorithm. Supported values: ";
-        bool first = true;
-        for (const auto& alg : {"AES-128-GCM", "AES-256-GCM", "ChaCha20-Poly1305"}) {
-            if (first) {
-                first = false;
-            } else {
-                encryptionAlgorithmHelp << ", ";
-            }
-            encryptionAlgorithmHelp << colors.BoldColor() << alg << colors.OldColor();
-        }
-        config.Opts->AddLongOption("encryption-algorithm", encryptionAlgorithmHelp)
-            .RequiredArgument("NAME").StoreResult(&EncryptionAlgorithm);
-    }
-
-    config.Opts->AddLongOption("encryption-key-file", "File path that contains encryption key or env that contains hex encoded key value")
-        .Env("YDB_ENCRYPTION_KEY_FILE", true, "encryption key file")
-        .Env("YDB_ENCRYPTION_KEY", false)
-        .FileName("encryption key file").RequiredArgument("PATH")
-        .StoreFilePath(&EncryptionKeyFile)
-        .StoreResult(&EncryptionKey);
-
-    AddDeprecatedJsonOption(config);
-    AddOutputFormats(config, { EDataFormat::Pretty, EDataFormat::ProtoJsonBase64 });
-    config.Opts->MutuallyExclusive("json", "format");
+    ConfigCommonExportOptions(config);
 }
 
 void TCommandExportToS3::Parse(TConfig& config) {
-    TClientCommand::Parse(config);
-    ParseOutputFormats();
+    ParseCommonExportOptions(config);
 
     ParseAwsProfile(config, "aws-profile");
     ParseAwsAccessKey(config, "access-key");
     ParseAwsSecretKey(config, "secret-key");
 
-    auto items = TItem::Parse(config, "item");
-    Items.insert(Items.end(), items.begin(), items.end());
     if (Items.empty() && !CommonDestinationPrefix) {
         throw TMisuseException() << "No destination prefix was provided";
     }
 }
 
 void TCommandExportToS3::ExtractParams(TConfig& config) {
-    TClientCommand::ExtractParams(config);
-
-    for (auto& item : Items) {
-        if (CommonSourcePath && item.Source && item.Source[0] != '/') {
-            item.Source = CommonSourcePath + "/" + item.Source;
-        }
-        NConsoleClient::AdjustPath(item.Source, config);
-    }
+    ExtractCommonExportParams(config);
 }
 
 int TCommandExportToS3::Run(TConfig& config) {
-    if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
-        try {
-            EncryptionKey = HexDecode(EncryptionKey);
-        } catch (const std::exception&) {
-            // Don't print error, it may contain secret.
-            Cerr << "Failed to decode encryption key from hex" << Endl;
-            return EXIT_FAILURE;
-        }
-    }
-
-    if (EncryptionAlgorithm && !EncryptionKey) {
-        Cerr << "No encryption key provided" << Endl;
+    if (DecodeEncryptionKey(EncryptionKey, EncryptionKeyFile) != EXIT_SUCCESS) {
         return EXIT_FAILURE;
     }
 
-    if (EncryptionKey && !EncryptionAlgorithm) {
-        Cerr << "No encryption algorithm provided" << Endl;
+    if (!ValidateEncryptionParams(EncryptionAlgorithm, EncryptionKey)) {
         return EXIT_FAILURE;
     }
 
@@ -513,6 +548,106 @@ int TCommandExportToS3::Run(TConfig& config) {
         settings.Item_ = std::move(originalItems);
         ExpandItems(schemeClient, tableClient, settings, ExclusionPatterns, FilterTables);
         response = client.ExportToS3(settings).ExtractValueSync();
+    }
+    ThrowOnError(response);
+    PrintOperation(response, OutputFormat);
+
+    return EXIT_SUCCESS;
+}
+
+/// FS
+TCommandExportToFs::TCommandExportToFs()
+    : TCommandExportBase("fs", {}, "Create export to file system")
+{
+    TItem::DefineFields({
+        {"Source", {{"source", "src", "s"}, "Database path to a directory or a table to be exported", true}},
+        {"Destination", {{"destination", "dst", "d"}, "FS path (relative to base-path)", true}},
+    });
+}
+
+void TCommandExportToFs::Config(TConfig& config) {
+    TYdbOperationCommand::Config(config);
+
+    config.Opts->AddLongOption("base-path", "Base path on FS where to write all export items (must be an absolute path)")
+        .Required().RequiredArgument("PATH").StoreResult(&BasePath);
+
+    ConfigCommonExportOptions(config);
+}
+
+void TCommandExportToFs::Parse(TConfig& config) {
+    ParseCommonExportOptions(config);
+}
+
+void TCommandExportToFs::ExtractParams(TConfig& config) {
+    ExtractCommonExportParams(config);
+}
+
+int TCommandExportToFs::Run(TConfig& config) {
+    if (DecodeEncryptionKey(EncryptionKey, EncryptionKeyFile) != EXIT_SUCCESS) {
+        return EXIT_FAILURE;
+    }
+
+    if (!ValidateEncryptionParams(EncryptionAlgorithm, EncryptionKey)) {
+        return EXIT_FAILURE;
+    }
+
+    const bool encryption = EncryptionAlgorithm && EncryptionKey;
+
+    using namespace NExport;
+    using namespace NScheme;
+    using namespace NTable;
+
+    TExportToFsSettings settings = FillSettings(TExportToFsSettings());
+
+    settings.BasePath(BasePath);
+    settings.IncludeIndexData(IncludeIndexData);
+
+    for (const auto& item : Items) {
+        settings.AppendItem({item.Source, item.Destination});
+    }
+
+    if (Description) {
+        settings.Description(Description);
+    }
+
+    settings.NumberOfRetries(NumberOfRetries);
+
+    if (Compression) {
+        settings.Compression(Compression);
+    }
+
+    if (CommonSourcePath) {
+        settings.SourcePath(CommonSourcePath);
+    }
+
+    if (encryption) {
+        settings.SymmetricEncryption(EncryptionAlgorithm, EncryptionKey);
+    }
+
+    // Server handles recursive directory listing for FS exports with base-path.
+    // We only expand items client-side if exclusion patterns are specified.
+    const bool expandItems = !ExclusionPatterns.empty();
+    if (expandItems && settings.Item_.empty()) {
+        settings.AppendItem(TExportToFsSettings::TItem{.Src = CommonSourcePath ? CommonSourcePath : config.Database, .Dst = {}});
+    }
+
+    const TDriver driver = CreateDriver(config);
+
+    TSchemeClient schemeClient(driver);
+    TExportClient client(driver);
+    TTableClient tableClient(driver);
+
+    auto originalItems = settings.Item_;
+    if (expandItems) {
+        ExpandItems(schemeClient, tableClient, settings, ExclusionPatterns, FilterAllSupportedSchemeObjects);
+    }
+    TExportToFsResponse response = client.ExportToFs(settings).ExtractValueSync();
+    if (expandItems && response.Status().GetStatus() == EStatus::BAD_REQUEST) {
+        // Retry the export operation limiting the scope to tables only.
+        // This approach ensures compatibility with servers running an older version of YDB.
+        settings.Item_ = std::move(originalItems);
+        ExpandItems(schemeClient, tableClient, settings, ExclusionPatterns, FilterTables);
+        response = client.ExportToFs(settings).ExtractValueSync();
     }
     ThrowOnError(response);
     PrintOperation(response, OutputFormat);

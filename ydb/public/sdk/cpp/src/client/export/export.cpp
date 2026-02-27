@@ -297,6 +297,8 @@ TFuture<TExportToFsResponse> TExportClient::ExportToFs(const TExportToFsSettings
         request.mutable_settings()->set_source_path(settings.SourcePath_.value());
     }
 
+    request.mutable_settings()->set_include_index_data(settings.IncludeIndexData_);
+
     if (settings.EncryptionAlgorithm_.empty() != settings.SymmetricKey_.empty()) {
         throw TContractViolation("Encryption algorithm and symmetric key must be set together");
     }
