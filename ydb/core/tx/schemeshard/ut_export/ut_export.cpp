@@ -16,9 +16,13 @@
 #include <ydb/core/util/aws.h>
 #include <ydb/core/wrappers/s3_wrapper.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
+#include <ydb/library/testlib/helpers.h>
 
 #include <library/cpp/testing/hook/hook.h>
 
+#include <util/folder/dirut.h>
+#include <util/folder/tempdir.h>
+#include <util/stream/file.h>
 #include <util/string/builder.h>
 #include <util/string/cast.h>
 #include <util/string/printf.h>
@@ -252,8 +256,112 @@ namespace {
         fieldChecker(proto);
     }
 
+    struct TExportItem {
+        TString SourcePath;
+        TString Destination;
+    };
+
+    TString MakeS3RequestItems(const TVector<TExportItem>& items) {
+        TStringBuilder result;
+        for (const auto& item : items) {
+            result << "items { source_path: \"" << item.SourcePath << "\" destination_prefix: \"" << item.Destination << "\" } ";
+        }
+        return result;
+    }
+
+    TString MakeS3RequestTpl(const TVector<TExportItem>& items, const TString& extraSettings = "") {
+        return TStringBuilder()
+            << "ExportToS3Settings { endpoint: \"localhost:%d\" scheme: HTTP "
+            << MakeS3RequestItems(items) << " "
+            << extraSettings
+            << " }";
+    }
+
+    TString MakeFsRequestItems(const TVector<TExportItem>& items) {
+        TStringBuilder result;
+        for (const auto& item : items) {
+            result << "items { source_path: \"" << item.SourcePath << "\" destination_path: \"" << item.Destination << "\" } ";
+        }
+        return result;
+    }
+
+    TString MakeFsRequestTpl(const TVector<TExportItem>& items, const TString& extraSettings = "") {
+        return TStringBuilder()
+            << "ExportToFsSettings { base_path: \"%s\" "
+            << MakeFsRequestItems(items) << " "
+            << extraSettings
+            << " }";
+    }
+
     class TExportFixture : public NUnitTest::TBaseFixture {
     public:
+        void ConfigureRuntime(bool isFs = false) {
+            Env();
+            Runtime().GetAppData().FeatureFlags.SetEnableEncryptedExport(true);
+            Runtime().GetAppData().FeatureFlags.SetEnableViewExport(true);
+            if (isFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
+        }
+
+        TString FsBasePath() {
+            if (!FsTempDir_) {
+                FsTempDir_.ConstructInPlace();
+            }
+            return FsTempDir_->Path();
+        }
+
+        TString MakeExportRequest(bool isFs, const TVector<TExportItem>& items, const TString& extraSettings = "") {
+            if (isFs) {
+                return Sprintf(MakeFsRequestTpl(items, extraSettings).c_str(), FsBasePath().c_str());
+            } else {
+                return Sprintf(MakeS3RequestTpl(items, extraSettings).c_str(), S3Port());
+            }
+        }
+
+        template <bool IsFs>
+        TString FilePrefix(const TString& sourcePath = "/MyRoot/Table") {
+            if constexpr (IsFs) {
+                auto pos = sourcePath.rfind('/');
+                return (pos != TString::npos) ? TString("/") + sourcePath.substr(pos + 1) : TString("/") + sourcePath;
+            } else {
+                return "";
+            }
+        }
+
+        template <bool IsFs>
+        void RunExport(const TVector<TString>& tables, const TVector<TExportItem>& items,
+                       Ydb::StatusIds::StatusCode expectedStatus = Ydb::StatusIds::SUCCESS,
+                       bool checkFilesExistence = true, const TString& extraSettings = "") {
+            TString requestStr = MakeExportRequest(IsFs, items, extraSettings);
+
+            NKikimrExport::TCreateExportRequest request;
+            UNIT_ASSERT(google::protobuf::TextFormat::ParseFromString(requestStr, &request));
+
+            ConfigureRuntime(IsFs);
+
+            Run(Runtime(), Env(), tables, requestStr, expectedStatus, "/MyRoot", false);
+
+            bool hasEncryption = request.HasExportToS3Settings() && request.GetExportToS3Settings().has_encryption_settings();
+            auto calcPath = [&](const TString& targetPath, const TString& file) {
+                TString canonPath = (targetPath.StartsWith("/") || targetPath.empty()) ? targetPath : TString("/") + targetPath;
+                TString result = canonPath;
+                result += '/';
+                result += file;
+                if (hasEncryption) {
+                    result += ".enc";
+                }
+                return result;
+            };
+
+            if (expectedStatus == Ydb::StatusIds::SUCCESS && checkFilesExistence) {
+                for (auto& path : GetExportTargetPaths(requestStr)) {
+                    UNIT_ASSERT_C(HasFile<IsFs>(calcPath(path, "metadata.json")), calcPath(path, "metadata.json"));
+                    UNIT_ASSERT_C(HasFile<IsFs>(calcPath(path, "scheme.pb")), calcPath(path, "scheme.pb"));
+                }
+            }
+        }
+
         void RunS3(const TVector<TString>& tables, const TString& requestTpl, Ydb::StatusIds::StatusCode expectedStatus = Ydb::StatusIds::SUCCESS, bool checkS3FilesExistence = true) {
             auto requestStr = Sprintf(requestTpl.c_str(), S3Port());
             NKikimrExport::TCreateExportRequest request;
@@ -281,6 +389,68 @@ namespace {
                     UNIT_ASSERT_C(HasS3File(calcPath(path, "scheme.pb")), calcPath(path, "scheme.pb"));
                 }
             }
+        }
+
+        template <bool IsFs>
+        bool HasFile(const TString& path) {
+            if constexpr (IsFs) {
+                return HasFsFile(path);
+            } else {
+                return HasS3File(path);
+            }
+        }
+
+        template <bool IsFs>
+        TString GetFileContent(const TString& path) {
+            if constexpr (IsFs) {
+                return GetFsFileContent(path);
+            } else {
+                return GetS3FileContent(path);
+            }
+        }
+
+        template <bool IsFs>
+        THashMap<TString, TString> GetAllFiles() {
+            if constexpr (IsFs) {
+                return GetAllFsFiles();
+            } else {
+                return S3Mock().GetData();
+            }
+        }
+
+        template <bool IsFs>
+        size_t FileCount() {
+            return GetAllFiles<IsFs>().size();
+        }
+
+        template <bool IsFs, class T>
+        void CheckHasAllFiles(std::initializer_list<T> paths) {
+            for (const T& path : paths) {
+                UNIT_ASSERT_C(HasFile<IsFs>(path), "Path \"" << path << "\" is expected to exist");
+            }
+        }
+
+        template <bool IsFs, class T>
+        void CheckNoSuchFiles(std::initializer_list<T> paths) {
+            for (const T& path : paths) {
+                UNIT_ASSERT_C(!HasFile<IsFs>(path), "Path \"" << path << "\" is expected not to exist");
+            }
+        }
+
+        template <bool IsFs, class T>
+        void CheckNoPrefix(std::initializer_list<T> prefixes) {
+            auto files = GetAllFiles<IsFs>();
+            for (const T& prefix : prefixes) {
+                for (auto&& [fileName, _] : files) {
+                    UNIT_ASSERT_C(!fileName.StartsWith(prefix), "Path \"" << fileName << "\" has prefix \"" << prefix << "\", which is not expected prefix");
+                }
+            }
+        }
+
+        template <bool IsFs>
+        void CheckPathWithChecksum(const TString& path) {
+            UNIT_ASSERT(HasFile<IsFs>(path));
+            UNIT_ASSERT(HasFile<IsFs>(path + ".sha256"));
         }
 
         bool HasS3File(const TString& path) {
@@ -319,20 +489,46 @@ namespace {
             return {};
         }
 
+        bool HasFsFile(const TString& path) {
+            TString fullPath = FsBasePath() + path;
+            return TFsPath(fullPath).Exists();
+        }
+
+        TString GetFsFileContent(const TString& path) {
+            TString fullPath = FsBasePath() + path;
+            if (!TFsPath(fullPath).Exists()) {
+                return {};
+            }
+            return TFileInput(fullPath).ReadAll();
+        }
+
+        THashMap<TString, TString> GetAllFsFiles() {
+            THashMap<TString, TString> result;
+            TString basePath = FsBasePath();
+            TVector<TString> files;
+            TFsPath(basePath).ListNames(files);
+            CollectFsFiles(basePath, basePath, result);
+            return result;
+        }
+
         void TearDown(NUnitTest::TTestContext&) override {
             if (S3ServerMock) {
                 S3ServerMock = Nothing();
                 S3ServerPort = 0;
             }
+            FsTempDir_.Clear();
         }
 
         using TDelayFunc = std::function<bool(TAutoPtr<IEventHandle>&)>;
 
-        void Cancel(const TVector<TString>& tables, const TString& request, TDelayFunc delayFunc) {
+        void Cancel(const TVector<TString>& tables, const TString& request, TDelayFunc delayFunc, bool isFs = false) {
             std::vector<std::string> auditLines;
             Runtime().AuditLogBackends = std::move(CreateTestAuditLogBackends(auditLines));
 
             Env(); // Init test env
+            if (isFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
             for (const auto& table : tables) {
@@ -421,6 +617,19 @@ namespace {
             });
         }
 
+        template <bool IsFs>
+        void CancelUponTransferringShouldSucceed(const TVector<TString>& tables, const TVector<TExportItem>& items) {
+            TString request = MakeExportRequest(IsFs, items);
+            Cancel(tables, request, [](TAutoPtr<IEventHandle>& ev) {
+                if (ev->GetTypeRewrite() != TEvSchemeShard::EvModifySchemeTransaction) {
+                    return false;
+                }
+
+                return ev->Get<TEvSchemeShard::TEvModifySchemeTransaction>()->Record
+                    .GetTransaction(0).GetOperationType() == NKikimrSchemeOp::ESchemeOpBackup;
+            }, IsFs);
+        }
+
         void CancelShouldSucceed(TDelayFunc delayFunc) {
             Cancel({
                 R"(
@@ -439,6 +648,19 @@ namespace {
                   }
                 }
             )", S3Port()), delayFunc);
+        }
+
+        template <bool IsFs>
+        void CancelShouldSucceed(TDelayFunc delayFunc) {
+            TString request = MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
+            Cancel({
+                R"(
+                    Name: "Table"
+                    Columns { Name: "key" Type: "Utf8" }
+                    Columns { Name: "value" Type: "Utf8" }
+                    KeyColumnNames: ["key"]
+                )",
+            }, request, delayFunc, IsFs);
         }
 
         void DropCopiesBeforeTransferring(ui32 tablesCount) {
@@ -630,9 +852,14 @@ namespace {
         }
 
         void ShouldCheckQuotas(const TSchemeLimits& limits, Ydb::StatusIds::StatusCode expectedFailStatus) {
+            ShouldCheckQuotasImpl<false>(limits, expectedFailStatus);
+        }
+
+        template <bool IsFs>
+        void ShouldCheckQuotasImpl(const TSchemeLimits& limits, Ydb::StatusIds::StatusCode expectedFailStatus) {
             const TString userSID = "user@builtin";
             EnvOptions().SystemBackupSIDs({userSID});
-            Env(); // Init test env
+            ConfigureRuntime(IsFs);
 
             SetSchemeshardSchemaLimits(Runtime(), limits);
 
@@ -644,41 +871,41 @@ namespace {
                     KeyColumnNames: ["key"]
                 )",
             };
-            const TString request = Sprintf(R"(
-                ExportToS3Settings {
-                  endpoint: "localhost:%d"
-                  scheme: HTTP
-                  items {
-                    source_path: "/MyRoot/Table"
-                    destination_prefix: ""
-                  }
-                }
-            )", S3Port());
+            const TString request = MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
 
             Run(Runtime(), Env(), tables, request, expectedFailStatus);
             Run(Runtime(), Env(), tables, request, Ydb::StatusIds::SUCCESS, "/MyRoot", false, userSID);
         }
 
         void TestTopic(bool enablePermissions = false, ui64 topicsCount = 1, ui64 consumersCount = 0) {
+            TestTopicImpl<false>(enablePermissions, topicsCount, consumersCount);
+        }
+
+        template <bool IsFs>
+        void TestTopicImpl(bool enablePermissions = false, ui64 topicsCount = 1, ui64 consumersCount = 0) {
             EnvOptions().EnablePermissionsExport(enablePermissions);
             Env();
+            if constexpr (IsFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
-            TVector<TString> requestItems;
+            TVector<TExportItem> items;
             TVector<NDescUT::TSimpleTopic> expected;
 
             for (ui64 i = 0; i < topicsCount; ++i) {
                 auto topic = NDescUT::TSimpleTopic(i, (topicsCount == 1 || i > 0) ? consumersCount : 0);
                 TestCreatePQGroup(Runtime(), ++txId, "/MyRoot", topic.GetPrivateProto().DebugString());
                 Env().TestWaitNotification(Runtime(), txId);
-                requestItems.push_back(topic.GetExportRequestItem());
+                TString topicName = Sprintf("Topic_%lu", i);
+                items.push_back({TStringBuilder() << "/MyRoot/" << topicName, topicName});
                 expected.push_back(topic);
             }
 
-            auto exportRequest = NDescUT::TExportRequest(S3Port(), requestItems);
+            TString request = MakeExportRequest(IsFs, items);
 
             auto schemeshardId = TTestTxConfig::SchemeShard;
-            TestExport(Runtime(), schemeshardId, ++txId, "/MyRoot", exportRequest.GetRequest(), "", "", Ydb::StatusIds::SUCCESS);
+            TestExport(Runtime(), schemeshardId, ++txId, "/MyRoot", request, "", "", Ydb::StatusIds::SUCCESS);
             Env().TestWaitNotification(Runtime(), txId, schemeshardId);
 
             TestGetExport(Runtime(), schemeshardId, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
@@ -686,15 +913,15 @@ namespace {
             for (ui64 i = 0; i < topicsCount; ++i) {
                 const auto& topicExpected = expected.at(i);
                 const auto& topicPath = topicExpected.GetPath();
-                UNIT_ASSERT(HasS3File(topicPath));
-                auto content = GetS3FileContent(topicPath);
+                UNIT_ASSERT(HasFile<IsFs>(topicPath));
+                auto content = GetFileContent<IsFs>(topicPath);
                 UNIT_ASSERT_C(topicExpected.CompareWithStringIgnoringFields(content, {"attributes"}),
                     TStringBuilder() << topicExpected.GetPublicProto().DebugString() << "\n\nVS\n\n" << content);
 
                 if (enablePermissions) {
                     auto permissionsPath = topicExpected.GetPermissions().GetPath();
-                    UNIT_ASSERT(HasS3File(permissionsPath));
-                    UNIT_ASSERT(topicExpected.GetPermissions().CompareWithString(GetS3FileContent(permissionsPath)));
+                    UNIT_ASSERT(HasFile<IsFs>(permissionsPath));
+                    UNIT_ASSERT(topicExpected.GetPermissions().CompareWithString(GetFileContent<IsFs>(permissionsPath)));
                 }
             }
         }
@@ -705,38 +932,37 @@ namespace {
         }
 
         void TestReplication(const TString& scheme, const TString& expected) {
+            TestReplicationImpl<false>(scheme, expected);
+        }
+
+        template <bool IsFs>
+        void TestReplicationImpl(const TString& scheme, const TString& expected) {
             auto options = TTestEnvOptions()
                 .InitYdbDriver(true);
             TTestEnv env(Runtime(), options);
+            if constexpr (IsFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
             TestCreateReplication(Runtime(), ++txId, "/MyRoot", scheme);
             env.TestWaitNotification(Runtime(), txId);
 
-            TString request = Sprintf(R"(
-                ExportToS3Settings {
-                    endpoint: "localhost:%d"
-                    scheme: HTTP
-                    items {
-                        source_path: "/MyRoot/Replication"
-                        destination_prefix: "Replication"
-                    }
-                }
-            )", S3Port());
+            TString request = MakeExportRequest(IsFs, {{"/MyRoot/Replication", "Replication"}});
 
             TestExport(Runtime(), ++txId, "/MyRoot", request);
             env.TestWaitNotification(Runtime(), txId);
 
             TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
 
-            CheckPathWithChecksum("/Replication/create_async_replication.sql");
-            const auto content = GetS3FileContent("/Replication/create_async_replication.sql");
+            CheckPathWithChecksum<IsFs>("/Replication/create_async_replication.sql");
+            const auto content = GetFileContent<IsFs>("/Replication/create_async_replication.sql");
             UNIT_ASSERT_EQUAL_C(
                 content, expected,
                 TStringBuilder() << "\nExpected:\n\n" << expected << "\n\nActual:\n\n" << content);
 
-            CheckPathWithChecksum("/Replication/permissions.pb");
-            const auto permissions = GetS3FileContent("/Replication/permissions.pb");
+            CheckPathWithChecksum<IsFs>("/Replication/permissions.pb");
+            const auto permissions = GetFileContent<IsFs>("/Replication/permissions.pb");
             const auto permissions_expected = "actions {\n  change_owner: \"root@builtin\"\n}\n";
             UNIT_ASSERT_EQUAL_C(
                 permissions, permissions_expected,
@@ -745,9 +971,17 @@ namespace {
         }
 
         void TestTransfer(const TString& scheme, const TString& expected) {
+            TestTransferImpl<false>(scheme, expected);
+        }
+
+        template <bool IsFs>
+        void TestTransferImpl(const TString& scheme, const TString& expected) {
             auto options = TTestEnvOptions()
                 .InitYdbDriver(true);
             TTestEnv env(Runtime(), options);
+            if constexpr (IsFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
             TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -765,30 +999,21 @@ namespace {
             TestCreateTransfer(Runtime(), ++txId, "/MyRoot", scheme);
             env.TestWaitNotification(Runtime(), txId);
 
-            TString request = Sprintf(R"(
-                ExportToS3Settings {
-                    endpoint: "localhost:%d"
-                    scheme: HTTP
-                    items {
-                        source_path: "/MyRoot/Transfer"
-                        destination_prefix: "Transfer"
-                    }
-                }
-            )", S3Port());
+            TString request = MakeExportRequest(IsFs, {{"/MyRoot/Transfer", "Transfer"}});
 
             TestExport(Runtime(), ++txId, "/MyRoot", request);
             env.TestWaitNotification(Runtime(), txId);
 
             TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
 
-            CheckPathWithChecksum("/Transfer/create_transfer.sql");
-            const auto content = GetS3FileContent("/Transfer/create_transfer.sql");
+            CheckPathWithChecksum<IsFs>("/Transfer/create_transfer.sql");
+            const auto content = GetFileContent<IsFs>("/Transfer/create_transfer.sql");
             UNIT_ASSERT_EQUAL_C(
                 content, expected,
                 TStringBuilder() << "\nExpected:\n\n" << expected << "\n\nActual:\n\n" << content);
 
-            CheckPathWithChecksum("/Transfer/permissions.pb");
-            const auto permissions = GetS3FileContent("/Transfer/permissions.pb");
+            CheckPathWithChecksum<IsFs>("/Transfer/permissions.pb");
+            const auto permissions = GetFileContent<IsFs>("/Transfer/permissions.pb");
             const auto permissions_expected = "actions {\n  change_owner: \"root@builtin\"\n}\n";
             UNIT_ASSERT_EQUAL_C(
                 permissions, permissions_expected,
@@ -800,30 +1025,32 @@ namespace {
             const TString& scheme,
             const TVector<TString>& expectedProperties)
         {
+            TestExternalDataSourceImpl<false>(scheme, expectedProperties);
+        }
+
+        template <bool IsFs>
+        void TestExternalDataSourceImpl(
+            const TString& scheme,
+            const TVector<TString>& expectedProperties)
+        {
             Env();
+            if constexpr (IsFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
             TestCreateExternalDataSource(Runtime(), ++txId, "/MyRoot", scheme);
             Env().TestWaitNotification(Runtime(), txId);
 
-            TString request = Sprintf(R"(
-                ExportToS3Settings {
-                    endpoint: "localhost:%d"
-                    scheme: HTTP
-                    items {
-                        source_path: "/MyRoot/DataSource"
-                        destination_prefix: "DataSource"
-                    }
-                }
-            )", S3Port());
+            TString request = MakeExportRequest(IsFs, {{"/MyRoot/DataSource", "DataSource"}});
 
             TestExport(Runtime(), ++txId, "/MyRoot", request);
             Env().TestWaitNotification(Runtime(), txId);
 
             TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
 
-            CheckPathWithChecksum("/DataSource/create_external_data_source.sql");
-            const auto content = GetS3FileContent("/DataSource/create_external_data_source.sql");
+            CheckPathWithChecksum<IsFs>("/DataSource/create_external_data_source.sql");
+            const auto content = GetFileContent<IsFs>("/DataSource/create_external_data_source.sql");
 
             TString expectedHeader = "-- database: \"/MyRoot\"\n"
                 "CREATE EXTERNAL DATA SOURCE IF NOT EXISTS `DataSource`\n"
@@ -832,21 +1059,19 @@ namespace {
                 TStringBuilder() << "\nExpected query to start from:\n\n"
                     << expectedHeader << "\n\nActual query:\n\n" << content);
 
-            // Check if all expected properties are presented
             for (const auto& property : expectedProperties) {
                 UNIT_ASSERT_C(content.find(property) != TString::npos,
                     TStringBuilder() << "Property not found:\n"
                     << "\nExpected property:\n\n" << property << "\n\nActual query:\n\n" << content);
             }
 
-            // Check if no other properties are presented
             UNIT_ASSERT_EQUAL_C(
                 std::ranges::count(content, ','),
                 static_cast<long>(expectedProperties.size()) - 1,
                 "Properties count mismatch");
 
-            CheckPathWithChecksum("/DataSource/permissions.pb");
-            const auto permissions = GetS3FileContent("/DataSource/permissions.pb");
+            CheckPathWithChecksum<IsFs>("/DataSource/permissions.pb");
+            const auto permissions = GetFileContent<IsFs>("/DataSource/permissions.pb");
             const auto permissions_expected = "actions {\n  change_owner: \"root@builtin\"\n}\n";
             UNIT_ASSERT_EQUAL_C(
                 permissions, permissions_expected,
@@ -858,7 +1083,19 @@ namespace {
             const TString& expectedStartsWith,
             const TVector<TString>& expectedProperties)
         {
+            TestExternalTableImpl<false>(scheme, expectedStartsWith, expectedProperties);
+        }
+
+        template <bool IsFs>
+        void TestExternalTableImpl(
+            const TString& scheme,
+            const TString& expectedStartsWith,
+            const TVector<TString>& expectedProperties)
+        {
             Env();
+            if constexpr (IsFs) {
+                Runtime().GetAppData().FeatureFlags.SetEnableFsBackups(true);
+            }
             ui64 txId = 100;
 
             const auto dataSourceScheme = R"(
@@ -880,44 +1117,33 @@ namespace {
             TestCreateExternalTable(Runtime(), ++txId, "/MyRoot", scheme);
             Env().TestWaitNotification(Runtime(), txId);
 
-            TString request = Sprintf(R"(
-                ExportToS3Settings {
-                    endpoint: "localhost:%d"
-                    scheme: HTTP
-                    items {
-                        source_path: "/MyRoot/ExternalTable"
-                        destination_prefix: "ExternalTable"
-                    }
-                }
-            )", S3Port());
+            TString request = MakeExportRequest(IsFs, {{"/MyRoot/ExternalTable", "ExternalTable"}});
 
             TestExport(Runtime(), ++txId, "/MyRoot", request);
             Env().TestWaitNotification(Runtime(), txId);
 
             TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
 
-            CheckPathWithChecksum("/ExternalTable/create_external_table.sql");
-            const auto content = GetS3FileContent("/ExternalTable/create_external_table.sql");
+            CheckPathWithChecksum<IsFs>("/ExternalTable/create_external_table.sql");
+            const auto content = GetFileContent<IsFs>("/ExternalTable/create_external_table.sql");
 
             UNIT_ASSERT_C(content.find(expectedStartsWith) != TString::npos,
                 TStringBuilder() << "\nExpected query to start with:\n\n"
                     << expectedStartsWith << "\n\nActual query:\n\n" << content);
 
-            // Check if all expected properties are presented
             for (const auto& property : expectedProperties) {
                 UNIT_ASSERT_C(content.find(property) != TString::npos,
                     TStringBuilder() << "Property not found:\n"
                     << "\nExpected property:\n\n" << property << "\n\nActual query:\n\n" << content);
             }
 
-            // Check if no other properties are presented
             UNIT_ASSERT_EQUAL_C(
                 std::ranges::count(content, '='),
                 static_cast<long>(expectedProperties.size()),
                 TStringBuilder() << "Properties count mismatch: ");
 
-            CheckPathWithChecksum("/ExternalTable/permissions.pb");
-            const auto permissions = GetS3FileContent("/ExternalTable/permissions.pb");
+            CheckPathWithChecksum<IsFs>("/ExternalTable/permissions.pb");
+            const auto permissions = GetFileContent<IsFs>("/ExternalTable/permissions.pb");
             const auto permissions_expected = "actions {\n  change_owner: \"root@builtin\"\n}\n";
             UNIT_ASSERT_EQUAL_C(
                 permissions, permissions_expected,
@@ -1013,6 +1239,26 @@ namespace {
         }
 
     private:
+        void CollectFsFiles(const TString& basePath, const TString& currentPath, THashMap<TString, TString>& result) {
+            TFsPath dir(currentPath);
+            if (!dir.Exists()) return;
+
+            TVector<TFsPath> children;
+            dir.List(children);
+            for (const auto& child : children) {
+                if (child.IsFile()) {
+                    TString relPath = child.GetPath().substr(basePath.size());
+                    if (!relPath.StartsWith("/")) {
+                        relPath = "/" + relPath;
+                    }
+                    result[relPath] = TFileInput(child.GetPath()).ReadAll();
+                } else if (child.IsDirectory()) {
+                    CollectFsFiles(basePath, child.GetPath(), result);
+                }
+            }
+        }
+
+        TMaybe<TTempDir> FsTempDir_;
         TPortManager PortManager;
         ui16 S3ServerPort = 0;
         TMaybe<TTestBasicRuntime> TestRuntime;
@@ -1025,28 +1271,19 @@ namespace {
 } // anonymous
 
 Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
-    Y_UNIT_TEST(ShouldSucceedOnSingleShardTable) {
-        RunS3({
+    Y_UNIT_TEST_TWIN(ShouldSucceedOnSingleShardTable, IsFs) {
+        RunExport<IsFs>({
             R"(
                 Name: "Table"
                 Columns { Name: "key" Type: "Utf8" }
                 Columns { Name: "value" Type: "Utf8" }
                 KeyColumnNames: ["key"]
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )");
+        }, {{"/MyRoot/Table", ""}});
     }
 
-    Y_UNIT_TEST(ShouldSucceedOnMultiShardTable) {
-        RunS3({
+    Y_UNIT_TEST_TWIN(ShouldSucceedOnMultiShardTable, IsFs) {
+        RunExport<IsFs>({
             R"(
                 Name: "Table"
                 Columns { Name: "key" Type: "Uint32" }
@@ -1054,20 +1291,11 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
                 KeyColumnNames: ["key"]
                 UniformPartitionsCount: 2
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )");
+        }, {{"/MyRoot/Table", ""}});
     }
 
-    Y_UNIT_TEST(ShouldSucceedOnManyTables) {
-        RunS3({
+    Y_UNIT_TEST_TWIN(ShouldSucceedOnManyTables, IsFs) {
+        RunExport<IsFs>({
             R"(
                 Name: "Table1"
                 Columns { Name: "key" Type: "Utf8" }
@@ -1080,23 +1308,13 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
                 Columns { Name: "value" Type: "Utf8" }
                 KeyColumnNames: ["key"]
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table1"
-                destination_prefix: "table1"
-              }
-              items {
-                source_path: "/MyRoot/Table2"
-                destination_prefix: "table2"
-              }
-            }
-        )");
+        }, {
+            {"/MyRoot/Table1", "table1"},
+            {"/MyRoot/Table2", "table2"},
+        });
     }
 
-    Y_UNIT_TEST(ShouldOmitNonStrictStorageSettings) {
+    Y_UNIT_TEST_TWIN(ShouldOmitNonStrictStorageSettings, IsFs) {
         const TVector<TString> tables = {R"(
             Name: "Table"
             Columns {
@@ -1157,20 +1375,12 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
             }
         )"};
 
-        Run(Runtime(), Env(), tables, Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        ConfigureRuntime(IsFs);
+        Run(Runtime(), Env(), tables, MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
-        auto schemeIt = S3Mock().GetData().find("/scheme.pb");
-        UNIT_ASSERT(schemeIt != S3Mock().GetData().end());
-
+        auto allFiles = GetAllFiles<IsFs>();
+        auto schemeIt = allFiles.find(FilePrefix<IsFs>() + "/scheme.pb");
+        UNIT_ASSERT(schemeIt != allFiles.end());
         TString scheme = schemeIt->second;
 
         UNIT_ASSERT_NO_DIFF(scheme, R"(columns {
@@ -1237,7 +1447,7 @@ partitioning_settings {
 )");
     }
 
-    Y_UNIT_TEST(ShouldPreserveIncrBackupFlag) {
+    Y_UNIT_TEST_TWIN(ShouldPreserveIncrBackupFlag, IsFs) {
         const TTablesWithAttrs tables{
             {
                 R"(
@@ -1284,20 +1494,12 @@ partitioning_settings {
             },
         };
 
-        Run(Runtime(), Env(), tables, Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        ConfigureRuntime(IsFs);
+        Run(Runtime(), Env(), tables, MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
-        auto schemeIt = S3Mock().GetData().find("/scheme.pb");
-        UNIT_ASSERT(schemeIt != S3Mock().GetData().end());
-
+        auto allFiles = GetAllFiles<IsFs>();
+        auto schemeIt = allFiles.find(FilePrefix<IsFs>() + "/scheme.pb");
+        UNIT_ASSERT(schemeIt != allFiles.end());
         TString scheme = schemeIt->second;
 
         UNIT_ASSERT_NO_DIFF(scheme, R"(columns {
@@ -1361,8 +1563,8 @@ partitioning_settings {
 )");
     }
 
-    Y_UNIT_TEST(CancelUponCreatingExportDirShouldSucceed) {
-        CancelShouldSucceed([](TAutoPtr<IEventHandle>& ev) {
+    Y_UNIT_TEST_TWIN(CancelUponCreatingExportDirShouldSucceed, IsFs) {
+        CancelShouldSucceed<IsFs>([](TAutoPtr<IEventHandle>& ev) {
             if (ev->GetTypeRewrite() != TEvSchemeShard::EvModifySchemeTransaction) {
                 return false;
             }
@@ -1372,8 +1574,8 @@ partitioning_settings {
         });
     }
 
-    Y_UNIT_TEST(CancelUponCopyingTablesShouldSucceed) {
-        CancelShouldSucceed([](TAutoPtr<IEventHandle>& ev) {
+    Y_UNIT_TEST_TWIN(CancelUponCopyingTablesShouldSucceed, IsFs) {
+        CancelShouldSucceed<IsFs>([](TAutoPtr<IEventHandle>& ev) {
             if (ev->GetTypeRewrite() != TEvSchemeShard::EvModifySchemeTransaction) {
                 return false;
             }
@@ -1383,28 +1585,19 @@ partitioning_settings {
         });
     }
 
-    Y_UNIT_TEST(CancelUponTransferringSingleShardTableShouldSucceed) {
-        CancelUponTransferringShouldSucceed({
+    Y_UNIT_TEST_TWIN(CancelUponTransferringSingleShardTableShouldSucceed, IsFs) {
+        CancelUponTransferringShouldSucceed<IsFs>({
             R"(
                 Name: "Table"
                 Columns { Name: "key" Type: "Utf8" }
                 Columns { Name: "value" Type: "Utf8" }
                 KeyColumnNames: ["key"]
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )");
+        }, {{"/MyRoot/Table", ""}});
     }
 
-    Y_UNIT_TEST(CancelUponTransferringMultiShardTableShouldSucceed) {
-        CancelUponTransferringShouldSucceed({
+    Y_UNIT_TEST_TWIN(CancelUponTransferringMultiShardTableShouldSucceed, IsFs) {
+        CancelUponTransferringShouldSucceed<IsFs>({
             R"(
                 Name: "Table"
                 Columns { Name: "key" Type: "Uint32" }
@@ -1412,24 +1605,15 @@ partitioning_settings {
                 KeyColumnNames: ["key"]
                 UniformPartitionsCount: 2
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )");
+        }, {{"/MyRoot/Table", ""}});
     }
 
-    Y_UNIT_TEST(CancelUponTransferringSingleTableShouldSucceed) {
+    Y_UNIT_TEST_TWIN(CancelUponTransferringSingleTableShouldSucceed, IsFs) {
         // same as CancelUponTransferringSingleShardTableShouldSucceed
     }
 
-    Y_UNIT_TEST(CancelUponTransferringManyTablesShouldSucceed) {
-        CancelUponTransferringShouldSucceed({
+    Y_UNIT_TEST_TWIN(CancelUponTransferringManyTablesShouldSucceed, IsFs) {
+        CancelUponTransferringShouldSucceed<IsFs>({
             R"(
                 Name: "Table1"
                 Columns { Name: "key" Type: "Utf8" }
@@ -1442,24 +1626,15 @@ partitioning_settings {
                 Columns { Name: "value" Type: "Utf8" }
                 KeyColumnNames: ["key"]
             )",
-        }, R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table1"
-                destination_prefix: "table1"
-              }
-              items {
-                source_path: "/MyRoot/Table2"
-                destination_prefix: "table2"
-              }
-            }
-        )");
+        }, {
+            {"/MyRoot/Table1", "table1"},
+            {"/MyRoot/Table2", "table2"},
+        });
     }
 
-    Y_UNIT_TEST(DropSourceTableBeforeTransferring) {
+    Y_UNIT_TEST_TWIN(DropSourceTableBeforeTransferring, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -1497,16 +1672,7 @@ partitioning_settings {
             return TTestActorRuntime::EEventAction::PROCESS;
         });
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         const ui64 exportId = txId;
 
         if (!delayed) {
@@ -1549,13 +1715,14 @@ partitioning_settings {
         RebootDuringFinish(true, Ydb::StatusIds::CANCELLED);
     }
 
-    Y_UNIT_TEST(ShouldExcludeBackupTableFromStats) {
+    Y_UNIT_TEST_TWIN(ShouldExcludeBackupTableFromStats, IsFs) {
         EnvOptions().DisableStatsBatching(true);
         Env(); // Init test env
         ui64 txId = 100;
 
         THashSet<ui64> statsCollected;
         Runtime().GetAppData().FeatureFlags.SetEnableExportAutoDropping(true);
+        ConfigureRuntime(IsFs);
         Runtime().SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
             if (ev->GetTypeRewrite() == TEvDataShard::EvPeriodicTableStats) {
                 statsCollected.insert(ev->Get<TEvDataShard::TEvPeriodicTableStats>()->Record.GetDatashardId());
@@ -1599,16 +1766,7 @@ partitioning_settings {
 
         const auto expected = waitForStats(1);
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/CopyTable"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/CopyTable", ""}}));
         const ui64 exportId = txId;
         ::NKikimrSubDomains::TDiskSpaceUsage afterExport;
 
@@ -1700,8 +1858,9 @@ partitioning_settings {
         UNIT_ASSERT_VALUES_EQUAL(entry.ItemsProgressSize(), 1);
     }
 
-    Y_UNIT_TEST(ShouldRestartOnScanErrors) {
+    Y_UNIT_TEST_TWIN(ShouldRestartOnScanErrors, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -1730,16 +1889,7 @@ partitioning_settings {
             return TTestActorRuntime::EEventAction::PROCESS;
         });
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
         if (!injectResult) {
             TDispatchOptions opts;
@@ -1756,8 +1906,9 @@ partitioning_settings {
         TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
     }
 
-    Y_UNIT_TEST(ShouldSucceedOnConcurrentTxs) {
+    Y_UNIT_TEST_TWIN(ShouldSucceedOnConcurrentTxs, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -1781,16 +1932,7 @@ partitioning_settings {
         });
 
         const auto exportId = ++txId;
-        TestExport(Runtime(), exportId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), exportId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
         if (!copyTables) {
             TDispatchOptions opts;
@@ -1831,8 +1973,9 @@ partitioning_settings {
         TestGetExport(Runtime(), exportId, "/MyRoot", Ydb::StatusIds::SUCCESS);
     }
 
-    Y_UNIT_TEST(ShouldSucceedOnConcurrentExport) {
+    Y_UNIT_TEST_TWIN(ShouldSucceedOnConcurrentExport, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -1867,16 +2010,7 @@ partitioning_settings {
         TVector<ui64> exportIds;
         for (ui32 i = 1; i <= 3; ++i) {
             exportIds.push_back(++txId);
-            TestExport(Runtime(), exportIds[i - 1], "/MyRoot", Sprintf(R"(
-                ExportToS3Settings {
-                  endpoint: "localhost:%d"
-                  scheme: HTTP
-                  items {
-                    source_path: "/MyRoot/Table"
-                    destination_prefix: "Table%u"
-                  }
-                }
-            )", S3Port(), i));
+            TestExport(Runtime(), exportIds[i - 1], "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", Sprintf("Table%u", i)}}));
             waitCopyTables(i);
         }
 
@@ -1983,12 +2117,12 @@ partitioning_settings {
         TestGetExport(Runtime(), exportId, "/MyRoot");
     }
 
-    Y_UNIT_TEST(ShouldCheckQuotasExportsLimited) {
-        ShouldCheckQuotas(TSchemeLimits{.MaxExports = 0}, Ydb::StatusIds::PRECONDITION_FAILED);
+    Y_UNIT_TEST_TWIN(ShouldCheckQuotasExportsLimited, IsFs) {
+        ShouldCheckQuotasImpl<IsFs>(TSchemeLimits{.MaxExports = 0}, Ydb::StatusIds::PRECONDITION_FAILED);
     }
 
-    Y_UNIT_TEST(ShouldCheckQuotasChildrenLimited) {
-        ShouldCheckQuotas(TSchemeLimits{.MaxChildrenInDir = 2}, Ydb::StatusIds::CANCELLED);
+    Y_UNIT_TEST_TWIN(ShouldCheckQuotasChildrenLimited, IsFs) {
+        ShouldCheckQuotasImpl<IsFs>(TSchemeLimits{.MaxChildrenInDir = 2}, Ydb::StatusIds::CANCELLED);
     }
 
     Y_UNIT_TEST(ShouldRetryAtFinalStage) {
@@ -2073,9 +2207,10 @@ partitioning_settings {
         TestGetExport(Runtime(), exportId, "/MyRoot");
     }
 
-    Y_UNIT_TEST(CorruptedDyNumber) {
+    Y_UNIT_TEST_TWIN(CorruptedDyNumber, IsFs) {
         EnvOptions().DisableStatsBatching(true);
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2089,23 +2224,15 @@ partitioning_settings {
         // Write bad DyNumber
         UploadRow(Runtime(), "/MyRoot/Table", 0, {1}, {2}, {TCell::Make(1u)}, {TCell::Make(1u)});
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         Env().TestWaitNotification(Runtime(), txId);
 
         TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::CANCELLED);
     }
 
-    Y_UNIT_TEST(UidAsIdempotencyKey) {
+    Y_UNIT_TEST_TWIN(UidAsIdempotencyKey, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2116,22 +2243,9 @@ partitioning_settings {
         )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        const auto request = Sprintf(R"(
-            OperationParams {
-              labels {
-                key: "uid"
-                value: "foo"
-              }
-            }
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
+        const auto request = TStringBuilder()
+            << R"(OperationParams { labels { key: "uid" value: "foo" } } )"
+            << MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
 
         // create operation
         TestExport(Runtime(), ++txId, "/MyRoot", request);
@@ -2145,8 +2259,9 @@ partitioning_settings {
         Env().TestWaitNotification(Runtime(), exportId);
     }
 
-    Y_UNIT_TEST(ExportStartTime) {
+    Y_UNIT_TEST_TWIN(ExportStartTime, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         Runtime().UpdateCurrentTime(TInstant::Now());
         ui64 txId = 100;
 
@@ -2158,16 +2273,7 @@ partitioning_settings {
         )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
         const auto desc = TestGetExport(Runtime(), txId, "/MyRoot");
         const auto& entry = desc.GetResponse().GetEntry();
@@ -2176,8 +2282,9 @@ partitioning_settings {
         UNIT_ASSERT(!entry.HasEndTime());
     }
 
-    Y_UNIT_TEST(CompletedExportEndTime) {
+    Y_UNIT_TEST_TWIN(CompletedExportEndTime, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         Runtime().UpdateCurrentTime(TInstant::Now());
         ui64 txId = 100;
 
@@ -2189,16 +2296,7 @@ partitioning_settings {
         )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
         Runtime().AdvanceCurrentTime(TDuration::Seconds(30)); // doing export
 
@@ -2227,8 +2325,8 @@ partitioning_settings {
         }
     };
 
-    Y_UNIT_TEST(CancelledExportEndTime) {
-        Env(); // Init test env
+    Y_UNIT_TEST_TWIN(CancelledExportEndTime, IsFs) {
+        ConfigureRuntime(IsFs);
         Runtime().UpdateCurrentTime(TInstant::Now());
         ui64 txId = 100;
 
@@ -2250,16 +2348,7 @@ partitioning_settings {
             return TTestActorRuntime::EEventAction::PROCESS;
         });
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         const ui64 exportId = txId;
 
         Runtime().AdvanceCurrentTime(TDuration::Seconds(30)); // doing export
@@ -2305,10 +2394,10 @@ partitioning_settings {
     }
 
     // Based on CompletedExportEndTime
-    Y_UNIT_TEST(AuditCompletedExport) {
+    Y_UNIT_TEST_TWIN(AuditCompletedExport, IsFs) {
         std::vector<std::string> auditLines;
         Runtime().AuditLogBackends = std::move(CreateTestAuditLogBackends(auditLines));
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         Runtime().UpdateCurrentTime(TInstant::Now());
         ui64 txId = 100;
 
@@ -2324,22 +2413,9 @@ partitioning_settings {
 
         // Start export
         //
-        const auto request = Sprintf(R"(
-            OperationParams {
-              labels {
-                key: "uid"
-                value: "foo"
-              }
-            }
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
+        const auto request = TStringBuilder()
+            << R"(OperationParams { labels { key: "uid" value: "foo" } } )"
+            << MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
         TestExport(Runtime(), ++txId, "/MyRoot", request, /*userSID*/ "user@builtin", /*peerName*/ "127.0.0.1:9876");
 
         // Check audit record for export start
@@ -2390,10 +2466,10 @@ partitioning_settings {
         }
     }
 
-    Y_UNIT_TEST(AuditCancelledExport) {
+    Y_UNIT_TEST_TWIN(AuditCancelledExport, IsFs) {
         std::vector<std::string> auditLines;
         Runtime().AuditLogBackends = std::move(CreateTestAuditLogBackends(auditLines));
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         Runtime().UpdateCurrentTime(TInstant::Now());
         ui64 txId = 100;
 
@@ -2419,22 +2495,9 @@ partitioning_settings {
 
         // Start export
         //
-        const auto request = Sprintf(R"(
-            OperationParams {
-              labels {
-                key: "uid"
-                value: "foo"
-              }
-            }
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
+        const auto request = TStringBuilder()
+            << R"(OperationParams { labels { key: "uid" value: "foo" } } )"
+            << MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
         TestExport(Runtime(), ++txId, "/MyRoot", request, /*userSID*/ "user@builtin", /*peerName*/ "127.0.0.1:9876");
         const ui64 exportId = txId;
 
@@ -2520,7 +2583,8 @@ partitioning_settings {
         }
     }
 
-    Y_UNIT_TEST(ExportPartitioningSettings) {
+    Y_UNIT_TEST_TWIN(ExportPartitioningSettings, IsFs) {
+        ConfigureRuntime(IsFs);
         Run(Runtime(), Env(), TVector<TString>{
                 R"(
                     Name: "Table"
@@ -2537,19 +2601,10 @@ partitioning_settings {
                     }
                 )"
             },
-            Sprintf(R"(
-                ExportToS3Settings {
-                  endpoint: "localhost:%d"
-                  scheme: HTTP
-                  items {
-                    source_path: "/MyRoot/Table"
-                    destination_prefix: ""
-                  }
-                }
-            )", S3Port())
+            MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}})
         );
 
-        auto* scheme = S3Mock().GetData().FindPtr("/scheme.pb");
+        auto allFiles = GetAllFiles<IsFs>(); auto* scheme = allFiles.FindPtr(FilePrefix<IsFs>() + "/scheme.pb");
         UNIT_ASSERT(scheme);
         CheckTableScheme(*scheme, GetPartitioningSettings, CreateProtoComparator(R"(
             partitioning_by_size: DISABLED
@@ -2558,8 +2613,8 @@ partitioning_settings {
         )"));
     }
 
-    Y_UNIT_TEST(ExportIndexTablePartitioningSettings) {
-        Env(); // Init test env
+    Y_UNIT_TEST_TWIN(ExportIndexTablePartitioningSettings, IsFs) {
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateIndexedTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2586,19 +2641,10 @@ partitioning_settings {
         )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         Env().TestWaitNotification(Runtime(), txId);
 
-        auto* scheme = S3Mock().GetData().FindPtr("/scheme.pb");
+        auto allFiles = GetAllFiles<IsFs>(); auto* scheme = allFiles.FindPtr(FilePrefix<IsFs>() + "/scheme.pb");
         UNIT_ASSERT(scheme);
         CheckTableScheme(*scheme, GetIndexTablePartitioningSettings, CreateProtoComparator(R"(
             partitioning_by_size: DISABLED
@@ -2607,8 +2653,9 @@ partitioning_settings {
         )"));
     }
 
-    Y_UNIT_TEST(UserSID) {
+    Y_UNIT_TEST_TWIN(UserSID, IsFs) {
         Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2619,16 +2666,7 @@ partitioning_settings {
         )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        const TString request = Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
+        const TString request = MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
         const TString userSID = "user@builtin";
         TestExport(Runtime(), ++txId, "/MyRoot", request, userSID);
 
@@ -2638,9 +2676,9 @@ partitioning_settings {
         UNIT_ASSERT_VALUES_EQUAL(entry.GetUserSID(), userSID);
     }
 
-    Y_UNIT_TEST(TablePermissions) {
+    Y_UNIT_TEST_TWIN(TablePermissions, IsFs) {
         EnvOptions().EnablePermissionsExport(true);
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2656,19 +2694,10 @@ partitioning_settings {
         TestModifyACL(Runtime(), ++txId, "/MyRoot", "Table", diffACL.SerializeAsString(), "user@builtin");
         Env().TestWaitNotification(Runtime(), txId);
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         Env().TestWaitNotification(Runtime(), txId);
 
-        auto* permissions = S3Mock().GetData().FindPtr("/permissions.pb");
+        auto allFiles = GetAllFiles<IsFs>(); auto* permissions = allFiles.FindPtr(FilePrefix<IsFs>() + "/permissions.pb");
         UNIT_ASSERT(permissions);
         CheckPermissions(*permissions, CreateProtoComparator(R"(
             actions {
@@ -2683,9 +2712,9 @@ partitioning_settings {
         )"));
     }
 
-    Y_UNIT_TEST(Checksums) {
+    Y_UNIT_TEST_TWIN(Checksums, IsFs) {
         EnvOptions().EnablePermissionsExport(true).EnableChecksumsExport(true);
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2698,39 +2727,32 @@ partitioning_settings {
 
         UploadRow(Runtime(), "/MyRoot/Table", 0, {1}, {2}, {TCell::Make(1u)}, {TCell::Make(1u)});
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
         Env().TestWaitNotification(Runtime(), txId);
 
-        UNIT_ASSERT_VALUES_EQUAL(S3Mock().GetData().size(), 8);
-        const auto* dataChecksum = S3Mock().GetData().FindPtr("/data_00.csv.sha256");
+        UNIT_ASSERT_VALUES_EQUAL(FileCount<IsFs>(), 8);
+        auto allFiles = GetAllFiles<IsFs>();
+        const TString p = FilePrefix<IsFs>();
+        const auto* dataChecksum = allFiles.FindPtr(p + "/data_00.csv.sha256");
         UNIT_ASSERT(dataChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*dataChecksum, "19dcd641390a61063ee45f3e6e06b8f0d3acfc33f934b9bf1ba204668a98f21d data_00.csv");
 
-        const auto* metadataChecksum = S3Mock().GetData().FindPtr("/metadata.json.sha256");
+        const auto* metadataChecksum = allFiles.FindPtr(p + "/metadata.json.sha256");
         UNIT_ASSERT(metadataChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*metadataChecksum, "a5a7ca9bce00ac9d7e5b48a30a46f139592845cad0664b3fda92af32583b7d52 metadata.json");
 
-        const auto* schemeChecksum = S3Mock().GetData().FindPtr("/scheme.pb.sha256");
+        const auto* schemeChecksum = allFiles.FindPtr(p + "/scheme.pb.sha256");
         UNIT_ASSERT(schemeChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*schemeChecksum, "cb1fb80965ae92e6369acda2b3b5921fd5518c97d6437f467ce00492907f9eb6 scheme.pb");
 
-        const auto* permissionsChecksum = S3Mock().GetData().FindPtr("/permissions.pb.sha256");
+        const auto* permissionsChecksum = allFiles.FindPtr(p + "/permissions.pb.sha256");
         UNIT_ASSERT(permissionsChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*permissionsChecksum, "b41fd8921ff3a7314d9c702dc0e71aace6af8443e0102add0432895c5e50a326 permissions.pb");
     }
 
-    Y_UNIT_TEST(EnableChecksumsPersistance) {
-        EnvOptions().EnableChecksumsExport(true);
-        Env(); // Init test env
+    Y_UNIT_TEST_TWIN(EnableChecksumsPersistance, IsFs) {
+        EnvOptions().EnablePermissionsExport(true).EnableChecksumsExport(true);
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         // Create test table
@@ -2753,16 +2775,7 @@ partitioning_settings {
         });
 
         // Start export and expect it to be blocked
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
 
         Runtime().WaitFor("backup task is sent to datashards", [&]{ return block.size() >= 1; });
 
@@ -2776,28 +2789,30 @@ partitioning_settings {
         Env().TestWaitNotification(Runtime(), txId);
 
         // Verify checksums are created
-        UNIT_ASSERT_VALUES_EQUAL(S3Mock().GetData().size(), 8);
+        UNIT_ASSERT_VALUES_EQUAL(FileCount<IsFs>(), 8);
+        auto allFiles = GetAllFiles<IsFs>();
+        const TString p = FilePrefix<IsFs>();
 
-        const auto* dataChecksum = S3Mock().GetData().FindPtr("/data_00.csv.sha256");
+        const auto* dataChecksum = allFiles.FindPtr(p + "/data_00.csv.sha256");
         UNIT_ASSERT(dataChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*dataChecksum, "19dcd641390a61063ee45f3e6e06b8f0d3acfc33f934b9bf1ba204668a98f21d data_00.csv");
 
-        const auto* metadataChecksum = S3Mock().GetData().FindPtr("/metadata.json.sha256");
+        const auto* metadataChecksum = allFiles.FindPtr(p + "/metadata.json.sha256");
         UNIT_ASSERT(metadataChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*metadataChecksum, "a5a7ca9bce00ac9d7e5b48a30a46f139592845cad0664b3fda92af32583b7d52 metadata.json");
 
-        const auto* schemeChecksum = S3Mock().GetData().FindPtr("/scheme.pb.sha256");
+        const auto* schemeChecksum = allFiles.FindPtr(p + "/scheme.pb.sha256");
         UNIT_ASSERT(schemeChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*schemeChecksum, "cb1fb80965ae92e6369acda2b3b5921fd5518c97d6437f467ce00492907f9eb6 scheme.pb");
 
-        const auto* permissionsChecksum = S3Mock().GetData().FindPtr("/permissions.pb.sha256");
+        const auto* permissionsChecksum = allFiles.FindPtr(p + "/permissions.pb.sha256");
         UNIT_ASSERT(permissionsChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*permissionsChecksum, "b41fd8921ff3a7314d9c702dc0e71aace6af8443e0102add0432895c5e50a326 permissions.pb");
     }
 
-    Y_UNIT_TEST(ChecksumsWithCompression) {
+    Y_UNIT_TEST_TWIN(ChecksumsWithCompression, IsFs) {
         EnvOptions().EnableChecksumsExport(true);
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -2810,20 +2825,10 @@ partitioning_settings {
 
         UploadRow(Runtime(), "/MyRoot/Table", 0, {1}, {2}, {TCell::Make(1u)}, {TCell::Make(1u)});
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-              compression: "zstd"
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}, R"(compression: "zstd")"));
         Env().TestWaitNotification(Runtime(), txId);
 
-        const auto* dataChecksum = S3Mock().GetData().FindPtr("/data_00.csv.sha256");
+        auto allFiles = GetAllFiles<IsFs>(); const auto* dataChecksum = allFiles.FindPtr(FilePrefix<IsFs>() + "/data_00.csv.sha256");
         UNIT_ASSERT(dataChecksum);
         UNIT_ASSERT_VALUES_EQUAL(*dataChecksum, "19dcd641390a61063ee45f3e6e06b8f0d3acfc33f934b9bf1ba204668a98f21d data_00.csv");
     }
@@ -3147,20 +3152,10 @@ state: STATE_ENABLED
         }
     }
 
-    Y_UNIT_TEST(AutoDropping) {
-        auto request = Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
-
-        Env();
+    Y_UNIT_TEST_TWIN(AutoDropping, IsFs) {
+        ConfigureRuntime(IsFs);
         Runtime().GetAppData().FeatureFlags.SetEnableExportAutoDropping(true);
+        auto request = MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
 
         Run(Runtime(), Env(), TVector<TString>{
             R"(
@@ -3172,20 +3167,10 @@ state: STATE_ENABLED
         }, request, Ydb::StatusIds::SUCCESS, "/MyRoot", false, "", "", {}, true);
     }
 
-    Y_UNIT_TEST(DisableAutoDropping) {
-        auto request = Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table"
-                destination_prefix: ""
-              }
-            }
-        )", S3Port());
-
-        Env();
+    Y_UNIT_TEST_TWIN(DisableAutoDropping, IsFs) {
+        ConfigureRuntime(IsFs);
         Runtime().GetAppData().FeatureFlags.SetEnableExportAutoDropping(false);
+        auto request = MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}});
 
         Run(Runtime(), Env(), TVector<TString>{
             R"(
@@ -3197,24 +3182,24 @@ state: STATE_ENABLED
         }, request, Ydb::StatusIds::SUCCESS, "/MyRoot", false, "", "", {}, true);
     }
 
-    Y_UNIT_TEST(TopicExport) {
-      TestTopic();
+    Y_UNIT_TEST_TWIN(TopicExport, IsFs) {
+      TestTopicImpl<IsFs>();
     }
 
-    Y_UNIT_TEST(TopicWithPermissionsExport) {
-      TestTopic(true);
+    Y_UNIT_TEST_TWIN(TopicWithPermissionsExport, IsFs) {
+      TestTopicImpl<IsFs>(true);
     }
 
-    Y_UNIT_TEST(TopicsExport) {
-      TestTopic(false, 5, 4);
+    Y_UNIT_TEST_TWIN(TopicsExport, IsFs) {
+      TestTopicImpl<IsFs>(false, 5, 4);
     }
 
-    Y_UNIT_TEST(TopicsWithPermissionsExport) {
-      TestTopic(true, 5, 4);
+    Y_UNIT_TEST_TWIN(TopicsWithPermissionsExport, IsFs) {
+      TestTopicImpl<IsFs>(true, 5, 4);
     }
 
-    Y_UNIT_TEST(SystemViewWithPermissionsExport) {
-        Env();
+    Y_UNIT_TEST_TWIN(SystemViewWithPermissionsExport, IsFs) {
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         Runtime().GetAppData().FeatureFlags.SetEnableSysViewPermissionsExport(true);
@@ -3226,31 +3211,24 @@ state: STATE_ENABLED
         TestModifyACL(Runtime(), ++txId, "/MyRoot/.sys", "partition_stats", diffACL.SerializeAsString(), "user0@builtin");
         Env().TestWaitNotification(Runtime(), txId);
 
-        auto exportRequest = NDescUT::TExportRequest(S3Port(), {
-            R"(
-                items {
-                    source_path: "/MyRoot/.sys/partition_stats"
-                    destination_prefix: "/partition_stats"
-                }
-            )",
-        });
+        auto request = MakeExportRequest(IsFs, {{"/MyRoot/.sys/partition_stats", "/partition_stats"}});
 
-        TestExport(Runtime(), ++txId, "/MyRoot", exportRequest.GetRequest());
+        TestExport(Runtime(), ++txId, "/MyRoot", request);
         Env().TestWaitNotification(Runtime(), txId);
 
         TestGetExport(Runtime(), txId, "/MyRoot");
 
-        UNIT_ASSERT(HasS3File("/partition_stats/system_view.pb"));
-        UNIT_ASSERT(HasS3File("/partition_stats/permissions.pb"));
-        UNIT_ASSERT(HasS3File("/partition_stats/metadata.json"));
+        UNIT_ASSERT(HasFile<IsFs>("/partition_stats/system_view.pb"));
+        UNIT_ASSERT(HasFile<IsFs>("/partition_stats/permissions.pb"));
+        UNIT_ASSERT(HasFile<IsFs>("/partition_stats/metadata.json"));
 
-        const auto sysviewDesc = GetS3FileContent("/partition_stats/system_view.pb");
+        const auto sysviewDesc = GetFileContent<IsFs>("/partition_stats/system_view.pb");
         const auto sysviewDescExpected = "sys_view_id: 1\nsys_view_name: \"partition_stats\"\n";
         UNIT_ASSERT_EQUAL_C(
             sysviewDesc, sysviewDescExpected,
             TStringBuilder() << "\nExpected:\n\n" << sysviewDescExpected << "\n\nActual:\n\n" << sysviewDesc);
 
-        const auto permissions = GetS3FileContent("/partition_stats/permissions.pb");
+        const auto permissions = GetFileContent<IsFs>("/partition_stats/permissions.pb");
         CheckPermissions(permissions, CreateProtoComparator(R"(
             actions {
               change_owner: "user0@builtin"
@@ -3264,8 +3242,8 @@ state: STATE_ENABLED
         )"));
     }
 
-    Y_UNIT_TEST(ExportTableWithUniqueIndex) {
-      Env();
+    Y_UNIT_TEST_TWIN(ExportTableWithUniqueIndex, IsFs) {
+      ConfigureRuntime(IsFs);
       ui64 txId = 100;
 
       TestCreateIndexedTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -3283,16 +3261,7 @@ state: STATE_ENABLED
       )");
       Env().TestWaitNotification(Runtime(), txId);
 
-      TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-          ExportToS3Settings {
-            endpoint: "localhost:%d"
-            scheme: HTTP
-            items {
-              source_path: "/MyRoot/Table"
-              destination_prefix: ""
-            }
-          }
-      )", S3Port()));
+      TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table", ""}}));
       Env().TestWaitNotification(Runtime(), txId);
 
       TestDescribeResult(DescribePrivatePath(Runtime(), "/MyRoot/Table/ByValue"),
@@ -3386,9 +3355,9 @@ state: STATE_ENABLED
             "2,inf\n");
     }
 
-    Y_UNIT_TEST(CorruptedDecimalValue) {
+    Y_UNIT_TEST_TWIN(CorruptedDecimalValue, IsFs) {
         EnvOptions().DisableStatsBatching(true);
-        Env(); // Init test env
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -3399,24 +3368,13 @@ state: STATE_ENABLED
             )");
         Env().TestWaitNotification(Runtime(), txId);
 
-        // Write a decimal value that is way out of range for max precision 35
-        // 10^38 = 0x4b3b4ca85a86c47a098a224000000000
         {
             ui64 key = 1u;
             std::pair<ui64, i64> value = { 0x098a224000000000ULL, 0x4b3b4ca85a86c47aULL };
             UploadRow(Runtime(), "/MyRoot/Table1", 0, {1}, {2}, {TCell::Make(key)}, {TCell::Make(value)});
         }
 
-        TestExport(Runtime(), ++txId, "/MyRoot", Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/Table1"
-                destination_prefix: "Backup1"
-              }
-            }
-        )", S3Port()));
+        TestExport(Runtime(), ++txId, "/MyRoot", MakeExportRequest(IsFs, {{"/MyRoot/Table1", "Backup1"}}));
         Env().TestWaitNotification(Runtime(), txId);
 
         TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::CANCELLED);
@@ -3594,7 +3552,7 @@ state: STATE_ENABLED
         env.TestWaitNotification(runtime, txId);
     }
 
-    Y_UNIT_TEST(ReplicationExportWithStaticCredentials) {
+    Y_UNIT_TEST_TWIN(ReplicationExportWithStaticCredentials, IsFs) {
         TString scheme = R"(
             Name: "Replication"
             Config {
@@ -3627,10 +3585,10 @@ WITH (
   PASSWORD_SECRET_NAME = 'pwd-secret-name',
   CONSISTENCY_LEVEL = 'Row'
 );)";
-        TestReplication(scheme, expected);
+        TestReplicationImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(ReplicationExportWithOAuthCredentials) {
+    Y_UNIT_TEST_TWIN(ReplicationExportWithOAuthCredentials, IsFs) {
         TString scheme = R"(
             Name: "Replication"
             Config {
@@ -3661,10 +3619,10 @@ WITH (
   TOKEN_SECRET_NAME = 'token-secret-name',
   CONSISTENCY_LEVEL = 'Row'
 );)";
-        TestReplication(scheme, expected);
+        TestReplicationImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(ReplicationExportMultipleItems) {
+    Y_UNIT_TEST_TWIN(ReplicationExportMultipleItems, IsFs) {
         TString scheme = R"(
             Name: "Replication"
             Config {
@@ -3699,10 +3657,10 @@ WITH (
   CONNECTION_STRING = 'grpc://localhost:2135/?database=/MyRoot',
   CONSISTENCY_LEVEL = 'Row'
 );)";
-        TestReplication(scheme, expected);
+        TestReplicationImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(ReplicationExportGlobalConsistency) {
+    Y_UNIT_TEST_TWIN(ReplicationExportGlobalConsistency, IsFs) {
         TString scheme = R"(
             Name: "Replication"
             Config {
@@ -3733,11 +3691,11 @@ WITH (
   CONSISTENCY_LEVEL = 'Global',
   COMMIT_INTERVAL = Interval('PT17S')
 );)";
-        TestReplication(scheme, expected);
+        TestReplicationImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(ReplicatedTableExport) {
-        Env();
+    Y_UNIT_TEST_TWIN(ReplicatedTableExport, IsFs) {
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
 
         TestCreateTable(Runtime(), ++txId, "/MyRoot", R"(
@@ -3756,22 +3714,13 @@ WITH (
             NLs::UserAttrsEqual({{"__async_replica", "true"}}),
         });
 
-        TString request = Sprintf(R"(
-            ExportToS3Settings {
-                endpoint: "localhost:%d"
-                scheme: HTTP
-                items {
-                    source_path: "/MyRoot/Table"
-                    destination_prefix: "Table"
-                }
-            }
-        )", S3Port());
+        TString request = MakeExportRequest(IsFs, {{"/MyRoot/Table", "Table"}});
 
         TestExport(Runtime(), ++txId, "/MyRoot", request, "", "", Ydb::StatusIds::BAD_REQUEST);
         TestGetExport(Runtime(), txId, "/MyRoot", Ydb::StatusIds::NOT_FOUND);
     }
 
-    Y_UNIT_TEST(TransferExportNoConnString) {
+    Y_UNIT_TEST_TWIN(TransferExportNoConnString, IsFs) {
         auto lambda = "PRAGMA OrderedColumns;$transformation_lambda = ($msg) -> { return [ <| partition: $msg._partition, offset: $msg._offset, message: CAST($msg._data AS Utf8) |> ]; };$__ydb_transfer_lambda = $transformation_lambda;";
 
         TString scheme = Sprintf(R"(
@@ -3797,10 +3746,10 @@ WITH (
   BATCH_SIZE_BYTES = 8388608,
   FLUSH_INTERVAL = Interval('PT60S')
 );)";
-        TestTransfer(scheme, expected);
+        TestTransferImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(TransferExportWithConnString) {
+    Y_UNIT_TEST_TWIN(TransferExportWithConnString, IsFs) {
         auto lambda = "PRAGMA OrderedColumns;$transformation_lambda = ($msg) -> { return [ <| partition: $msg._partition, offset: $msg._offset, message: CAST($msg._data AS Utf8) |> ]; };$__ydb_transfer_lambda = $transformation_lambda;";
 
         TString scheme = Sprintf(R"(
@@ -3830,10 +3779,10 @@ WITH (
   BATCH_SIZE_BYTES = 8388608,
   FLUSH_INTERVAL = Interval('PT60S')
 );)";
-        TestTransfer(scheme, expected);
+        TestTransferImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(TransferExportWithConsumer) {
+    Y_UNIT_TEST_TWIN(TransferExportWithConsumer, IsFs) {
         auto lambda = "PRAGMA OrderedColumns;$transformation_lambda = ($msg) -> { return [ <| partition: $msg._partition, offset: $msg._offset, message: CAST($msg._data AS Utf8) |> ]; };$__ydb_transfer_lambda = $transformation_lambda;";
 
         TString scheme = Sprintf(R"(
@@ -3861,12 +3810,12 @@ WITH (
   BATCH_SIZE_BYTES = 8388608,
   FLUSH_INTERVAL = Interval('PT60S')
 );)";
-        TestTransfer(scheme, expected);
+        TestTransferImpl<IsFs>(scheme, expected);
     }
 
-    Y_UNIT_TEST(TopicExportWithAllFields) {
+    Y_UNIT_TEST_TWIN(TopicExportWithAllFields, IsFs) {
         EnvOptions().EnablePermissionsExport(true).EnablePqBilling(true);
-        Env();
+        ConfigureRuntime(IsFs);
         ui64 txId = 100;
         TString topicProto = R"(
             Name: "topic_full_test"
@@ -3926,24 +3875,15 @@ WITH (
         Env().TestWaitNotification(Runtime(), txId);
 
         auto schemeshardId = TTestTxConfig::SchemeShard;
-        TString exportRequest = Sprintf(R"(
-            ExportToS3Settings {
-              endpoint: "localhost:%d"
-              scheme: HTTP
-              items {
-                source_path: "/MyRoot/topic_full_test"
-                destination_prefix: "topic_export"
-              }
-            }
-        )", S3Port());
+        TString exportRequest = MakeExportRequest(IsFs, {{"/MyRoot/topic_full_test", "topic_export"}});
 
         TestExport(Runtime(), schemeshardId, ++txId, "/MyRoot", exportRequest, "", "", Ydb::StatusIds::SUCCESS);
         Env().TestWaitNotification(Runtime(), txId, schemeshardId);
         TestGetExport(Runtime(), schemeshardId, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
 
         auto topicPath = "/topic_export/create_topic.pb";
-        UNIT_ASSERT_C(HasS3File(topicPath), "Topic description file should exist");
-        auto content = GetS3FileContent(topicPath);
+        UNIT_ASSERT_C(HasFile<IsFs>(topicPath), "Topic description file should exist");
+        auto content = GetFileContent<IsFs>(topicPath);
 
         Ydb::Topic::CreateTopicRequest topicDescription;
         UNIT_ASSERT_C(
@@ -4034,10 +3974,10 @@ WITH (
         UNIT_ASSERT_VALUES_EQUAL(attrs.at("_max_partition_message_groups_seqno_stored"), "10000000");
 
         auto permissionsPath = "/topic_export/permissions.pb";
-        UNIT_ASSERT_C(HasS3File(permissionsPath), "Permissions file should exist");
+        UNIT_ASSERT_C(HasFile<IsFs>(permissionsPath), "Permissions file should exist");
     }
 
-    Y_UNIT_TEST(ExternalDataSourceAuthNone) {
+    Y_UNIT_TEST_TWIN(ExternalDataSourceAuthNone, IsFs) {
         TString scheme = R"(
             Name: "DataSource"
             SourceType: "ObjectStorage"
@@ -4053,10 +3993,10 @@ WITH (
             "AUTH_METHOD = 'NONE'",
         };
 
-        TestExternalDataSource(scheme, expectedProperties);
+        TestExternalDataSourceImpl<IsFs>(scheme, expectedProperties);
     }
 
-    Y_UNIT_TEST(ExternalDataSourceAuthBasic) {
+    Y_UNIT_TEST_TWIN(ExternalDataSourceAuthBasic, IsFs) {
         TString scheme = R"(
             Name: "DataSource"
             SourceType: "ClickHouse"
@@ -4094,10 +4034,10 @@ WITH (
             "USE_TLS = 'TRUE'",
         };
 
-        TestExternalDataSource(scheme, expectedProperties);
+        TestExternalDataSourceImpl<IsFs>(scheme, expectedProperties);
     }
 
-    Y_UNIT_TEST(ExternalDataSourceAuthAWS) {
+    Y_UNIT_TEST_TWIN(ExternalDataSourceAuthAWS, IsFs) {
         TString scheme = R"(
             Name: "DataSource"
             SourceType: "ObjectStorage"
@@ -4120,10 +4060,10 @@ WITH (
             "AWS_REGION = 'ru-central-1'",
         };
 
-        TestExternalDataSource(scheme, expectedProperties);
+        TestExternalDataSourceImpl<IsFs>(scheme, expectedProperties);
     }
 
-    Y_UNIT_TEST(ExternalDataSourceAuthServiceAccount) {
+    Y_UNIT_TEST_TWIN(ExternalDataSourceAuthServiceAccount, IsFs) {
         TString scheme = R"(
             Name: "DataSource"
             SourceType: "ObjectStorage"
@@ -4144,10 +4084,10 @@ WITH (
             "SERVICE_ACCOUNT_SECRET_NAME = 'service_secret'",
         };
 
-        TestExternalDataSource(scheme, expectedProperties);
+        TestExternalDataSourceImpl<IsFs>(scheme, expectedProperties);
     }
 
-    Y_UNIT_TEST(ExternalDataSourceAuthMdbBasic) {
+    Y_UNIT_TEST_TWIN(ExternalDataSourceAuthMdbBasic, IsFs) {
         TString scheme = R"(
             Name: "DataSource"
             SourceType: "PostgreSQL"
@@ -4184,10 +4124,10 @@ WITH (
             "MDB_CLUSTER_ID = 'id'",
         };
 
-        TestExternalDataSource(scheme, expectedProperties);
+        TestExternalDataSourceImpl<IsFs>(scheme, expectedProperties);
     }
 
-    Y_UNIT_TEST(ExternalTable) {
+    Y_UNIT_TEST_TWIN(ExternalTable, IsFs) {
         TString scheme = R"(
             Name: "ExternalTable"
             SourceType: "General"
@@ -4211,7 +4151,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS `ExternalTable` (
             "LOCATION = 'bucket'"
         };
 
-        TestExternalTable(scheme, expectedStartsWith, expectedProperties);
+        TestExternalTableImpl<IsFs>(scheme, expectedStartsWith, expectedProperties);
     }
 
     Y_UNIT_TEST(DisableIcb) {
