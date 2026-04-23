@@ -1,5 +1,6 @@
 PY3TEST()
 INCLUDE(${ARCADIA_ROOT}/ydb/tests/harness_dep.inc)
+INCLUDE(${ARCADIA_ROOT}/ydb/tests/tools/nfs_recipe/recipe.inc)
 ENV(YDB_TEST_PATH="ydb/tests/stress/nfs_backups/nfs_backups")
 
 TEST_SRCS(
