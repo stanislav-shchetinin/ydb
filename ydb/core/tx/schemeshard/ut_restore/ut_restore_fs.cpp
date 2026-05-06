@@ -2,6 +2,8 @@
 #include <ydb/core/backup/common/metadata.h>
 #include <ydb/core/backup/common/checksum.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
+#include <ydb/core/protos/fs_settings.pb.h>
+#include <ydb/core/wrappers/s3_wrapper.h>
 
 #include <ydb/public/api/protos/ydb_import.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
@@ -668,6 +670,167 @@ Y_UNIT_TEST_SUITE(TImportFromFsTests) {
                 NLs::PathExist,
                 NLs::IndexesCount(1),
             });
+        }
+    }
+
+    Y_UNIT_TEST(DataIntegrityAfterFsCompleteMultipartUploadFailed) {
+        TTempDir tempDir;
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+        runtime.GetAppData().FeatureFlags.SetEnableFsBackups(true);
+        runtime.GetAppData().FeatureFlags.SetEnableChecksumsExport(true);
+        runtime.SetLogPriority(NKikimrServices::DATASHARD_BACKUP, NActors::NLog::PRI_DEBUG);
+        runtime.SetLogPriority(NKikimrServices::EXPORT, NActors::NLog::PRI_DEBUG);
+        runtime.SetLogPriority(NKikimrServices::S3_WRAPPER, NActors::NLog::PRI_DEBUG);
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns { Name: "value" Type: "Utf8" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TString longValue;
+        longValue.reserve(1000);
+        for (ui32 i = 0; i < 1000; ++i) {
+            longValue.push_back(static_cast<char>('a' + i % 26));
+        }
+        
+        for (ui32 i = 1; i <= 100; ++i) {
+            WriteRow(runtime, ++txId, "/MyRoot/Table", 0, i, longValue);
+        }
+
+        const TString basePath = tempDir.Path();
+
+        int sessionLostInjected = 3;
+
+        auto prevObserver = runtime.SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
+            switch (ev->GetTypeRewrite()) {
+                case TEvDataShard::EvProposeTransaction: {
+                    auto& record = ev->Get<TEvDataShard::TEvProposeTransaction>()->Record;
+                    if (record.GetTxKind() != NKikimrTxDataShard::ETransactionKind::TX_KIND_SCHEME) {
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    }
+                    NKikimrTxDataShard::TFlatSchemeTransaction schemeTx;
+                    UNIT_ASSERT(schemeTx.ParseFromString(record.GetTxBody()));
+                    if (schemeTx.HasBackup() && schemeTx.GetBackup().HasFSSettings()) {
+                        schemeTx.MutableBackup()->MutableScanSettings()->SetRowsBatchSize(5);
+                        schemeTx.MutableBackup()->MutableFSSettings()->MutableLimits()->SetMinWriteBatchSize(500);
+                        record.SetTxBody(schemeTx.SerializeAsString());
+                    }
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+
+                case NWrappers::NExternalStorage::EvCompleteMultipartUploadResponse: {
+                    if (!sessionLostInjected--) {
+                        Aws::Client::AWSError<Aws::S3::S3Errors> awsError(
+                            Aws::S3::S3Errors::INTERNAL_FAILURE,
+                            "FsCompleteMultipartUploadFailed",
+                            "Upload session not found: simulated node restart",
+                            true /* retryable */
+                        );
+                        auto response = MakeHolder<NWrappers::NExternalStorage::TEvCompleteMultipartUploadResponse>(
+                            std::nullopt,
+                            Aws::Utils::Outcome<Aws::S3::Model::CompleteMultipartUploadResult, Aws::S3::S3Error>(
+                                std::move(awsError)
+                            )
+                        );
+                        auto handle = MakeHolder<IEventHandle>(
+                            ev->Recipient, ev->Sender, response.Release(), ev->Flags, ev->Cookie);
+                        runtime.Send(handle.Release(), 0, true);
+                        return TTestActorRuntime::EEventAction::DROP;
+                    }
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+
+                default:
+                    return TTestActorRuntime::EEventAction::PROCESS;
+            }
+        });
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToFsSettings {
+              base_path: "%s"
+              number_of_retries: 10
+              items {
+                source_path: "/MyRoot/Table"
+                destination_path: "backup/Table"
+              }
+            }
+        )", basePath.c_str()));
+
+        env.TestWaitNotification(runtime, txId);
+        runtime.SetObserverFunc(prevObserver);
+
+        UNIT_ASSERT(sessionLostInjected);
+
+        auto desc = TestGetExport(runtime, txId, "/MyRoot");
+        const auto& entry = desc.GetResponse().GetEntry();
+        UNIT_ASSERT_VALUES_EQUAL(entry.GetProgress(), Ydb::Export::ExportProgress::PROGRESS_DONE);
+
+        const TFsPath tableDir = TFsPath(basePath) / "backup" / "Table";
+        TVector<TString> names;
+        tableDir.ListNames(names);
+
+        bool foundDataFile = false;
+        for (const TString& name : names) {
+            if (!name.StartsWith("data_") || !name.EndsWith(".csv")) {
+                continue;
+            }
+            foundDataFile = true;
+
+            const TString dataFilePath   = (tableDir / name).GetPath();
+            const TString sha256FilePath = (tableDir / (name + ".sha256")).GetPath();
+
+            UNIT_ASSERT(TFsPath(sha256FilePath).Exists());
+
+            TString storedChecksum;
+            {
+                TFileInput f(sha256FilePath);
+                TString line = StripString(f.ReadAll());
+                storedChecksum = line.substr(0, line.find(' '));
+            }
+            UNIT_ASSERT(!storedChecksum.empty());
+
+            TString actualChecksum;
+            {
+                TFileInput f(dataFilePath);
+                actualChecksum = NKikimr::NBackup::ComputeChecksum(f.ReadAll());
+            }
+
+            UNIT_ASSERT_VALUES_EQUAL(actualChecksum, storedChecksum);
+        }
+
+        UNIT_ASSERT(foundDataFile);
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromFsSettings {
+              base_path: "%s"
+              items {
+                source_path: "backup/Table"
+                destination_path: "/MyRoot/RestoredTable"
+              }
+            }
+        )", basePath.c_str()));
+        env.TestWaitNotification(runtime, txId);
+
+        auto importDesc = TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_VALUES_EQUAL(
+            importDesc.GetResponse().GetEntry().GetProgress(),
+            Ydb::Import::ImportProgress::PROGRESS_DONE);
+
+        const ui32 originalRows = CountRows(runtime, "/MyRoot/Table");
+        const ui32 restoredRows = CountRows(runtime, "/MyRoot/RestoredTable");
+        UNIT_ASSERT_VALUES_EQUAL(restoredRows, originalRows);
+
+        const ui64 schemeshardId = TTestTxConfig::SchemeShard;
+        TVector<TString> originalData  = ReadShards(runtime, schemeshardId, "/MyRoot/Table");
+        TVector<TString> restoredData  = ReadShards(runtime, schemeshardId, "/MyRoot/RestoredTable");
+        UNIT_ASSERT_VALUES_EQUAL(originalData.size(), restoredData.size());
+        for (size_t i = 0; i < originalData.size(); ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(restoredData[i], originalData[i]);
         }
     }
 }

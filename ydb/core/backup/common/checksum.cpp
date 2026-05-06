@@ -25,6 +25,10 @@ public:
         SHA256_Init(&Context);
     }
 
+    void Reset() override {
+        SHA256_Init(&Context);
+    }
+
     void AddData(TStringBuf data) override {
         SHA256_Update(&Context, data.data(), data.size());
     }

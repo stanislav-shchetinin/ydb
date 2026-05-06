@@ -99,6 +99,14 @@ class TExportScan: private NActors::IActorCallback, public IActorExceptionHandle
             return EScan::Final;
         }
 
+        EXPORT_LOG_I("SendBuffer"
+            << ": self# " << SelfId()
+            << ", uploader# " << Uploader
+            << ", rows# " << stats.Rows
+            << ", bytesRead# " << stats.BytesRead
+            << ", bytesSent# " << stats.BytesSent
+            << ", last# " << noMoreData);
+
         Send(Uploader, std::move(ev));
         State.Set(ES_BUFFER_SENT);
         Stats->Aggr(stats);
@@ -114,8 +122,9 @@ class TExportScan: private NActors::IActorCallback, public IActorExceptionHandle
     void Handle(TEvExportScan::TEvReset::TPtr&) {
         Y_ENSURE(IsReady());
 
-        EXPORT_LOG_D("Handle TEvExportScan::TEvReset"
-            << ": self# " << SelfId());
+        EXPORT_LOG_I("Handle TEvExportScan::TEvReset: resetting scan from beginning"
+            << ": self# " << SelfId()
+            << ", uploader# " << Uploader);
 
         Stats.Reset(new TStats);
         State.Reset(ES_UPLOADER_READY).Reset(ES_BUFFER_SENT).Reset(ES_NO_MORE_DATA);
@@ -191,6 +200,10 @@ public:
     }
 
     EScan Seek(TLead& lead, ui64) override {
+        EXPORT_LOG_I("Seek: starting scan from beginning"
+            << ": self# " << SelfId()
+            << ", uploader# " << Uploader);
+
         lead.To(Scheme->Tags(), {}, ESeek::Lower);
         Buffer->Clear();
 

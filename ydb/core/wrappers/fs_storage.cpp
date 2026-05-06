@@ -12,6 +12,9 @@
 #include <util/stream/file.h>
 #include <util/system/fs.h>
 #include <util/generic/guid.h>
+#include <util/string/hex.h>
+
+#include <openssl/sha.h>
 
 #include <type_traits>
 
@@ -35,10 +38,17 @@ class TFsOperationActor : public TActorBootstrapped<TFsOperationActor> {
 private:
     const TString BasePath;
 
+    struct TPartInfo {
+        int PartNumber = 0;
+        ui64 Size = 0;
+        TString Sha256;
+    };
+
     struct TMultipartUploadSession {
         const TString Key;
         TFile File;
         ui64 TotalSize = 0;
+        TVector<TPartInfo> PartsInfo;
 
         explicit TMultipartUploadSession(const TString& key)
             : Key(key)
@@ -49,6 +59,12 @@ private:
             File.Resize(0);
         }
     };
+
+    static TString ComputeSha256(const TString& data) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash);
+        return to_lower(HexEncode(hash, SHA256_DIGEST_LENGTH));
+    }
 
     THashMap<TString, TMultipartUploadSession> ActiveUploads;
     static constexpr std::pair<ui64, ui64> EmptyRange = std::make_pair(0, 0);
@@ -93,10 +109,10 @@ private:
     }
 
     template<typename TEvResponse>
-    auto CreateOutcome(Aws::S3::S3Errors errorType, const TString& errorMessage, bool retryable) {
+    auto CreateOutcome(Aws::S3::S3Errors errorType, const TString& exceptionName, const TString& errorMessage, bool retryable) {
         Aws::Client::AWSError<Aws::S3::S3Errors> awsError(
             errorType,
-            "FsStorageError",
+            exceptionName,
             errorMessage,
             retryable
         );
@@ -110,10 +126,11 @@ private:
             const NActors::TActorId& sender,
             const TString& errorMessage,
             Aws::S3::S3Errors errorType = Aws::S3::S3Errors::INTERNAL_FAILURE,
-            bool retryable = false)
+            bool retryable = false,
+            const TString& exceptionName = "FsStorageError")
     {
         std::unique_ptr<TEvResponse> response;
-        response = std::make_unique<TEvResponse>(CreateOutcome<TEvResponse>(errorType, errorMessage, retryable));
+        response = std::make_unique<TEvResponse>(CreateOutcome<TEvResponse>(errorType, exceptionName, errorMessage, retryable));
         this->Send(sender, response.release());
     }
 
@@ -123,10 +140,11 @@ private:
             const TString& key,
             const TString& errorMessage,
             Aws::S3::S3Errors errorType = Aws::S3::S3Errors::INTERNAL_FAILURE,
-            bool retryable = false)
+            bool retryable = false,
+            const TString& exceptionName = "FsStorageError")
     {
         std::unique_ptr<TEvResponse> response;
-        response = std::make_unique<TEvResponse>(key, CreateOutcome<TEvResponse>(errorType, errorMessage, retryable));
+        response = std::make_unique<TEvResponse>(key, CreateOutcome<TEvResponse>(errorType, exceptionName, errorMessage, retryable));
         this->Send(sender, response.release());
     }
 
@@ -137,10 +155,11 @@ private:
             const std::pair<ui64, ui64>& range,
             const TString& errorMessage,
             Aws::S3::S3Errors errorType = Aws::S3::S3Errors::INTERNAL_FAILURE,
-            bool retryable = false)
+            bool retryable = false,
+            const TString& exceptionName = "FsStorageError")
     {
         std::unique_ptr<TEvResponse> response;
-        response = std::make_unique<TEvResponse>(key, range, CreateOutcome<TEvResponse>(errorType, errorMessage, retryable));
+        response = std::make_unique<TEvResponse>(key, range, CreateOutcome<TEvResponse>(errorType, exceptionName, errorMessage, retryable));
         this->Send(sender, response.release());
     }
 
@@ -183,17 +202,19 @@ public:
 
 private:
     void CleanupActiveSessions() {
-        FS_LOG_D_SAFE("TFsOperationActor: cleaning up"
-            << ": active MPU sessions# " << ActiveUploads.size());
+        FS_LOG_I_SAFE("TFsOperationActor: cleaning up active sessions"
+            << ": count# " << ActiveUploads.size());
         for (auto& [uploadId, session] : ActiveUploads) {
             try {
                 const TString filePath = session.Key;
+                const ui64 totalSize = session.TotalSize;
                 NFs::Remove(filePath);
                 session.File.Close();
 
-                FS_LOG_T_SAFE("TFsOperationActor: closed and deleted incomplete file"
+                FS_LOG_I_SAFE("TFsOperationActor: closed and deleted incomplete file"
                     << ": uploadId# " << uploadId
-                    << ", file# " << filePath);
+                    << ", file# " << filePath
+                    << ", fileTotalSize# " << totalSize);
             } catch (const std::exception& ex) {
                 FS_LOG_W_SAFE("Failed to cleanup MPU session"
                     << ": uploadId# " << uploadId
@@ -237,9 +258,10 @@ public:
         const auto& body = ev->Get()->Body;
         const TString key = TString(request.GetKey().data(), request.GetKey().size());
 
-        FS_LOG_D("PutObject"
+        FS_LOG_I("PutObject begin"
             << ": key# " << key
-            << ", size# " << body.size());
+            << ", bodySize# " << body.size()
+            << ", sender# " << ev->Sender);
 
         try {
             TFsPath fsPath(key);
@@ -249,6 +271,11 @@ public:
             session.File.Write(body.data(), body.size());
             session.File.Flush();
             session.File.Close();
+
+            FS_LOG_I("PutObject succeeded"
+                << ": key# " << key
+                << ", bytesWritten# " << body.size());
+
             ReplySuccess<TEvPutObjectResponse>(ev->Sender, key);
         } catch (const TSystemError& ex) {
             if (!HandleFileLockError<TEvPutObjectResponse>(ex, ev->Sender, key, "PutObject")) {
@@ -470,8 +497,10 @@ public:
         const auto& request = ev->Get()->GetRequest();
         const TString originalKey = TString(request.GetKey().data(), request.GetKey().size());
 
-        FS_LOG_D("CreateMultipartUpload"
-            << ": key# " << originalKey);
+        FS_LOG_I("CreateMultipartUpload begin"
+            << ": key# " << originalKey
+            << ", sender# " << ev->Sender
+            << ", activeSessions# " << ActiveUploads.size());
 
         try {
             const TString key = GetIncompletePath(originalKey.c_str());
@@ -481,10 +510,11 @@ public:
 
             ActiveUploads.emplace(uploadId, TMultipartUploadSession(key));
 
-            FS_LOG_I("CreateMultipartUpload"
-                << ": key# " << key
+            FS_LOG_I("CreateMultipartUpload succeeded"
+                << ": originalKey# " << originalKey
+                << ", incompleteFile# " << key
                 << ", uploadId# " << uploadId
-                << ", file opened with exclusive lock");
+                << ", activeSessions# " << ActiveUploads.size());
 
             Aws::S3::Model::CreateMultipartUploadResult awsResult;
             awsResult.SetKey(request.GetKey());
@@ -516,11 +546,12 @@ public:
         const TString uploadId = TString(request.GetUploadId().data(), request.GetUploadId().size());
         const int partNumber = request.GetPartNumber();
 
-        FS_LOG_D("UploadPart"
+        FS_LOG_I("UploadPart begin"
             << ": key# " << originalKey
             << ", uploadId# " << uploadId
             << ", part# " << partNumber
-            << ", size# " << body.size());
+            << ", bodySize# " << body.size()
+            << ", sender# " << ev->Sender);
 
         try {
             const TString key = GetIncompletePath(originalKey.c_str());
@@ -537,21 +568,33 @@ public:
                     ReplyError<TEvUploadPartResponse>(ev->Sender, originalKey, errorMsg, Aws::S3::S3Errors::INTERNAL_FAILURE);
                     return;
                 }
+                FS_LOG_I("UploadPart: session not found, creating new session for part 1"
+                    << ": uploadId# " << uploadId
+                    << ", incompleteFile# " << key);
                 it = ActiveUploads.emplace(uploadId, TMultipartUploadSession(key)).first;
             }
 
             auto& session = it->second;
+            const ui64 offsetBefore = session.TotalSize;
+
+            const TString partSha256 = ComputeSha256(body);
 
             session.File.Write(body.data(), body.size());
             session.File.Flush();
             session.TotalSize += body.size();
-
-            FS_LOG_I("UploadPart: written under lock"
-                << ": uploadId# " << uploadId
-                << ", part# " << partNumber
-                << ", total size# " << session.TotalSize);
+            session.PartsInfo.push_back({partNumber, body.size(), partSha256});
 
             const TString etag = TStringBuilder() << "\"part" << partNumber << "\"";
+
+            FS_LOG_I("UploadPart completed"
+                << ": uploadId# " << uploadId
+                << ", part# " << partNumber
+                << ", partSize# " << body.size()
+                << ", partSha256# " << partSha256
+                << ", fileOffsetBefore# " << offsetBefore
+                << ", fileTotalSize# " << session.TotalSize
+                << ", eTag# " << etag
+                << ", incompleteFile# " << session.Key);
 
             Aws::S3::Model::UploadPartResult awsResult;
             awsResult.SetETag(etag.c_str());
@@ -564,6 +607,8 @@ public:
                 FS_LOG_E("UploadPart failed with system error"
                     << ": key# " << originalKey
                     << ", uploadId# " << uploadId
+                    << ", part# " << partNumber
+                    << ", bodySize# " << body.size()
                     << ", error# " << ex.what()
                     << ", errno# " << ex.Status());
                 ReplyError<TEvUploadPartResponse>(ev->Sender, originalKey, ex.what());
@@ -572,6 +617,8 @@ public:
             FS_LOG_E("UploadPart failed"
                 << ": key# " << originalKey
                 << ", uploadId# " << uploadId
+                << ", part# " << partNumber
+                << ", bodySize# " << body.size()
                 << ", error# " << ex.what());
             ReplyError<TEvUploadPartResponse>(ev->Sender, originalKey, ex.what());
         }
@@ -582,54 +629,84 @@ public:
         const TString key = TString(request.GetKey().data(), request.GetKey().size());
         const TString uploadId = TString(request.GetUploadId().data(), request.GetUploadId().size());
 
-        FS_LOG_D("CompleteMultipartUpload"
+        const auto& parts = request.GetMultipartUpload().GetParts();
+        FS_LOG_I("CompleteMultipartUpload begin"
             << ": key# " << key
-            << ", uploadId# " << uploadId);
+            << ", uploadId# " << uploadId
+            << ", partsInRequest# " << parts.size()
+            << ", sender# " << ev->Sender);
+
+        for (const auto& part : parts) {
+            FS_LOG_I("CompleteMultipartUpload part"
+                << ": uploadId# " << uploadId
+                << ", partNumber# " << part.GetPartNumber()
+                << ", eTag# " << part.GetETag());
+        }
 
         try {
             const TString incompleteKey = GetIncompletePath(key.c_str());
             auto it = ActiveUploads.find(uploadId);
             if (it == ActiveUploads.end()) {
-                // Upload session not found - likely due to actor restart
-                // Return retryable error to force datashard to retry with cleared uploadId
-                Aws::Client::AWSError<Aws::S3::S3Errors> awsError(
-                    Aws::S3::S3Errors::INTERNAL_FAILURE,
-                    "FsUploadSessionLost",
-                    TStringBuilder() << "Upload session not found: uploadId# " << uploadId,
-                    true // retryable
-                );
-                Aws::S3::S3Error error(std::move(awsError));
-                Aws::Utils::Outcome<Aws::S3::Model::CompleteMultipartUploadResult, Aws::S3::S3Error> outcome(std::move(error));
-                auto response = std::make_unique<TEvCompleteMultipartUploadResponse>(key, std::move(outcome));
-                this->Send(ev->Sender, response.release());
+                FS_LOG_E("CompleteMultipartUpload: session not found"
+                    << ": uploadId# " << uploadId
+                    << ", key# " << key
+                    << ", activeSessions# " << ActiveUploads.size());
+                ReplyError<TEvCompleteMultipartUploadResponse>(ev->Sender, key,
+                    TStringBuilder() << "Upload session not found: uploadId# " << uploadId);
                 return;
             }
 
             auto& session = it->second;
             session.File.Flush();
 
+            const ui64 totalSize = session.TotalSize;
+            const auto& partsInfo = session.PartsInfo;
+
+            FS_LOG_I("CompleteMultipartUpload: flushed, renaming"
+                << ": uploadId# " << uploadId
+                << ", fileTotalSize# " << totalSize
+                << ", uploadedPartsCount# " << partsInfo.size()
+                << ", from# " << incompleteKey
+                << ", to# " << key);
+
+            for (const auto& pi : partsInfo) {
+                FS_LOG_I("CompleteMultipartUpload: uploaded part summary"
+                    << ": uploadId# " << uploadId
+                    << ", part# " << pi.PartNumber
+                    << ", size# " << pi.Size
+                    << ", sha256# " << pi.Sha256);
+            }
+
             if (!NFs::Rename(incompleteKey, key)) {
                 const TString errorMsg = TStringBuilder()
                     << "Failed to rename " << incompleteKey << " to " << key
                     << ": " << LastSystemErrorText();
-                FS_LOG_E("CompleteMultipartUpload: " << errorMsg);
+                FS_LOG_E("CompleteMultipartUpload: rename failed"
+                    << ": uploadId# " << uploadId
+                    << ", fileTotalSize# " << totalSize
+                    << ", uploadedPartsCount# " << partsInfo.size()
+                    << ", error# " << errorMsg);
 
                 session.File.Close();
                 NFs::Remove(incompleteKey);
                 ActiveUploads.erase(it);
 
-                ReplyError<TEvCompleteMultipartUploadResponse>(
-                    ev->Sender, key, errorMsg,
-                    Aws::S3::S3Errors::INTERNAL_FAILURE, true /* retryable */);
+                ReplyError<TEvCompleteMultipartUploadResponse>(ev->Sender, key, errorMsg, 
+                    Aws::S3::S3Errors::INTERNAL_FAILURE, 
+                    true /* retryable */, 
+                    "FsCompleteMultipartUploadFailed"
+                );
                 return;
             }
             FsyncParentDir(key);
             session.File.Close();
 
-            FS_LOG_I("CompleteMultipartUpload"
+            FS_LOG_I("CompleteMultipartUpload succeeded"
                 << ": uploadId# " << uploadId
-                << ", total size# " << session.TotalSize
-                << ", file mv from# " << incompleteKey << " to# " << key);
+                << ", key# " << key
+                << ", fileTotalSize# " << totalSize
+                << ", partsCount# " << parts.size()
+                << ", uploadedPartsCount# " << partsInfo.size());
 
             ActiveUploads.erase(it);
 
@@ -642,7 +719,10 @@ public:
             auto response = std::make_unique<TEvCompleteMultipartUploadResponse>(key, std::move(outcome));
             this->Send(ev->Sender, response.release());
         } catch (const std::exception& ex) {
-            FS_LOG_E("CompleteMultipartUpload failed: key# " << key << ", uploadId# " << uploadId << ", error# " << ex.what());
+            FS_LOG_E("CompleteMultipartUpload failed with exception"
+                << ": key# " << key
+                << ", uploadId# " << uploadId
+                << ", error# " << ex.what());
             ReplyError<TEvCompleteMultipartUploadResponse>(ev->Sender, key, ex.what());
         }
     }
@@ -652,31 +732,36 @@ public:
         const TString key = TString(request.GetKey().data(), request.GetKey().size());
         const TString uploadId = TString(request.GetUploadId().data(), request.GetUploadId().size());
 
-        FS_LOG_D("AbortMultipartUpload"
+        FS_LOG_I("AbortMultipartUpload begin"
             << ": key# " << key
-            << ", uploadId# " << uploadId);
+            << ", uploadId# " << uploadId
+            << ", sender# " << ev->Sender);
 
         try {
             auto it = ActiveUploads.find(uploadId);
             if (it == ActiveUploads.end()) {
-                FS_LOG_W("AbortMultipartUpload"
-                    << ": session not found"
-                    << ": uploadId# " << uploadId);
+                FS_LOG_W("AbortMultipartUpload: session not found"
+                    << ": uploadId# " << uploadId
+                    << ", key# " << key
+                    << ", activeSessions# " << ActiveUploads.size());
             } else {
                 auto& session = it->second;
                 const TString filePath = session.Key;
+                const ui64 totalSize = session.TotalSize;
 
                 bool removed = NFs::Remove(filePath);
+                FS_LOG_I("AbortMultipartUpload: cleanup"
+                    << ": uploadId# " << uploadId
+                    << ", file# " << filePath
+                    << ", fileTotalSize# " << totalSize
+                    << ", fileRemoved# " << removed);
+
                 if (!removed) {
                     FS_LOG_W("AbortMultipartUpload: failed to delete incomplete file"
                         << ": uploadId# " << uploadId
                         << ", file# " << filePath);
                 }
                 ActiveUploads.erase(it);
-
-                FS_LOG_I("AbortMultipartUpload"
-                    << ": uploadId# " << uploadId
-                    << ", file deleted, lock released");
             }
 
             ReplySuccess<TEvAbortMultipartUploadResponse>(ev->Sender, key);

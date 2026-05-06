@@ -16,6 +16,7 @@ public:
 
     virtual void AddData(TStringBuf data) = 0;
     virtual TString Finalize() = 0;
+    virtual void Reset() = 0;
 
     virtual TChecksumState GetState() const = 0;
     virtual void SetState(const TChecksumState& state) = 0;

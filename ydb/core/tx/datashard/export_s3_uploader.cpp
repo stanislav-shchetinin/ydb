@@ -170,6 +170,14 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
     void Restart() {
         Y_ENSURE(ProxyResolved);
 
+        EXPORT_LOG_I("Restart"
+            << ": self# " << this->SelfId()
+            << ", attempt# " << Attempt
+            << ", multiPart# " << MultiPart
+            << ", partsCount# " << Parts.size()
+            << ", uploadId# " << UploadId
+            << ", forceNewUpload# " << ForceNewUpload);
+
         MultiPart = false;
         Last = false;
         Parts.clear();
@@ -193,6 +201,9 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             this->Become(&TThis::StateUploadData);
 
             if (Attempt) {
+                EXPORT_LOG_I("Restart: resetting scanner"
+                    << ": self# " << this->SelfId()
+                    << ", scanner# " << Scanner);
                 this->Send(std::exchange(Scanner, TActorId()), new TEvExportScan::TEvReset());
             } else if (Scanner) {
                 this->Send(Scanner, new TEvExportScan::TEvFeed());
@@ -307,9 +318,16 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
     {
         // make checksum verifiable using sha256sum CLI
         checksum += ' ' + objectKeySuffix;
+        EXPORT_LOG_I("UploadChecksum"
+            << ": self# " << this->SelfId()
+            << ", checksumKey# " << checksumKey
+            << ", checksumValue# " << checksum);
         PutData(std::move(checksum), checksumKey, &TThis::StateUploadChecksum);
         ChecksumUploadedCallback = checksumUploadedCallback;
     }
+
+    //export/import nemesis/no-nemesis
+    // export + no-n
 
     void HandleScheme(TEvExternalStorage::TEvPutObjectResponse::TPtr& ev) {
         const auto& result = ev->Get()->Result;
@@ -445,6 +463,8 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             return;
         }
 
+        EXPORT_LOG_I("Checksum uploaded successfully"
+            << ": self# " << this->SelfId());
         ChecksumUploadedCallback();
     }
 
@@ -456,11 +476,18 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         Scanner = ev->Sender;
 
         if (Error) {
+            EXPORT_LOG_N("Scanner ready but uploader has error, passing away"
+                << ": self# " << this->SelfId()
+                << ", error# " << *Error);
             return PassAway();
         }
 
         const bool permissionsDone = !EnablePermissions || PermissionsUploaded;
         if (ProxyResolved && SchemeUploaded && MetadataUploaded && permissionsDone && ChangefeedsUploaded) {
+            EXPORT_LOG_I("Scanner ready, requesting first data chunk"
+                << ": self# " << this->SelfId()
+                << ", scanner# " << Scanner
+                << ", attempt# " << Attempt);
             this->Send(Scanner, new TEvExportScan::TEvFeed());
         }
     }
@@ -484,24 +511,48 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         ev->Get()->Buffer.AsString(Buffer);
         DataChecksum = std::move(ev->Get()->Checksum);
 
+        EXPORT_LOG_I("ReceivedBuffer"
+            << ": self# " << this->SelfId()
+            << ", bufferSize# " << Buffer.size()
+            << ", last# " << Last
+            << ", multiPart# " << MultiPart
+            << ", dataChecksum# " << DataChecksum
+            << ", attempt# " << Attempt
+            << ", partsCount# " << Parts.size());
+
         UploadData();
     }
 
     void UploadData() {
         if (!MultiPart) {
+            EXPORT_LOG_I("UploadData PutObject (single-part)"
+                << ": self# " << this->SelfId()
+                << ", key# " << Settings.GetDataKey(DataFormat, CompressionCodec)
+                << ", bufferSize# " << Buffer.size());
             auto request = Aws::S3::Model::PutObjectRequest()
                 .WithKey(Settings.GetDataKey(DataFormat, CompressionCodec));
             this->Send(Client, new TEvExternalStorage::TEvPutObjectRequest(request, std::move(Buffer)));
         } else {
             if (!UploadId) {
+                EXPORT_LOG_I("UploadData requesting uploadId from DataShard"
+                    << ": self# " << this->SelfId()
+                    << ", forceNewUpload# " << ForceNewUpload
+                    << ", bufferSize# " << Buffer.size());
                 this->Send(DataShard, new TEvDataShard::TEvGetS3Upload(this->SelfId(), TxId));
                 return;
             }
 
+            const ui32 partNumber = Parts.size() + 1;
+            EXPORT_LOG_I("UploadData UploadPart"
+                << ": self# " << this->SelfId()
+                << ", partNumber# " << partNumber
+                << ", bufferSize# " << Buffer.size()
+                << ", uploadId# " << *UploadId
+                << ", last# " << Last);
             auto request = Aws::S3::Model::UploadPartRequest()
                 .WithKey(Settings.GetDataKey(DataFormat, CompressionCodec))
                 .WithUploadId(*UploadId)
-                .WithPartNumber(Parts.size() + 1);
+                .WithPartNumber(partNumber);
             this->Send(Client, new TEvExternalStorage::TEvUploadPartRequest(request, std::move(Buffer)));
         }
     }
@@ -516,6 +567,11 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
         if (!CheckResult(result, TStringBuf("PutObject (data)"))) {
             return;
         }
+
+        EXPORT_LOG_I("PutObject (data) succeeded"
+            << ": self# " << this->SelfId()
+            << ", dataChecksum# " << DataChecksum
+            << ", enableChecksums# " << EnableChecksums);
 
         auto nextStep = [this]() {
             Finish();
@@ -539,10 +595,20 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             << ", upload# " << upload);
 
         if (!upload) {
+            EXPORT_LOG_I("CreateMultipartUpload (no prior upload)"
+                << ": self# " << this->SelfId()
+                << ", key# " << Settings.GetDataKey(DataFormat, CompressionCodec)
+                << ", attempt# " << Attempt);
             auto request = Aws::S3::Model::CreateMultipartUploadRequest()
                 .WithKey(Settings.GetDataKey(DataFormat, CompressionCodec));
             this->Send(Client, new TEvExternalStorage::TEvCreateMultipartUploadRequest(request));
         } else if (ForceNewUpload) {
+            EXPORT_LOG_I("ForceNewUpload: resetting upload to UploadParts"
+                << ": self# " << this->SelfId()
+                << ", uploadId# " << upload->Id
+                << ", oldStatus# " << static_cast<int>(upload->Status)
+                << ", oldPartsCount# " << upload->Parts.size()
+                << ", attempt# " << Attempt);
             ForceNewUpload = false;
             UploadId = upload->Id;
             Parts.clear();
@@ -554,10 +620,20 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
 
             switch (upload->Status) {
                 case TS3Upload::EStatus::UploadParts:
+                    EXPORT_LOG_I("ResumeUpload status=UploadParts"
+                        << ": self# " << this->SelfId()
+                        << ", uploadId# " << upload->Id
+                        << ", existingPartsCount# " << upload->Parts.size()
+                        << ", attempt# " << Attempt);
                     return UploadData();
 
                 case TS3Upload::EStatus::Complete: {
                     Parts = std::move(upload->Parts);
+                    EXPORT_LOG_I("ResumeUpload status=Complete, sending CompleteMultipartUpload"
+                        << ": self# " << this->SelfId()
+                        << ", uploadId# " << upload->Id
+                        << ", partsCount# " << Parts.size()
+                        << ", attempt# " << Attempt);
 
                     TVector<Aws::S3::Model::CompletedPart> parts(Reserve(Parts.size()));
                     for (ui32 partIndex = 0; partIndex < Parts.size(); ++partIndex) {
@@ -575,6 +651,10 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
                 }
 
                 case TS3Upload::EStatus::Abort: {
+                    EXPORT_LOG_I("ResumeUpload status=Abort"
+                        << ": self# " << this->SelfId()
+                        << ", uploadId# " << upload->Id
+                        << ", error# " << upload->Error);
                     Error = std::move(upload->Error);
                     if (!Error) {
                         Error = "<empty>";
@@ -601,7 +681,12 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             return;
         }
 
-        this->Send(DataShard, new TEvDataShard::TEvStoreS3UploadId(this->SelfId(), TxId, result.GetResult().GetUploadId().c_str()));
+        const TString uploadId = result.GetResult().GetUploadId().c_str();
+        EXPORT_LOG_I("CreateMultipartUpload succeeded"
+            << ": self# " << this->SelfId()
+            << ", uploadId# " << uploadId
+            << ", key# " << Settings.GetDataKey(DataFormat, CompressionCodec));
+        this->Send(DataShard, new TEvDataShard::TEvStoreS3UploadId(this->SelfId(), TxId, uploadId));
     }
 
     void Handle(TEvExternalStorage::TEvUploadPartResponse::TPtr& ev) {
@@ -615,9 +700,24 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             return;
         }
 
-        Parts.push_back(result.GetResult().GetETag().c_str());
+        const TString etag = result.GetResult().GetETag().c_str();
+        Parts.push_back(etag);
+
+        EXPORT_LOG_I("UploadPartCompleted"
+            << ": self# " << this->SelfId()
+            << ", partNumber# " << Parts.size()
+            << ", eTag# " << etag
+            << ", last# " << Last
+            << ", totalParts# " << Parts.size()
+            << ", uploadId# " << UploadId);
 
         if (Last) {
+            EXPORT_LOG_I("LastPartUploaded, finalizing"
+                << ": self# " << this->SelfId()
+                << ", totalParts# " << Parts.size()
+                << ", dataChecksum# " << DataChecksum
+                << ", enableChecksums# " << EnableChecksums);
+
             auto nextStep = [this]() {
                 Finish();
             };
@@ -643,23 +743,43 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             << ", result# " << result);
 
         if (result.IsSuccess()) {
+            EXPORT_LOG_I("CompleteMultipartUpload succeeded"
+                << ": self# " << this->SelfId()
+                << ", uploadId# " << UploadId
+                << ", totalParts# " << Parts.size());
             return PassAway();
         }
 
         const auto& error = result.GetError();
         if (error.GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD) {
+            EXPORT_LOG_I("CompleteMultipartUpload NO_SUCH_UPLOAD (already completed)"
+                << ": self# " << this->SelfId()
+                << ", uploadId# " << UploadId);
             return PassAway();
         }
 
+        EXPORT_LOG_N("CompleteMultipartUpload failed"
+            << ": self# " << this->SelfId()
+            << ", uploadId# " << UploadId
+            << ", totalParts# " << Parts.size()
+            << ", errorType# " << static_cast<int>(error.GetErrorType())
+            << ", exceptionName# " << error.GetExceptionName()
+            << ", message# " << error.GetMessage()
+            << ", retryable# " << error.ShouldRetry()
+            << ", attempt# " << Attempt);
+
         if (CanRetry(error)) {
-            if (error.GetExceptionName() == "FsUploadSessionLost") {
+            if (error.GetExceptionName() == "FsCompleteMultipartUploadFailed") {
+                EXPORT_LOG_N("ForceNewUpload set due to FsCompleteMultipartUploadFailed"
+                    << ": self# " << this->SelfId()
+                    << ", uploadId# " << UploadId);
                 ForceNewUpload = true;
             }
             UploadId.Clear(); // force getting info after restart
             Retry();
         } else {
             Error = TStringBuilder() << "S3 error: " << error;
-            this->PassAway();
+            PassAway();
         }
     }
 
@@ -682,7 +802,7 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
             Y_ENSURE(Error);
             Error = TStringBuilder() << *Error << " Additionally, 'AbortMultipartUpload' has failed: "
                 << error;
-            this->PassAway();
+            PassAway();
         }
     }
 
@@ -707,7 +827,15 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
     void Retry() {
         Delay = Min(Delay * ++Attempt, MaxDelay);
         const TDuration random = TDuration::FromValue(TAppData::RandomProvider->GenRand64() % Delay.MicroSeconds());
-        this->Schedule(Delay + random, new TEvents::TEvWakeup());
+        const TDuration totalDelay = Delay + random;
+        EXPORT_LOG_N("Retry scheduled"
+            << ": self# " << this->SelfId()
+            << ", attempt# " << Attempt
+            << ", delay# " << totalDelay
+            << ", forceNewUpload# " << ForceNewUpload
+            << ", uploadId# " << UploadId
+            << ", partsCount# " << Parts.size());
+        this->Schedule(totalDelay, new TEvents::TEvWakeup());
     }
 
     void RetryOrFinish(const Aws::S3::S3Error& error) {
@@ -735,7 +863,7 @@ class TS3Uploader: public TActorBootstrapped<TS3Uploader<TSettings>> {
                 return;
             }
 
-            this->PassAway();
+            PassAway();
         } else {
             if (success) {
                 this->Send(DataShard, new TEvDataShard::TEvChangeS3UploadStatus(this->SelfId(), TxId,
