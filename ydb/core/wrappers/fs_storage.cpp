@@ -652,7 +652,11 @@ public:
                     << ", key# " << key
                     << ", activeSessions# " << ActiveUploads.size());
                 ReplyError<TEvCompleteMultipartUploadResponse>(ev->Sender, key,
-                    TStringBuilder() << "Upload session not found: uploadId# " << uploadId);
+                    TStringBuilder() << "Upload session not found: uploadId# " << uploadId,
+                    Aws::S3::S3Errors::INTERNAL_FAILURE, 
+                    true /* retryable */, 
+                    "FsCompleteMultipartUploadFailed"
+                );
                 return;
             }
 
