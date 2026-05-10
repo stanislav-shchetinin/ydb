@@ -334,6 +334,7 @@ IEventBase* TS3Buffer::PrepareEvent(bool last, NExportScan::IBuffer::TStats& sta
 void TS3Buffer::Clear() {
     Rows = 0;
     BytesRead = 0;
+    Buffer = TBuffer();
     if (Checksum) {
         Checksum.reset(ChecksumCreator());
     }
