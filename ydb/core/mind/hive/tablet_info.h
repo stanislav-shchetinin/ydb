@@ -158,6 +158,10 @@ public:
     TVector<TActorId> ActorsToNotify; // ...OnCreation persistent
     TVector<TActorId> ActorsToNotifyOnRestart; // volatile
     double Weight;
+    // Applied on top of Weight in GetWeight, which is what the tablet balancer uses to pick a
+    // victim. Cached by UpdateWeight so that GetWeight stays inline - it is called from sort
+    // comparators. Does not affect Weight itself, which is also used for boot priority.
+    double BalancerWeightMultiplier = 1;
     mutable TString BootState;
     TInstant PostponedStart;
     EBalancerPolicy BalancerPolicy;
@@ -260,18 +264,10 @@ public:
         }
     }
 
-    void UpdateWeight() {
-        TResourceRawValues current = GetResourceCurrentValues();
-        TResourceRawValues maximum = GetResourceMaximumValues();
-        FilterRawValues(current);
-        FilterRawValues(maximum);
-
-        ResourceNormalizedValues = NormalizeRawValues(current, maximum);
-        Weight = ExtractResourceUsage(ResourceNormalizedValues);
-    }
+    void UpdateWeight();
 
     double GetWeight(EResourceToBalance resourceToBalance) const {
-        return ExtractResourceUsage(ResourceNormalizedValues, resourceToBalance);
+        return ExtractResourceUsage(ResourceNormalizedValues, resourceToBalance) * BalancerWeightMultiplier;
     }
 
     void PostponeStart(TInstant nextStart) {

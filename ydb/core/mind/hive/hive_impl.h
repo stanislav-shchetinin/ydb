@@ -900,6 +900,10 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
         return CurrentConfig.GetBackupBootUsageQuantile();
     }
 
+    double GetBackupTabletBalancerWeight() const {
+        return CurrentConfig.GetBackupTabletBalancerWeight();
+    }
+
     TResourceNormalizedValues GetMinScatterToBalance() const {
         TResourceNormalizedValues minScatter;
         std::get<NMetrics::EResource::CPU>(minScatter) = CurrentConfig.GetMinCPUScatterToBalance();

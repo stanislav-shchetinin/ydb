@@ -8682,26 +8682,27 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         static constexpr ui64 NUM_BACKUP_TABLETS = 6;
         std::vector<ui64> tabletIds;
-        {
-            // Tablets stay in STARTING while the status is blocked
-            TBlockEvents<TEvLocal::TEvTabletStatus> blockStatus(runtime);
-            for (ui64 i = 0; i < NUM_BACKUP_TABLETS; ++i) {
-                auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
-                ev->Record.SetIsBackup(true);
-                tabletIds.push_back(SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, false));
-            }
-
-            ui64 maxStarting = 0;
-            for (ui64 i = 0; i < 20; ++i) {
-                runtime.SimulateSleep(TDuration::MilliSeconds(100));
-                maxStarting = std::max(maxStarting,
-                    GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_STARTING));
-            }
-            // The window must never be exceeded, and it must actually be reached
-            UNIT_ASSERT_VALUES_EQUAL(maxStarting, 2);
-            // The rest is waiting in the backup queue, not started
-            UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
+        // Tablets stay in STARTING while the status is blocked
+        TBlockEvents<TEvLocal::TEvTabletStatus> blockStatus(runtime);
+        for (ui64 i = 0; i < NUM_BACKUP_TABLETS; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            tabletIds.push_back(SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, false));
         }
+
+        ui64 maxStarting = 0;
+        for (ui64 i = 0; i < 20; ++i) {
+            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+            maxStarting = std::max(maxStarting,
+                GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_STARTING));
+        }
+        // The window must never be exceeded, and it must actually be reached
+        UNIT_ASSERT_VALUES_EQUAL(maxStarting, 2);
+        // The rest is waiting in the backup queue, not started
+        UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
+
+        // Replay the blocked statuses, otherwise the tablets would never report as started
+        blockStatus.Stop().Unblock();
 
         // Once the tablets are allowed to report, everything must eventually come up
         for (ui64 tabletId : tabletIds) {

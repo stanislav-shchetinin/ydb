@@ -57,6 +57,14 @@ public:
         return BackupBootTokens;
     }
 
+    double TestGetBackupBootRate() const {
+        return GetBackupBootRate();
+    }
+
+    double TestGetBackupBootBurst() const {
+        return GetBackupBootBurst();
+    }
+
     void MakeNodes(size_t numNodes) {
         for (TNodeId nodeId = 1; nodeId <= numNodes; ++nodeId) {
             TNodeInfo& node = Nodes.emplace(std::piecewise_construct, std::tuple<TNodeId>(nodeId), std::tuple<TNodeId, THive&>(nodeId, *this)).first->second;

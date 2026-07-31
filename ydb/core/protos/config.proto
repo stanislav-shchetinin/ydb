@@ -2716,6 +2716,13 @@ message THiveConfig {
                                                                 // is booted regardless of load and inflight
     optional double BackupBootMinRate = 101 [default = 1.0]; // starts per second when escalated by BackupBootMaxDelay
     optional double BackupBootUsageQuantile = 102 [default = 0.9]; // quantile of node usage used as the load signal
+
+    // Multiplier applied to the balancer weight of a backup tablet, making it a preferred victim
+    // when the balancer moves tablets off an overloaded node: shedding a backup tablet costs the
+    // backup a restart, while shedding a user tablet costs user requests a latency spike.
+    // The weight still matters, so a much heavier user tablet is still moved first - that is why
+    // this is a multiplier and not a hard partition. 1.0 means no preference.
+    optional double BackupTabletBalancerWeight = 103 [default = 1.0];
 }
 
 message THealthCheckConfig {

@@ -457,7 +457,13 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
         hive->SetBackupBootTokens(0, T0);
         UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
         // 100ms at 10 starts/sec is exactly one token
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0), 1);
+        hive->SetBackupBootTokens(0, T0);
+        ui64 budgetAfter100ms = hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0);
+        Ctest << "Budget: rate=" << hive->TestGetBackupBootRate()
+              << " burst=" << hive->TestGetBackupBootBurst()
+              << " tokens=" << hive->GetBackupBootTokens()
+              << " budget=" << budgetAfter100ms << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(budgetAfter100ms, 1);
 
         // Refill is capped by burst
         hive->SetBackupBootTokens(0, T0);
@@ -526,6 +532,89 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
 
         // No nodes at all - no reason to throttle
         UNIT_ASSERT_DOUBLES_EQUAL(hive->TestGetBackupBootLoadFactor(T0), 1.0, 1e-6);
+    }
+}
+
+Y_UNIT_TEST_SUITE(THiveBackupBalancerTest) {
+    // Memory has to be above THive::IsValidMetricsMemory threshold to survive FilterRawValues
+    static constexpr ui64 SOME_MEMORY = 10'000'000;
+
+    Y_UNIT_TEST(BackupTabletIsPreferredVictim) {
+        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
+        hiveStorage->TabletType = TTabletTypes::Hive;
+        TTestHive hive(hiveStorage.Get(), TActorId());
+        hive.UpdateConfig([](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupTabletBalancerWeight(4.0);
+        });
+
+        TLeaderTabletInfo userTablet(1UL, hive);
+        userTablet.SetType(TTabletTypes::DataShard);
+        userTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
+        userTablet.UpdateWeight();
+
+        TLeaderTabletInfo backupTablet(2UL, hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
+        backupTablet.UpdateWeight();
+
+        UNIT_ASSERT_DOUBLES_EQUAL(userTablet.BalancerWeightMultiplier, 1.0, 1e-9);
+        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.BalancerWeightMultiplier, 4.0, 1e-9);
+
+        double userWeight = userTablet.GetWeight(EResourceToBalance::Memory);
+        double backupWeight = backupTablet.GetWeight(EResourceToBalance::Memory);
+        UNIT_ASSERT(userWeight > 0);
+        UNIT_ASSERT_DOUBLES_EQUAL(backupWeight, userWeight * 4.0, 1e-9);
+
+        // Boot priority must not be affected - Weight itself is shared with the boot queue
+        UNIT_ASSERT_VALUES_EQUAL(backupTablet.Weight, userTablet.Weight);
+    }
+
+    Y_UNIT_TEST(PreferenceIsNotExclusion) {
+        // A much heavier user tablet is still moved first - otherwise the balancer would waste its
+        // movement budget on a negligible backup tablet and leave the overload in place
+        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
+        hiveStorage->TabletType = TTabletTypes::Hive;
+        TTestHive hive(hiveStorage.Get(), TActorId());
+        hive.UpdateConfig([](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupTabletBalancerWeight(4.0);
+        });
+
+        TLeaderTabletInfo backupTablet(1UL, hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
+        backupTablet.UpdateWeight();
+
+        TLeaderTabletInfo heavyUserTablet(2UL, hive);
+        heavyUserTablet.SetType(TTabletTypes::DataShard);
+        heavyUserTablet.GetMutableResourceValues().Memory = SOME_MEMORY * 10;
+        heavyUserTablet.UpdateWeight();
+
+        UNIT_ASSERT(heavyUserTablet.GetWeight(EResourceToBalance::Memory)
+                    > backupTablet.GetWeight(EResourceToBalance::Memory));
+    }
+
+    Y_UNIT_TEST(DefaultConfigIsNoop) {
+        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
+        hiveStorage->TabletType = TTabletTypes::Hive;
+        TTestHive hive(hiveStorage.Get(), TActorId());
+        hive.UpdateConfig([](NKikimrConfig::THiveConfig&){});
+
+        TLeaderTabletInfo userTablet(1UL, hive);
+        userTablet.SetType(TTabletTypes::DataShard);
+        userTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
+        userTablet.UpdateWeight();
+
+        TLeaderTabletInfo backupTablet(2UL, hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
+        backupTablet.UpdateWeight();
+
+        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.BalancerWeightMultiplier, 1.0, 1e-9);
+        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.GetWeight(EResourceToBalance::Memory),
+                                  userTablet.GetWeight(EResourceToBalance::Memory), 1e-9);
     }
 }
 
