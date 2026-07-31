@@ -1617,6 +1617,8 @@ public:
         out << "<tr><td>" << "Tablets:" << "</td><td id='runningTablets'>" << runningTablets << "</td></tr>";
         out << "<tr><td>" << "Boot Queue:" << "</td><td id='bootQueue'>" << Self->BootQueue.BootQueue.size() << "</td></tr>";
         out << "<tr><td>" << "Wait Queue:" << "</td><td id='waitQueue'>" << Self->BootQueue.WaitQueue.size() << "</td></tr>";
+        out << "<tr><td>" << "Backup Boot Queue:" << "</td><td id='backupBootQueue'>" << Self->BootQueue.BackupBootQueue.size() << "</td></tr>";
+        out << "<tr><td>" << "Backup Wait Queue:" << "</td><td id='backupWaitQueue'>" << Self->BootQueue.BackupWaitQueue.size() << "</td></tr>";
         out << "</table></div>";
         out << "<div style='width:180px'><table class='simple-table1'>";
         out << "<tr><th colspan='2'>Totals</th></tr>";
@@ -2678,6 +2680,9 @@ public:
         jsonData["ResourceVariance"] = GetResourceValuesJson(Self->GetStDevResourceValues());
         jsonData["BootQueueSize"] = Self->BootQueue.BootQueue.size();
         jsonData["WaitQueueSize"] = Self->BootQueue.WaitQueue.size();
+        jsonData["BackupBootQueueSize"] = Self->BootQueue.BackupBootQueue.size();
+        jsonData["BackupWaitQueueSize"] = Self->BootQueue.BackupWaitQueue.size();
+        jsonData["BackupTabletsStarting"] = Self->BackupTabletsStarting;
         jsonData["Balancers"] = Self->GetBalancerProgressJson();
         jsonData["MaxUsage"] =  GetValueWithColoredGlyph(stats.MaxUsage, Self->GetMaxNodeUsageToKick()) ;
         auto scatterHtml = convert(stats.ScatterByResource, Self->GetMinScatterToBalance(), GetValueWithColoredGlyph);

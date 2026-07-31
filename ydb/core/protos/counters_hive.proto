@@ -39,6 +39,10 @@ enum ESimpleCounters {
     COUNTER_DELETE_TABLET_QUEUE_SIZE = 29 [(CounterOpts) = {Name: "DeleteTabletQueueSize"}];
     COUNTER_TABLETS_DELETING = 30 [(CounterOpts) = {Name: "TabletsDeleting"}];
     COUNTER_TABLETS_REASSIGNING = 31 [(CounterOpts) = {Name: "TabletsMarkedForReassign"}];
+    COUNTER_BACKUP_BOOTQUEUE_SIZE = 32 [(CounterOpts) = {Name: "BackupBootQueueSize"}];
+    COUNTER_BACKUP_WAITQUEUE_SIZE = 33 [(CounterOpts) = {Name: "BackupWaitQueueSize"}];
+    COUNTER_BACKUP_TABLETS_STARTING = 34 [(CounterOpts) = {Name: "BackupTabletsStarting"}];
+    COUNTER_BACKUP_BOOT_DELAY_MS = 35 [(CounterOpts) = {Name: "BackupBootOldestDelayMs"}];
 }
 
 enum ECumulativeCounters {
@@ -59,6 +63,7 @@ enum ECumulativeCounters {
     COUNTER_HISTORY_CUT = 14 [(CounterOpts) = {Name: "TabletHistoryCut"}];
     COUNTER_HISTORY_RESTORED = 15 [(CounterOpts) = {Name: "TabletHistoryRestored"}];
     COUNTER_REASSIGN_EXECUTED = 16 [(CounterOpts) = {Name: "ReassignExecuted"}];
+    COUNTER_BACKUP_TABLETS_STARTED = 17 [(CounterOpts) = {Name: "BackupTabletsStarted"}];
 }
 
 enum EPercentileCounters {

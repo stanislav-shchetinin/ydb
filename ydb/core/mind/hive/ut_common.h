@@ -35,6 +35,28 @@ public:
         return BootQueue;
     }
 
+    ui64 TestGetBackupBootBudget(TInstant now, double loadFactor) {
+        return GetBackupBootBudget(now, loadFactor);
+    }
+
+    double TestGetBackupBootLoadFactor(TInstant now) {
+        return GetBackupBootLoadFactor(now);
+    }
+
+    void SetTabletsStarting(ui64 total, ui64 backup) {
+        TabletsStarting = total;
+        BackupTabletsStarting = backup;
+    }
+
+    void SetBackupBootTokens(double tokens, TInstant updatedAt) {
+        BackupBootTokens = tokens;
+        BackupBootTokensUpdated = updatedAt;
+    }
+
+    double GetBackupBootTokens() const {
+        return BackupBootTokens;
+    }
+
     void MakeNodes(size_t numNodes) {
         for (TNodeId nodeId = 1; nodeId <= numNodes; ++nodeId) {
             TNodeInfo& node = Nodes.emplace(std::piecewise_construct, std::tuple<TNodeId>(nodeId), std::tuple<TNodeId, THive&>(nodeId, *this)).first->second;

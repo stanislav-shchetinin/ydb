@@ -314,6 +314,20 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
             return;
         }
     }
+    ProcessBootQueueScheduled = false;
+
+    TBootPassResult mainPass = ProcessMainBootQueue(now, sideEffects);
+
+    // Backup tablets ride along in the same transaction, right after the main queue. If nobody can
+    // start anything at all, there is no point in calling FindBestNode for them.
+    if (!mainPass.TooManyStarting) {
+        ProcessBackupBootQueue(now, sideEffects);
+    }
+
+    ScheduleNextBootQueuePass(now, mainPass);
+}
+
+THive::TBootPassResult THive::ProcessMainBootQueue(TInstant now, TSideEffects& sideEffects) {
     YDB_LOG_DEBUG("Handle TEvPrivate::TEvProcessBootQueue:",
         {"logPrefix", GetLogPrefix()},
         {"bootQueueSize", BootQueue.BootQueue.size()});
@@ -323,16 +337,17 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
             {"logPrefix", GetLogPrefix()},
             {"waitQueueSize", BootQueue.WaitQueue.size()});
         BootQueue.IncludeWaitQueue();
+        BootQueue.IncludeBackupWaitQueue();
         ProcessWaitQueueScheduled = false;
     }
-    ProcessBootQueueScheduled = false;
+    TBootPassResult result;
     ui64 processedItems = 0;
     ui64 tabletsStarted = 0;
     TInstant postponedStart;
     TStackVec<TBootQueue::TBootQueueRecord> delayedTablets;
     std::vector<TBootQueue::TBootQueueRecord> waitingTablets;
-    waitingTablets.reserve(std::min<size_t>(BootQueue.Size(), GetMaxBootBatchSize()));
-    while (!BootQueue.Empty() && processedItems < GetMaxBootBatchSize()) {
+    waitingTablets.reserve(std::min<size_t>(BootQueue.MainQueueSize(), GetMaxBootBatchSize()));
+    while (!BootQueue.MainQueueEmpty() && processedItems < GetMaxBootBatchSize()) {
         TBootQueue::TBootQueueRecord record = BootQueue.PopFromBootQueue();
         YDB_LOG_TRACE("ProcessBootQueue: tablet has priority",
             {"logPrefix", GetLogPrefix()},
@@ -361,6 +376,7 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
             } else {
                 if (std::holds_alternative<TTooManyTabletsStarting>(bestNodeResult)) {
                     delayedTablets.push_back(record);
+                    result.TooManyStarting = true;
                     break;
                 } else {
                     if (std::holds_alternative<TNotEnoughResources>(bestNodeResult)) {
@@ -411,26 +427,250 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
             {"logPrefix", GetLogPrefix()},
             {"waitQueueSize", BootQueue.WaitQueue.size()});
     }
-    if (processedItems > 0) {
-        if (tabletsStarted > 0) {
-            WarmUp = false;
-        }
-        if (processedItems == delayedTablets.size() && postponedStart < now) {
-            YDB_LOG_DEBUG("ProcessBootQueue: throttling boot queue",
-                {"logPrefix", GetLogPrefix()},
-                {"bootQueueSize", BootQueue.BootQueue.size()});
-            return;
-        }
-        if (processedItems == GetMaxBootBatchSize() && !BootQueue.Empty()) {
-            YDB_LOG_DEBUG("ProcessBootQueue: rescheduling",
-                {"logPrefix", GetLogPrefix()});
-            ProcessBootQueue();
-        } else if (postponedStart > now) {
-            YDB_LOG_DEBUG("ProcessBootQueue: postponing",
-                {"logPrefix", GetLogPrefix()});
-            PostponeProcessBootQueue(postponedStart - now);
+    if (tabletsStarted > 0) {
+        WarmUp = false;
+    }
+    result.ProcessedItems = processedItems;
+    result.DelayedItems = delayedTablets.size();
+    result.PostponedStart = postponedStart;
+    return result;
+}
+
+void THive::ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainPass) {
+    if (mainPass.ProcessedItems == 0) {
+        return;
+    }
+    if (mainPass.ProcessedItems == mainPass.DelayedItems && mainPass.PostponedStart < now) {
+        YDB_LOG_DEBUG("ProcessBootQueue: throttling boot queue",
+            {"logPrefix", GetLogPrefix()},
+            {"bootQueueSize", BootQueue.BootQueue.size()});
+        return;
+    }
+    if (mainPass.ProcessedItems == GetMaxBootBatchSize() && !BootQueue.MainQueueEmpty()) {
+        YDB_LOG_DEBUG("ProcessBootQueue: rescheduling",
+            {"logPrefix", GetLogPrefix()});
+        ProcessBootQueue();
+    } else if (mainPass.PostponedStart > now) {
+        YDB_LOG_DEBUG("ProcessBootQueue: postponing",
+            {"logPrefix", GetLogPrefix()});
+        PostponeProcessBootQueue(mainPass.PostponedStart - now);
+    }
+}
+
+double THive::GetBackupBootLoadFactor(TInstant now) {
+    static constexpr TDuration LOAD_FACTOR_CACHE_PERIOD = TDuration::Seconds(1);
+    if (BackupBootLoadFactorUpdated && now < BackupBootLoadFactorUpdated + LOAD_FACTOR_CACHE_PERIOD) {
+        return BackupBootLoadFactor;
+    }
+    std::vector<double> usages;
+    usages.reserve(Nodes.size());
+    for (const auto& [_, node] : Nodes) {
+        if (node.IsAlive() && !node.Down) {
+            usages.push_back(node.GetNodeUsage());
         }
     }
+    double factor = 1;
+    double usage = 0;
+    if (!usages.empty()) {
+        // Max usage is too fragile - a single hot node would stop backups in the whole cluster,
+        // and average hides local problems, so we use a high quantile
+        double quantile = std::clamp(GetBackupBootUsageQuantile(), 0.0, 1.0);
+        size_t index = static_cast<size_t>(quantile * (usages.size() - 1));
+        std::nth_element(usages.begin(), usages.begin() + index, usages.end());
+        usage = usages[index];
+        double stopUsage = GetBackupBootStopUsage();
+        double fullSpeedUsage = GetBackupBootFullSpeedUsage();
+        if (stopUsage <= fullSpeedUsage) {
+            factor = (usage >= stopUsage) ? 0.0 : 1.0;
+        } else {
+            factor = std::clamp((stopUsage - usage) / (stopUsage - fullSpeedUsage), 0.0, 1.0);
+        }
+    }
+    YDB_LOG_TRACE("ProcessBackupBootQueue: load factor",
+        {"logPrefix", GetLogPrefix()},
+        {"usage", usage},
+        {"loadFactor", factor});
+    BackupBootLoadFactor = factor;
+    BackupBootLoadFactorUpdated = now;
+    return factor;
+}
+
+void THive::RefillBackupBootTokens(TInstant now, double rate) {
+    double burst = std::max(GetBackupBootBurst(), 1.0);
+    if (!BackupBootTokensUpdated) {
+        // An idle bucket is a full bucket
+        BackupBootTokens = burst;
+    } else if (now > BackupBootTokensUpdated) {
+        double refill = rate * (now - BackupBootTokensUpdated).SecondsFloat();
+        BackupBootTokens = std::min(burst, BackupBootTokens + refill);
+    }
+    BackupBootTokensUpdated = now;
+}
+
+ui64 THive::GetBackupBootBudget(TInstant now, double loadFactor) {
+    // Guarantee of progress: a tablet that has been waiting for too long is booted regardless of
+    // load and inflight, otherwise a permanently busy cluster would stall the copy operation in
+    // SchemeShard forever
+    auto oldestEnqueueTime = BootQueue.GetOldestBackupEnqueueTime();
+    bool escalated = oldestEnqueueTime.has_value()
+        && *oldestEnqueueTime + GetBackupBootMaxDelay() <= now;
+
+    double rate = GetBackupBootRate() * loadFactor;
+    if (escalated) {
+        rate = std::max(rate, GetBackupBootMinRate());
+    }
+    RefillBackupBootTokens(now, rate);
+
+    i64 userStarting = std::max<i64>(0, static_cast<i64>(TabletsStarting) - static_cast<i64>(BackupTabletsStarting));
+    i64 inflightBudget = static_cast<i64>(GetMaxBackupTabletsStarting() * loadFactor)
+        - static_cast<i64>(BackupTabletsStarting)
+        - static_cast<i64>(GetBackupStartUserWeight() * userStarting);
+    if (escalated) {
+        inflightBudget = std::max<i64>(inflightBudget, 1);
+    }
+    if (inflightBudget <= 0) {
+        return 0;
+    }
+    return std::min<ui64>(static_cast<ui64>(BackupBootTokens), static_cast<ui64>(inflightBudget));
+}
+
+void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
+    if (BootQueue.BackupQueueEmpty() && BootQueue.BackupWaitQueue.empty()) {
+        return;
+    }
+
+    if (!GetBackupBootPacingEnabled()) {
+        // Pacing has been turned off while there were tablets in the backup queue - hand them
+        // over to the main queue, which is the only path when pacing is disabled
+        BootQueue.IncludeBackupWaitQueue();
+        size_t handedOver = BootQueue.BackupQueueSize();
+        while (!BootQueue.BackupQueueEmpty()) {
+            BootQueue.AddToBootQueue(BootQueue.PopFromBackupQueue().Record);
+        }
+        UpdateCounterBackupBootQueueSize();
+        if (handedOver > 0) {
+            YDB_LOG_DEBUG("ProcessBackupBootQueue: pacing disabled, moved tablets to boot queue",
+                {"logPrefix", GetLogPrefix()},
+                {"tablets", handedOver});
+            ProcessBootQueue();
+        }
+        return;
+    }
+
+    double loadFactor = GetBackupBootLoadFactor(now);
+    ui64 budget = GetBackupBootBudget(now, loadFactor);
+    YDB_LOG_DEBUG("ProcessBackupBootQueue:",
+        {"logPrefix", GetLogPrefix()},
+        {"backupBootQueueSize", BootQueue.BackupQueueSize()},
+        {"backupTabletsStarting", BackupTabletsStarting},
+        {"tabletsStarting", TabletsStarting},
+        {"loadFactor", loadFactor},
+        {"tokens", BackupBootTokens},
+        {"budget", budget});
+
+    ui64 processedItems = 0;
+    ui64 scannedItems = 0;
+    ui64 tabletsStarted = 0;
+    bool tooManyStarting = false;
+    bool headNotReady = false;
+    // Stale records cost no token, so the batch size is what bounds the time we spend in a single
+    // transaction when the queue is full of them
+    while (processedItems < budget && scannedItems < GetMaxBootBatchSize() && !BootQueue.BackupQueueEmpty()) {
+        ++scannedItems;
+        TBootQueue::TBackupBootRecord record = BootQueue.PopFromBackupQueue();
+        TTabletInfo* tablet = FindTablet(record.Record.TabletId, record.Record.FollowerId);
+        // A stale record is not an attempt to start anything, so it costs no token - otherwise a
+        // queue full of deleted tablets would drain at the configured rate doing nothing
+        if (tablet == nullptr) {
+            continue;
+        }
+        tablet->InWaitQueue = false;
+        if (tablet->IsAlive()) {
+            continue;
+        }
+        if (!tablet->IsReadyToStart(now)) {
+            // The queue is strictly ordered by enqueue time and the head is the oldest record,
+            // which is what the progress guarantee relies on, so we cannot reorder around it -
+            // put it back and wait
+            YDB_LOG_DEBUG("ProcessBackupBootQueue: tablet is not ready to start",
+                {"logPrefix", GetLogPrefix()},
+                {"tabletId", record.Record.TabletId},
+                {"tabletPostponedStart", tablet->PostponedStart});
+            BootQueue.ReturnToBackupQueueFront(record);
+            headNotReady = true;
+            break;
+        }
+        ++processedItems;
+        // A token is spent per attempt, not per successful start - this way the pass is
+        // self-limiting under any failure mode
+        BackupBootTokens = std::max(0.0, BackupBootTokens - 1);
+        TBestNodeResult bestNodeResult = FindBestNode(*tablet, record.Record.SuggestedNodeId);
+        if (std::holds_alternative<TNodeInfo*>(bestNodeResult)) {
+            if (tablet->InitiateStart(std::get<TNodeInfo*>(bestNodeResult))) {
+                ++tabletsStarted;
+                continue;
+            }
+            BootQueue.ReturnToBackupQueueFront(record);
+            break;
+        }
+        if (std::holds_alternative<TTooManyTabletsStarting>(bestNodeResult)) {
+            BootQueue.ReturnToBackupQueueFront(record);
+            tooManyStarting = true;
+            break;
+        }
+        if (std::holds_alternative<TNotEnoughResources>(bestNodeResult)) {
+            NotEnoughResources = true;
+        }
+        tablet->NotifyOnRestart("backup boot delay", sideEffects);
+        tablet->InWaitQueue = true;
+        BootQueue.AddToBackupWaitQueue(record);
+    }
+    if (tabletsStarted > 0) {
+        WarmUp = false;
+        if (TabletCounters != nullptr) {
+            TabletCounters->Cumulative()[NHive::COUNTER_BACKUP_TABLETS_STARTED].Increment(tabletsStarted);
+        }
+    }
+    UpdateCounterBackupBootQueueSize();
+    if (TabletCounters != nullptr) {
+        ui64 oldestDelayMs = 0;
+        auto oldestEnqueueTime = BootQueue.GetOldestBackupEnqueueTime();
+        if (oldestEnqueueTime && now > *oldestEnqueueTime) {
+            oldestDelayMs = (now - *oldestEnqueueTime).MilliSeconds();
+        }
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_BOOT_DELAY_MS].Set(oldestDelayMs);
+    }
+
+    if (BootQueue.BackupQueueEmpty() || tooManyStarting) {
+        // Nothing to do, or no capacity at all - in the latter case we will be woken up by
+        // TTxUpdateTabletStatus when a tablet reports that it has started
+        return;
+    }
+    if (headNotReady) {
+        PostponeProcessBootQueue(GetPostponeStartPeriod());
+        return;
+    }
+    if (scannedItems >= GetMaxBootBatchSize()) {
+        // Ran out of batch, not out of budget - continue right away
+        ProcessBootQueue();
+        return;
+    }
+    if (loadFactor <= 0) {
+        // Waiting for the load to go down, nothing else would wake us up
+        PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
+        return;
+    }
+    if (BackupBootTokens < 1) {
+        double rate = GetBackupBootRate() * loadFactor;
+        if (rate <= 0) {
+            PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
+        } else {
+            double secondsToNextToken = (1.0 - BackupBootTokens) / rate;
+            PostponeProcessBootQueue(TDuration::MicroSeconds(
+                std::max<ui64>(1, static_cast<ui64>(secondsToNextToken * 1000000))));
+        }
+    }
+    // Otherwise we are limited by inflight and will be woken up by TTxUpdateTabletStatus
 }
 
 void THive::HandleInit(TEvPrivate::TEvProcessBootQueue::TPtr&) {
@@ -490,8 +730,13 @@ void THive::ProcessWaitQueue() {
 void THive::AddToBootQueue(TTabletInfo* tablet, TNodeId node) {
     tablet->UpdateWeight();
     tablet->BootState = BootStateBooting;
-    BootQueue.AddToBootQueue(*tablet, node);
+    TInstant now;
+    if (BootQueue.GetPaceBackupTablets()) {
+        now = TActivationContext::Now();
+    }
+    BootQueue.AddToBootQueue(*tablet, node, now);
     UpdateCounterBootQueueSize(BootQueue.BootQueue.size());
+    UpdateCounterBackupBootQueueSize();
 }
 
 void THive::Handle(TEvPrivate::TEvProcessPendingOperations::TPtr&) {
@@ -885,6 +1130,7 @@ void THive::BuildCurrentConfig() {
         ObjectDistributions.Disable();
     }
     BootQueue.UpdateTabletBootQueuePriorities(CurrentConfig);
+    BootQueue.SetPaceBackupTablets(CurrentConfig.GetBackupBootPacingEnabled());
 }
 
 void THive::Cleanup() {
@@ -2042,6 +2288,26 @@ void THive::UpdateCounterTabletsStarting(i64 tabletsStartingDiff) {
     }
 }
 
+void THive::UpdateTabletsStarting(const TTabletInfo& tablet, i64 diff) {
+    // These counters are the source of truth for backup boot admission control, so they are
+    // maintained in TNodeInfo::OnTabletChangeVolatileState - the single choke point for volatile
+    // state transitions
+    TabletsStarting = static_cast<ui64>(std::max<i64>(0, static_cast<i64>(TabletsStarting) + diff));
+    if (tablet.GetLeader().IsBackup) {
+        BackupTabletsStarting = static_cast<ui64>(std::max<i64>(0, static_cast<i64>(BackupTabletsStarting) + diff));
+        if (TabletCounters != nullptr) {
+            TabletCounters->Simple()[NHive::COUNTER_BACKUP_TABLETS_STARTING].Set(BackupTabletsStarting);
+        }
+    }
+}
+
+void THive::UpdateCounterBackupBootQueueSize() {
+    if (TabletCounters != nullptr) {
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE].Set(BootQueue.BackupQueueSize());
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_WAITQUEUE_SIZE].Set(BootQueue.BackupWaitQueue.size());
+    }
+}
+
 void THive::UpdateCounterPingQueueSize() {
     if (TabletCounters != nullptr) {
         auto& counter = TabletCounters->Simple()[NHive::COUNTER_PINGQUEUE_SIZE];
@@ -2702,14 +2968,16 @@ TResourceRawValues THive::GetDefaultResourceInitialMaximumValues() {
 }
 
 void THive::ProcessTabletBalancer() {
-    if (!ProcessTabletBalancerScheduled && !ProcessTabletBalancerPostponed && BootQueue.Empty()) {
+    // MainQueueEmpty, not Empty: the backup queue drains slowly by design, waiting for it would
+    // block the balancer for the whole duration of a backup
+    if (!ProcessTabletBalancerScheduled && !ProcessTabletBalancerPostponed && BootQueue.MainQueueEmpty()) {
         Schedule(GetBalancerCooldown(LastBalancerTrigger), new TEvPrivate::TEvProcessTabletBalancer());
         ProcessTabletBalancerScheduled = true;
     }
 }
 
 void THive::ProcessStorageBalancer() {
-    if (!ProcessStorageBalancerScheduled && BootQueue.Empty()) {
+    if (!ProcessStorageBalancerScheduled && BootQueue.MainQueueEmpty()) {
         Schedule(GetBalancerCooldown(EBalancerType::Storage), new TEvPrivate::TEvProcessStorageBalancer());
         ProcessStorageBalancerScheduled = true;
     }

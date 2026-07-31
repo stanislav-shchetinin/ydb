@@ -330,6 +330,205 @@ Y_UNIT_TEST_SUITE(THiveImplTest) {
     }
 }
 
+Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
+    static constexpr TInstant T0 = TInstant::Seconds(1000);
+
+    THolder<TTestHive> MakeHive(TIntrusivePtr<TTabletStorageInfo>& hiveStorage, bool pacingEnabled) {
+        hiveStorage = MakeIntrusive<TTabletStorageInfo>();
+        hiveStorage->TabletType = TTabletTypes::Hive;
+        auto hive = MakeHolder<TTestHive>(hiveStorage.Get(), TActorId());
+        hive->UpdateConfig([pacingEnabled](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupBootPacingEnabled(pacingEnabled);
+        });
+        return hive;
+    }
+
+    Y_UNIT_TEST(QueueRouting) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        auto& bootQueue = hive->GetBootQueue();
+
+        TLeaderTabletInfo userTablet(1UL, *hive);
+        userTablet.SetType(TTabletTypes::DataShard);
+        bootQueue.AddToBootQueue(userTablet, 0UL, T0);
+
+        TLeaderTabletInfo backupTablet(2UL, *hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        bootQueue.AddToBootQueue(backupTablet, 0UL, T0);
+
+        // The backup tablet must not be visible to the main pass at all
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.MainQueueSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.Size(), 2);
+        UNIT_ASSERT(!bootQueue.Empty());
+
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBootQueue().TabletId, 1UL);
+        UNIT_ASSERT(bootQueue.MainQueueEmpty());
+        UNIT_ASSERT(!bootQueue.Empty());
+
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 2UL);
+        UNIT_ASSERT(bootQueue.Empty());
+    }
+
+    Y_UNIT_TEST(QueueRoutingWhenPacingDisabled) {
+        // With pacing disabled the behaviour must be exactly as it was before
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, false);
+        auto& bootQueue = hive->GetBootQueue();
+
+        TLeaderTabletInfo backupTablet(1UL, *hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        bootQueue.AddToBootQueue(backupTablet, 0UL, T0);
+
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.MainQueueSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 0);
+    }
+
+    Y_UNIT_TEST(QueueIsFifo) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        auto& bootQueue = hive->GetBootQueue();
+
+        std::vector<THolder<TLeaderTabletInfo>> tablets;
+        for (TTabletId id = 1; id <= 5; ++id) {
+            auto& tablet = tablets.emplace_back(MakeHolder<TLeaderTabletInfo>(id, *hive));
+            tablet->SetType(TTabletTypes::DataShard);
+            tablet->IsBackup = true;
+            // Weight would have changed the priority, it must not affect the order
+            tablet->Weight = 5 - id;
+            bootQueue.AddToBootQueue(*tablet, 0UL, T0 + TDuration::Seconds(id));
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL(*bootQueue.GetOldestBackupEnqueueTime(), T0 + TDuration::Seconds(1));
+        for (TTabletId id = 1; id <= 5; ++id) {
+            UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, id);
+        }
+    }
+
+    Y_UNIT_TEST(WaitQueueReturnsToFront) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        auto& bootQueue = hive->GetBootQueue();
+
+        std::vector<THolder<TLeaderTabletInfo>> tablets;
+        for (TTabletId id = 1; id <= 3; ++id) {
+            auto& tablet = tablets.emplace_back(MakeHolder<TLeaderTabletInfo>(id, *hive));
+            tablet->SetType(TTabletTypes::DataShard);
+            tablet->IsBackup = true;
+            bootQueue.AddToBootQueue(*tablet, 0UL, T0 + TDuration::Seconds(id));
+        }
+
+        // Tablets 1 and 2 could not be placed and went to the wait queue
+        bootQueue.AddToBackupWaitQueue(bootQueue.PopFromBackupQueue());
+        bootQueue.AddToBackupWaitQueue(bootQueue.PopFromBackupQueue());
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupWaitQueue.size(), 2);
+
+        // A new node has appeared - the waiting ones are older, so they go first
+        bootQueue.IncludeBackupWaitQueue();
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupWaitQueue.size(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(*bootQueue.GetOldestBackupEnqueueTime(), T0 + TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 1UL);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 2UL);
+        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 3UL);
+    }
+
+    Y_UNIT_TEST(Budget) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupBootPacingEnabled(true);
+            config.SetBackupBootRate(10);
+            config.SetBackupBootBurst(10);
+            config.SetMaxBackupTabletsStarting(16);
+            config.SetBackupStartUserWeight(2);
+            config.SetBackupBootMaxDelay(300000);
+        });
+
+        // Full bucket, quiet cluster: limited by burst
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(0, 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 10);
+
+        // Empty bucket: nothing until the next token
+        hive->SetBackupBootTokens(0, T0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
+        // 100ms at 10 starts/sec is exactly one token
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0), 1);
+
+        // Refill is capped by burst
+        hive->SetBackupBootTokens(0, T0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Seconds(100), 1.0), 10);
+
+        // User tablets starting crowd out backup starts: 8 * weight 2 == 16 == the whole window
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(8, 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
+
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(4, 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 8); // 16 - 2*4
+
+        // Backup tablets already starting count against the window directly
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(10, 10);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 6); // 16 - 10
+
+        // Load factor scales both the window and the refill rate
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(0, 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 0.5), 8); // 16 * 0.5
+        hive->SetBackupBootTokens(10, T0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 0.0), 0);
+    }
+
+    Y_UNIT_TEST(BudgetAgingGuaranteesProgress) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupBootPacingEnabled(true);
+            config.SetBackupBootRate(10);
+            config.SetBackupBootBurst(10);
+            config.SetMaxBackupTabletsStarting(16);
+            config.SetBackupStartUserWeight(2);
+            config.SetBackupBootMaxDelay(300000); // 5 minutes
+            config.SetBackupBootMinRate(1);
+        });
+        auto& bootQueue = hive->GetBootQueue();
+
+        TLeaderTabletInfo backupTablet(1UL, *hive);
+        backupTablet.SetType(TTabletTypes::DataShard);
+        backupTablet.IsBackup = true;
+        bootQueue.AddToBootQueue(backupTablet, 0UL, T0);
+
+        // Overloaded cluster and a lot of user starts - nothing gets through
+        hive->SetBackupBootTokens(0, T0);
+        hive->SetTabletsStarting(100, 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Seconds(1), 0.0), 0);
+
+        // ... but not forever: after BackupBootMaxDelay both gates are bypassed
+        hive->SetBackupBootTokens(0, T0);
+        TInstant escalated = T0 + TDuration::Seconds(301);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(escalated, 0.0), 1);
+    }
+
+    Y_UNIT_TEST(LoadFactor) {
+        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
+        auto hive = MakeHive(hiveStorage, true);
+        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
+            config.SetBackupBootPacingEnabled(true);
+            config.SetBackupBootFullSpeedUsage(0.5);
+            config.SetBackupBootStopUsage(0.8);
+        });
+
+        // No nodes at all - no reason to throttle
+        UNIT_ASSERT_DOUBLES_EQUAL(hive->TestGetBackupBootLoadFactor(T0), 1.0, 1e-6);
+    }
+}
+
 Y_UNIT_TEST_SUITE(TCutHistoryRestrictions) {
 
     Y_UNIT_TEST(BasicTest) {

@@ -2701,6 +2701,21 @@ message THiveConfig {
     optional uint64 MaxDeleteTabletInProgress = 90 [default = 100];
     optional uint64 DataCenterChangeReactionPeriod = 91 [default = 300]; // seconds
     repeated THiveTabletAllowedMetrics DefaultTabletAllowedMetrics = 92;
+
+    // Backup tablets (tablets of backup tables created by export/backup operations) are booted
+    // through a separate rate-limited queue, so that a massive backup does not create a boot storm
+    // that hurts latency of user requests. All of it is a no-op unless BackupBootPacingEnabled.
+    optional bool BackupBootPacingEnabled = 93 [default = false];
+    optional double BackupBootRate = 94 [default = 10.0]; // backup tablet starts per second at zero load
+    optional double BackupBootBurst = 95 [default = 10.0]; // max accumulated starts, controls pack size
+    optional uint64 MaxBackupTabletsStarting = 96 [default = 16]; // max backup tablets in STARTING state
+    optional double BackupStartUserWeight = 97 [default = 2.0]; // how many backup slots one user start costs
+    optional double BackupBootFullSpeedUsage = 98 [default = 0.5]; // node usage below which we boot at full rate
+    optional double BackupBootStopUsage = 99 [default = 0.8]; // node usage at which we stop booting backups
+    optional uint64 BackupBootMaxDelay = 100 [default = 300000]; // milliseconds, after that a backup tablet
+                                                                // is booted regardless of load and inflight
+    optional double BackupBootMinRate = 101 [default = 1.0]; // starts per second when escalated by BackupBootMaxDelay
+    optional double BackupBootUsageQuantile = 102 [default = 0.9]; // quantile of node usage used as the load signal
 }
 
 message THealthCheckConfig {

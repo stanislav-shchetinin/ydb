@@ -398,6 +398,12 @@ protected:
     bool ProcessWaitQueueScheduled = false;
     bool ProcessBootQueueScheduled = false;
     bool ProcessBootQueuePostponed = false;
+    ui64 TabletsStarting = 0;
+    ui64 BackupTabletsStarting = 0;
+    double BackupBootTokens = 0;
+    TInstant BackupBootTokensUpdated;
+    double BackupBootLoadFactor = 1;
+    TInstant BackupBootLoadFactorUpdated;
     TInstant LastConnect;
     TInstant ProcessBootQueuePostponedUntil;
     TDuration MaxTimeBetweenConnects;
@@ -715,6 +721,8 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     void UpdateCounterEventQueueSize(i64 eventQueueSizeDiff);
     void UpdateCounterNodesConnected(i64 nodesConnectedDiff);
     void UpdateCounterTabletsStarting(i64 tabletsStartingDiff);
+    void UpdateTabletsStarting(const TTabletInfo& tablet, i64 diff);
+    void UpdateCounterBackupBootQueueSize();
     void UpdateCounterPingQueueSize();
     void UpdateCounterTabletChannelHistorySize();
     void UpdateCounterNodesDown(i64 nodesDownDiff);
@@ -758,6 +766,21 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     void StopTablet(const TActorId& local, const TTabletInfo& tablet);
     void StopTablet(const TActorId& local, TFullTabletId tabletId);
     void ExecuteProcessBootQueue(NIceDb::TNiceDb& db, TSideEffects& sideEffects);
+
+    struct TBootPassResult {
+        ui64 ProcessedItems = 0;
+        ui64 DelayedItems = 0;
+        bool TooManyStarting = false;
+        TInstant PostponedStart;
+    };
+
+    TBootPassResult ProcessMainBootQueue(TInstant now, TSideEffects& sideEffects);
+    void ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects);
+    void ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainPass);
+    double GetBackupBootLoadFactor(TInstant now);
+    void RefillBackupBootTokens(TInstant now, double rate);
+    ui64 GetBackupBootBudget(TInstant now, double loadFactor);
+
     void CreateTabletFollowers(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db, TSideEffects& sideEffects);
     TDuration GetBalancerCooldown(EBalancerType balancerType) const;
     void UpdateObjectCount(const TLeaderTabletInfo& tablet, const TNodeInfo& node, i64 diff);
@@ -835,6 +858,46 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
 
     ui64 GetMaxBootBatchSize() const {
         return CurrentConfig.GetMaxBootBatchSize();
+    }
+
+    bool GetBackupBootPacingEnabled() const {
+        return CurrentConfig.GetBackupBootPacingEnabled();
+    }
+
+    double GetBackupBootRate() const {
+        return CurrentConfig.GetBackupBootRate();
+    }
+
+    double GetBackupBootBurst() const {
+        return CurrentConfig.GetBackupBootBurst();
+    }
+
+    ui64 GetMaxBackupTabletsStarting() const {
+        return CurrentConfig.GetMaxBackupTabletsStarting();
+    }
+
+    double GetBackupStartUserWeight() const {
+        return CurrentConfig.GetBackupStartUserWeight();
+    }
+
+    double GetBackupBootFullSpeedUsage() const {
+        return CurrentConfig.GetBackupBootFullSpeedUsage();
+    }
+
+    double GetBackupBootStopUsage() const {
+        return CurrentConfig.GetBackupBootStopUsage();
+    }
+
+    TDuration GetBackupBootMaxDelay() const {
+        return TDuration::MilliSeconds(CurrentConfig.GetBackupBootMaxDelay());
+    }
+
+    double GetBackupBootMinRate() const {
+        return CurrentConfig.GetBackupBootMinRate();
+    }
+
+    double GetBackupBootUsageQuantile() const {
+        return CurrentConfig.GetBackupBootUsageQuantile();
     }
 
     TResourceNormalizedValues GetMinScatterToBalance() const {

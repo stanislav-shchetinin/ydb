@@ -73,6 +73,12 @@ bool TNodeInfo::OnTabletChangeVolatileState(TTabletInfo* tablet, TTabletInfo::EV
         FrozenTablets.push_back(tablet->GetFullTabletId());
     }
     TTabletInfo::EVolatileState oldState = tablet->GetVolatileState();
+    if (oldState == TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+        Hive.UpdateTabletsStarting(*tablet, -1);
+    }
+    if (newState == TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+        Hive.UpdateTabletsStarting(*tablet, +1);
+    }
     if (IsResourceDrainingState(oldState)) {
         if (Tablets[oldState].erase(tablet) != 0) {
             UpdateResourceValues(tablet, tablet->GetResourceValues(), {});

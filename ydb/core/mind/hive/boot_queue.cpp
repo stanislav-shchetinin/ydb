@@ -16,8 +16,13 @@ void TBootQueue::AddToBootQueue(TBootQueueRecord record) {
     BootQueue.push(record);
 }
 
-void TBootQueue::AddToBootQueue(const TTabletInfo &tablet, TNodeId node) {
+void TBootQueue::AddToBootQueue(const TTabletInfo &tablet, TNodeId node, TInstant now) {
     double priority = GetBootPriority(tablet);
+    // IsBackup is only set on the leader, followers keep the default value
+    if (PaceBackupTablets && tablet.GetLeader().IsBackup) {
+        BackupBootQueue.push_back({.Record = TBootQueueRecord(tablet, priority, node), .EnqueueTime = now});
+        return;
+    }
     BootQueue.emplace(tablet, priority, node);
 }
 
@@ -61,6 +66,14 @@ void TBootQueue::ExcludeWaitQueue() {
 }
 
 bool TBootQueue::Empty() const {
+    return MainQueueEmpty() && BackupQueueEmpty();
+}
+
+size_t TBootQueue::Size() const {
+    return MainQueueSize() + BackupQueueSize();
+}
+
+bool TBootQueue::MainQueueEmpty() const {
     if (ProcessWaitQueue) {
         return BootQueue.empty() && WaitQueue.empty();
     } else {
@@ -68,12 +81,57 @@ bool TBootQueue::Empty() const {
     }
 }
 
-size_t TBootQueue::Size() const {
+size_t TBootQueue::MainQueueSize() const {
     if (ProcessWaitQueue) {
         return BootQueue.size() + WaitQueue.size();
     } else {
         return BootQueue.size();
     }
+}
+
+void TBootQueue::SetPaceBackupTablets(bool pace) {
+    PaceBackupTablets = pace;
+}
+
+bool TBootQueue::GetPaceBackupTablets() const {
+    return PaceBackupTablets;
+}
+
+bool TBootQueue::BackupQueueEmpty() const {
+    return BackupBootQueue.empty();
+}
+
+size_t TBootQueue::BackupQueueSize() const {
+    return BackupBootQueue.size();
+}
+
+TBootQueue::TBackupBootRecord TBootQueue::PopFromBackupQueue() {
+    TBackupBootRecord record = BackupBootQueue.front();
+    BackupBootQueue.pop_front();
+    return record;
+}
+
+void TBootQueue::ReturnToBackupQueueFront(TBackupBootRecord record) {
+    BackupBootQueue.push_front(record);
+}
+
+void TBootQueue::AddToBackupWaitQueue(TBackupBootRecord record) {
+    BackupWaitQueue.push_back(record);
+}
+
+void TBootQueue::IncludeBackupWaitQueue() {
+    // Waiting tablets are older than anything in the boot queue, so they go to the front
+    while (!BackupWaitQueue.empty()) {
+        BackupBootQueue.push_front(BackupWaitQueue.back());
+        BackupWaitQueue.pop_back();
+    }
+}
+
+std::optional<TInstant> TBootQueue::GetOldestBackupEnqueueTime() const {
+    if (BackupBootQueue.empty()) {
+        return std::nullopt;
+    }
+    return BackupBootQueue.front().EnqueueTime;
 }
 
 TBootQueue::TQueue& TBootQueue::GetCurrentQueue() {
