@@ -42,6 +42,8 @@ struct TEvPrivate {
         EvProcessTabletMetrics,
         EvReassignInactiveGroupsComplete,
         EvMoveDataComplete,
+        EvProcessBackupDeleteQueue,
+        EvPostponeProcessBackupDeleteQueue,
         EvEnd
     };
 
@@ -60,6 +62,11 @@ struct TEvPrivate {
     };
 
     struct TEvPostponeProcessBootQueue : TEventLocal<TEvPostponeProcessBootQueue, EvPostponeProcessBootQueue> {};
+
+    struct TEvProcessBackupDeleteQueue : TEventLocal<TEvProcessBackupDeleteQueue, EvProcessBackupDeleteQueue> {};
+
+    struct TEvPostponeProcessBackupDeleteQueue
+        : TEventLocal<TEvPostponeProcessBackupDeleteQueue, EvPostponeProcessBackupDeleteQueue> {};
 
     struct TEvProcessDisconnectNode : TEventLocal<TEvProcessDisconnectNode, EvProcessDisconnectNode> {
         ui32 NodeId;

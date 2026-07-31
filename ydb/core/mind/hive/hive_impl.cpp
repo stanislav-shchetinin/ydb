@@ -703,6 +703,44 @@ void THive::ProcessWaitQueue() {
     ProcessBootQueue();
 }
 
+void THive::Handle(TEvPrivate::TEvProcessBackupDeleteQueue::TPtr&) {
+    YDB_LOG_TRACE("Handle TEvPrivate::TEvProcessBackupDeleteQueue:",
+        {"logPrefix", GetLogPrefix()});
+    ProcessBackupDeleteQueueScheduled = false;
+    TSideEffects sideEffects;
+    sideEffects.Reset(SelfId());
+    ExecuteProcessBackupDeleteQueue(sideEffects);
+    sideEffects.Complete(DEPRECATED_CTX);
+}
+
+void THive::Handle(TEvPrivate::TEvPostponeProcessBackupDeleteQueue::TPtr&) {
+    YDB_LOG_DEBUG("Handle TEvPrivate::TEvPostponeProcessBackupDeleteQueue:",
+        {"logPrefix", GetLogPrefix()});
+    ProcessBackupDeleteQueuePostponed = false;
+    ProcessBackupDeleteQueue();
+}
+
+void THive::ProcessBackupDeleteQueue() {
+    if (!ProcessBackupDeleteQueueScheduled) {
+        YDB_LOG_TRACE("ProcessBackupDeleteQueue: sending event",
+            {"logPrefix", GetLogPrefix()});
+        ProcessBackupDeleteQueueScheduled = true;
+        Send(SelfId(), new TEvPrivate::TEvProcessBackupDeleteQueue());
+    }
+}
+
+void THive::PostponeProcessBackupDeleteQueue(TDuration after) {
+    TInstant postponeUntil = TActivationContext::Now() + after;
+    if (!ProcessBackupDeleteQueuePostponed || postponeUntil < ProcessBackupDeleteQueuePostponedUntil) {
+        YDB_LOG_DEBUG("PostponeProcessBackupDeleteQueue:",
+            {"logPrefix", GetLogPrefix()},
+            {"duration", after});
+        ProcessBackupDeleteQueuePostponed = true;
+        ProcessBackupDeleteQueuePostponedUntil = postponeUntil;
+        Schedule(after, new TEvPrivate::TEvPostponeProcessBackupDeleteQueue());
+    }
+}
+
 void THive::AddToBootQueue(TTabletInfo* tablet, TNodeId node) {
     tablet->UpdateWeight();
     tablet->BootState = BootStateBooting;
@@ -2284,6 +2322,22 @@ void THive::UpdateCounterBackupBootQueueSize() {
     }
 }
 
+void THive::UpdateCounterBackupDeleteQueueSize() {
+    if (TabletCounters != nullptr) {
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE].Set(BackupDeleteQueue.size());
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_TABLETS_DELETING].Set(BackupDeleteInFlight.size());
+        ui64 oldestDelayMs = 0;
+        if (!BackupDeleteQueue.empty()) {
+            TInstant now = TActivationContext::Now();
+            TInstant oldest = BackupDeleteQueue.front().second;
+            if (now > oldest) {
+                oldestDelayMs = (now - oldest).MilliSeconds();
+            }
+        }
+        TabletCounters->Simple()[NHive::COUNTER_BACKUP_DELETE_DELAY_MS].Set(oldestDelayMs);
+    }
+}
+
 void THive::UpdateCounterPingQueueSize() {
     if (TabletCounters != nullptr) {
         auto& counter = TabletCounters->Simple()[NHive::COUNTER_PINGQUEUE_SIZE];
@@ -3671,6 +3725,14 @@ void THive::BlockStorageForDelete(TTabletId tabletId, TSideEffects& sideEffects)
         return;
     }
     Y_ENSURE(tablet->IsDeleting());
+    if (GetBackupDeletePacingEnabled() && tablet->IsBackup) {
+        // Backup tablets get their own queue, which also means the DeleteTabletInProgress window
+        // below stays available for user deletions
+        BackupDeleteQueue.push_back({tabletId, TActivationContext::Now()});
+        UpdateCounterBackupDeleteQueueSize();
+        ExecuteProcessBackupDeleteQueue(sideEffects);
+        return;
+    }
     if (DeleteTabletInProgress < GetMaxDeleteTabletInProgress()) {
         ++DeleteTabletInProgress;
         if (!tablet->InitiateBlockStorage(sideEffects, std::numeric_limits<ui32>::max())) {
@@ -3681,6 +3743,116 @@ void THive::BlockStorageForDelete(TTabletId tabletId, TSideEffects& sideEffects)
     }
     UpdateCounterDeleteTabletQueueSize();
     UpdateCounterTabletsDeleting();
+}
+
+// Bounds how many queue records a single pass may look at, so that a queue full of tablets that
+// have already been deleted elsewhere cannot occupy the actor for an unbounded time
+static constexpr ui64 MAX_BACKUP_DELETE_SCAN_PER_PASS = 1000;
+
+TBackupPacer::TSettings THive::GetBackupDeletePacerSettings() const {
+    return {
+        .Rate = CurrentConfig.GetBackupDeleteRate(),
+        .Burst = CurrentConfig.GetBackupDeleteBurst(),
+        .WindowLimit = static_cast<i64>(CurrentConfig.GetMaxBackupDeleteInProgress()),
+        .UserWeight = CurrentConfig.GetBackupDeleteUserWeight(),
+        .MaxDelay = TDuration::MilliSeconds(CurrentConfig.GetBackupDeleteMaxDelay()),
+        .MinRate = CurrentConfig.GetBackupDeleteMinRate(),
+    };
+}
+
+void THive::DrainDeleteTabletQueue(TSideEffects& sideEffects) {
+    while (!DeleteTabletQueue.empty() && DeleteTabletInProgress < GetMaxDeleteTabletInProgress()) {
+        BlockStorageForDelete(DeleteTabletQueue.front(), sideEffects);
+        DeleteTabletQueue.pop();
+    }
+    UpdateCounterDeleteTabletQueueSize();
+    UpdateCounterTabletsDeleting();
+}
+
+void THive::HandOverBackupDeleteQueue(TSideEffects& sideEffects) {
+    // Pacing has been turned off while there were tablets in the backup queue - hand them over to
+    // the shared window, which is the only path when pacing is disabled
+    size_t handedOver = BackupDeleteQueue.size();
+    while (!BackupDeleteQueue.empty()) {
+        DeleteTabletQueue.push(BackupDeleteQueue.front().first);
+        BackupDeleteQueue.pop_front();
+    }
+    UpdateCounterBackupDeleteQueueSize();
+    if (handedOver > 0) {
+        YDB_LOG_DEBUG("ProcessBackupDeleteQueue: pacing disabled, moved tablets to delete queue",
+            {"logPrefix", GetLogPrefix()},
+            {"tablets", handedOver});
+        DrainDeleteTabletQueue(sideEffects);
+    }
+}
+
+void THive::ExecuteProcessBackupDeleteQueue(TSideEffects& sideEffects) {
+    if (BackupDeleteQueue.empty()) {
+        return;
+    }
+    if (!GetBackupDeletePacingEnabled()) {
+        HandOverBackupDeleteQueue(sideEffects);
+        return;
+    }
+
+    TInstant now = TActivationContext::Now();
+    double loadFactor = GetBackupLoadFactor(now);
+    ui64 budget = BackupDeletePacer.GetBudget(now,
+                                             GetBackupDeletePacerSettings(),
+                                             loadFactor,
+                                             static_cast<i64>(BackupDeleteInFlight.size()),
+                                             DeleteTabletInProgress,
+                                             BackupDeleteQueue.front().second);
+    YDB_LOG_DEBUG("ProcessBackupDeleteQueue:",
+        {"logPrefix", GetLogPrefix()},
+        {"backupDeleteQueueSize", BackupDeleteQueue.size()},
+        {"backupDeleteInFlight", BackupDeleteInFlight.size()},
+        {"deleteTabletInProgress", DeleteTabletInProgress},
+        {"loadFactor", loadFactor},
+        {"tokens", BackupDeletePacer.Tokens},
+        {"budget", budget});
+
+    ui64 startedItems = 0;
+    ui64 scannedItems = 0;
+    // Stale records cost no token, so the batch size is what bounds the time spent in one pass
+    while (startedItems < budget && scannedItems < MAX_BACKUP_DELETE_SCAN_PER_PASS && !BackupDeleteQueue.empty()) {
+        ++scannedItems;
+        TTabletId tabletId = BackupDeleteQueue.front().first;
+        auto* tablet = FindTabletEvenInDeleting(tabletId);
+        BackupDeleteQueue.pop_front();
+        // The tablet could have been deleted by another path already - that is not an attempt to
+        // delete anything, so it costs no token
+        if (tablet == nullptr || !tablet->IsDeleting()) {
+            continue;
+        }
+        ++startedItems;
+        BackupDeletePacer.Spend();
+        BackupDeleteInFlight.insert(tabletId);
+        if (!tablet->InitiateBlockStorage(sideEffects, std::numeric_limits<ui32>::max())) {
+            DeleteTabletWithoutStorage(tablet, sideEffects);
+        }
+    }
+    UpdateCounterBackupDeleteQueueSize();
+
+    if (BackupDeleteQueue.empty()) {
+        return;
+    }
+    if (scannedItems >= MAX_BACKUP_DELETE_SCAN_PER_PASS) {
+        // Ran out of batch, not out of budget - continue right away
+        ProcessBackupDeleteQueue();
+        return;
+    }
+    if (loadFactor <= 0) {
+        PostponeProcessBackupDeleteQueue(GetResourceChangeReactionPeriod());
+        return;
+    }
+    if (auto timeToNextToken = BackupDeletePacer.GetTimeToNextToken(GetBackupDeletePacerSettings(), loadFactor)) {
+        PostponeProcessBackupDeleteQueue(*timeToNextToken);
+    } else if (BackupDeletePacer.Tokens + TBackupPacer::TOKEN_EPSILON < 1) {
+        // Rate is configured to zero - only a config or load change can help
+        PostponeProcessBackupDeleteQueue(GetResourceChangeReactionPeriod());
+    }
+    // Otherwise we are limited by the window and will be woken up by TTxDeleteTabletResult
 }
 
 void THive::ProcessPendingStopTablet() {
@@ -3948,6 +4120,8 @@ void THive::ProcessEvent(std::unique_ptr<IEventHandle> event) {
         hFunc(TEvHive::TEvShrinkStoragePoolDone, Handle);
         hFunc(TEvPrivate::TEvReassignInactiveGroupsComplete, Handle);
         hFunc(TEvPrivate::TEvMoveDataComplete, Handle);
+        hFunc(TEvPrivate::TEvProcessBackupDeleteQueue, Handle);
+        hFunc(TEvPrivate::TEvPostponeProcessBackupDeleteQueue, Handle);
     }
 }
 
@@ -3999,6 +4173,8 @@ STFUNC(THive::StateWork) {
         fFunc(TEvents::TEvUndelivered::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessBootQueue::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvPostponeProcessBootQueue::EventType, EnqueueIncomingEvent);
+        fFunc(TEvPrivate::TEvProcessBackupDeleteQueue::EventType, EnqueueIncomingEvent);
+        fFunc(TEvPrivate::TEvPostponeProcessBackupDeleteQueue::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessPendingOperations::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessDisconnectNode::EventType, EnqueueIncomingEvent);
         fFunc(TEvLocal::TEvSyncTablets::EventType, EnqueueIncomingEvent);

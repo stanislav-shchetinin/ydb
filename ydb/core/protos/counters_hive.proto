@@ -43,6 +43,9 @@ enum ESimpleCounters {
     COUNTER_BACKUP_WAITQUEUE_SIZE = 33 [(CounterOpts) = {Name: "BackupWaitQueueSize"}];
     COUNTER_BACKUP_TABLETS_STARTING = 34 [(CounterOpts) = {Name: "BackupTabletsStarting"}];
     COUNTER_BACKUP_BOOT_DELAY_MS = 35 [(CounterOpts) = {Name: "BackupBootOldestDelayMs"}];
+    COUNTER_BACKUP_DELETEQUEUE_SIZE = 36 [(CounterOpts) = {Name: "BackupDeleteQueueSize"}];
+    COUNTER_BACKUP_TABLETS_DELETING = 37 [(CounterOpts) = {Name: "BackupTabletsDeleting"}];
+    COUNTER_BACKUP_DELETE_DELAY_MS = 38 [(CounterOpts) = {Name: "BackupDeleteOldestDelayMs"}];
 }
 
 enum ECumulativeCounters {

@@ -8803,6 +8803,122 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
     }
 
+    Y_UNIT_TEST(TestBackupDeletePacingLimitsRate) {
+        static constexpr ui64 NUM_TABLETS = 8;
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupDeletePacingEnabled(true);
+            // Isolate the rate limiter: the window and aging must not interfere
+            app.HiveConfig.SetBackupDeleteRate(2);
+            app.HiveConfig.SetBackupDeleteBurst(1);
+            app.HiveConfig.SetMaxBackupDeleteInProgress(1000);
+            app.HiveConfig.SetBackupDeleteUserWeight(0);
+            app.HiveConfig.SetBackupDeleteMaxDelay(3600000);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, true);
+        }
+
+        ui64 deleteCount = 0;
+        auto deleteCounter = runtime.AddObserver<TEvTabletBase::TEvDeleteTabletResult>([&](auto&&) { ++deleteCount; });
+
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            SendDeleteTestTablet(runtime, hiveTablet,
+                MakeHolder<TEvHive::TEvDeleteTablet>(testerTablet, i, 0), 0, std::nullopt);
+        }
+
+        // With burst 1 and 2 deletions/sec not everything can go at once
+        runtime.SimulateSleep(TDuration::MilliSeconds(200));
+        UNIT_ASSERT_C(deleteCount < NUM_TABLETS,
+            "all " << NUM_TABLETS << " backup deletions went at once, rate is not limited");
+        UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
+
+        // ... but the queue does drain over time
+        runtime.WaitFor("all backup tablets deleted", [&] { return deleteCount >= NUM_TABLETS; }, TDuration::Minutes(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING), 0);
+    }
+
+    Y_UNIT_TEST(TestBackupDeletePacingDoesNotDelayUserDeletes) {
+        static constexpr ui64 NUM_BACKUP_TABLETS = 5;
+        static constexpr ui64 USER_TABLET_OWNER_IDX = 100;
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupDeletePacingEnabled(true);
+            // Backup deletions are throttled to a crawl - user deletions must not care
+            app.HiveConfig.SetBackupDeleteRate(0.01);
+            app.HiveConfig.SetBackupDeleteBurst(1);
+            app.HiveConfig.SetMaxBackupDeleteInProgress(1);
+            app.HiveConfig.SetBackupDeleteMaxDelay(3600000);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+
+        for (ui64 i = 0; i < NUM_BACKUP_TABLETS; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, true);
+        }
+        auto userEv = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, USER_TABLET_OWNER_IDX,
+                                                          TTabletTypes::Dummy, BINDED_CHANNELS);
+        ui64 userTabletId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(userEv), 0, true);
+
+        std::unordered_set<ui64> deleted;
+        auto deleteObserver = runtime.AddObserver<TEvTabletBase::TEvDeleteTabletResult>(
+            [&](auto&& ev) { deleted.insert(ev->Get()->TabletId); });
+
+        for (ui64 i = 0; i < NUM_BACKUP_TABLETS; ++i) {
+            SendDeleteTestTablet(runtime, hiveTablet,
+                MakeHolder<TEvHive::TEvDeleteTablet>(testerTablet, i, 0), 0, std::nullopt);
+        }
+        SendDeleteTestTablet(runtime, hiveTablet,
+            MakeHolder<TEvHive::TEvDeleteTablet>(testerTablet, USER_TABLET_OWNER_IDX, 0), 0, std::nullopt);
+
+        // The user tablet must not wait behind the throttled backup queue
+        runtime.WaitFor("user tablet deleted", [&] { return deleted.contains(userTabletId); }, TDuration::Seconds(30));
+        UNIT_ASSERT(deleted.contains(userTabletId));
+        // Meanwhile the backup deletions are still queued
+        UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
+    }
+
+    Y_UNIT_TEST(TestBackupDeletePacingDisabled) {
+        // Default config: deletion of backup tablets must behave exactly as it did before
+        static constexpr ui64 NUM_TABLETS = 4;
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true);
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, true);
+        }
+
+        ui64 deleteCount = 0;
+        auto deleteCounter = runtime.AddObserver<TEvTabletBase::TEvDeleteTabletResult>([&](auto&&) { ++deleteCount; });
+
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            SendDeleteTestTablet(runtime, hiveTablet,
+                MakeHolder<TEvHive::TEvDeleteTablet>(testerTablet, i, 0), 0, std::nullopt);
+        }
+
+        runtime.WaitFor("all tablets deleted", [&] { return deleteCount >= NUM_TABLETS; }, TDuration::Minutes(1));
+        // The backup queue must not have been used at all
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
+    }
+
     Y_UNIT_TEST(TestTabletsStartingCounterExternalBoot) {
       TTestBasicRuntime runtime(1, false);
       Setup(runtime, true);

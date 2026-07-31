@@ -90,13 +90,16 @@ public:
             {"tabletId", TabletId},
             {"sideEffects", SideEffects});
         if (Success) {
-            --Self->DeleteTabletInProgress;
-            while (!Self->DeleteTabletQueue.empty() && Self->DeleteTabletInProgress < Self->GetMaxDeleteTabletInProgress()) {
-                Self->BlockStorageForDelete(Self->DeleteTabletQueue.front(), SideEffects);
-                Self->DeleteTabletQueue.pop();
+            // Which window this tablet occupied is decided by membership in BackupDeleteInFlight,
+            // not by IsBackup: by now the tablet is gone from Tablets, and this result can even
+            // arrive for a tablet that was never in flight
+            if (Self->BackupDeleteInFlight.erase(TabletId) != 0) {
+                Self->UpdateCounterBackupDeleteQueueSize();
+                Self->ExecuteProcessBackupDeleteQueue(SideEffects);
+            } else {
+                --Self->DeleteTabletInProgress;
+                Self->DrainDeleteTabletQueue(SideEffects);
             }
-            Self->UpdateCounterDeleteTabletQueueSize();
-            Self->UpdateCounterTabletsDeleting();
         }
         SideEffects.Complete(ctx);
     }

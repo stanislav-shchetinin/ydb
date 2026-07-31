@@ -2683,6 +2683,8 @@ public:
         jsonData["BackupBootQueueSize"] = Self->BootQueue.BackupBootQueue.size();
         jsonData["BackupWaitQueueSize"] = Self->BootQueue.BackupWaitQueue.size();
         jsonData["BackupTabletsStarting"] = Self->BackupTabletsStarting;
+        jsonData["BackupDeleteQueueSize"] = Self->BackupDeleteQueue.size();
+        jsonData["BackupTabletsDeleting"] = Self->BackupDeleteInFlight.size();
         jsonData["Balancers"] = Self->GetBalancerProgressJson();
         jsonData["MaxUsage"] =  GetValueWithColoredGlyph(stats.MaxUsage, Self->GetMaxNodeUsageToKick()) ;
         auto scatterHtml = convert(stats.ScatterByResource, Self->GetMinScatterToBalance(), GetValueWithColoredGlyph);

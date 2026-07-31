@@ -2723,6 +2723,19 @@ message THiveConfig {
     // The weight still matters, so a much heavier user tablet is still moved first - that is why
     // this is a multiplier and not a hard partition. 1.0 means no preference.
     optional double BackupTabletBalancerWeight = 103 [default = 1.0];
+
+    // Dropping a backup table at the end of an export deletes thousands of tablets at once, which
+    // blocks and deletes their storage groups in a burst. Without pacing that burst also takes over
+    // the whole MaxDeleteTabletInProgress window, so a user DROP TABLE has to wait behind it.
+    // Note: this does not cover the borrowed parts compaction the source tables have to do when the
+    // loans are returned - that work lives in DataShard and cannot be paced from here.
+    optional bool BackupDeletePacingEnabled = 104 [default = false];
+    optional double BackupDeleteRate = 105 [default = 10.0]; // deletions per second at zero load
+    optional double BackupDeleteBurst = 106 [default = 10.0];
+    optional uint64 MaxBackupDeleteInProgress = 107 [default = 16];
+    optional double BackupDeleteUserWeight = 108 [default = 2.0]; // own slots one user deletion costs
+    optional uint64 BackupDeleteMaxDelay = 109 [default = 300000]; // milliseconds
+    optional double BackupDeleteMinRate = 110 [default = 1.0];
 }
 
 message THealthCheckConfig {

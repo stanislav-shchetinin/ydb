@@ -474,6 +474,17 @@ protected:
     i64 DeleteTabletInProgress = 0;
     std::queue<TTabletId> DeleteTabletQueue;
 
+    // Deletion of backup tablets is paced separately, so that it neither takes over the
+    // DeleteTabletInProgress window from user deletions nor deletes storage in a burst
+    std::deque<std::pair<TTabletId, TInstant>> BackupDeleteQueue; // tablet id and enqueue time
+    // A set rather than a counter: TTxDeleteTabletResult can arrive for a tablet that is already
+    // gone, and erasing from a set makes the bookkeeping robust against that
+    std::unordered_set<TTabletId> BackupDeleteInFlight;
+    TBackupPacer BackupDeletePacer;
+    bool ProcessBackupDeleteQueueScheduled = false;
+    bool ProcessBackupDeleteQueuePostponed = false;
+    TInstant ProcessBackupDeleteQueuePostponedUntil;
+
     TString BootStateBooting = "Booting";
     TString BootStateStarting = "Starting";
     TString BootStateRunning = "Running";
@@ -601,6 +612,8 @@ protected:
     void HandleInit(TEvPrivate::TEvProcessBootQueue::TPtr&);
     void Handle(TEvPrivate::TEvProcessBootQueue::TPtr&);
     void Handle(TEvPrivate::TEvPostponeProcessBootQueue::TPtr&);
+    void Handle(TEvPrivate::TEvProcessBackupDeleteQueue::TPtr&);
+    void Handle(TEvPrivate::TEvPostponeProcessBackupDeleteQueue::TPtr&);
     void Handle(TEvPrivate::TEvProcessDisconnectNode::TPtr&);
     void HandleInit(TEvPrivate::TEvProcessTabletBalancer::TPtr&);
     void Handle(TEvPrivate::TEvProcessTabletBalancer::TPtr&);
@@ -724,6 +737,7 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     void UpdateCounterTabletsStarting(i64 tabletsStartingDiff);
     void UpdateTabletsStarting(const TTabletInfo& tablet, i64 diff);
     void UpdateCounterBackupBootQueueSize();
+    void UpdateCounterBackupDeleteQueueSize();
     void UpdateCounterPingQueueSize();
     void UpdateCounterTabletChannelHistorySize();
     void UpdateCounterNodesDown(i64 nodesDownDiff);
@@ -736,6 +750,8 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     void ProcessBootQueue();
     void ProcessWaitQueue();
     void PostponeProcessBootQueue(TDuration after);
+    void ProcessBackupDeleteQueue();
+    void PostponeProcessBackupDeleteQueue(TDuration after);
     void ProcessPendingOperations();
     void ProcessTabletBalancer();
     void ProcessStorageBalancer();
@@ -781,6 +797,10 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     double GetBackupLoadFactor(TInstant now);
     TBackupPacer::TSettings GetBackupBootPacerSettings() const;
     ui64 GetBackupBootBudget(TInstant now, double loadFactor);
+    TBackupPacer::TSettings GetBackupDeletePacerSettings() const;
+    void ExecuteProcessBackupDeleteQueue(TSideEffects& sideEffects);
+    void HandOverBackupDeleteQueue(TSideEffects& sideEffects);
+    void DrainDeleteTabletQueue(TSideEffects& sideEffects);
 
     void CreateTabletFollowers(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db, TSideEffects& sideEffects);
     TDuration GetBalancerCooldown(EBalancerType balancerType) const;
@@ -903,6 +923,10 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
 
     double GetBackupTabletBalancerWeight() const {
         return CurrentConfig.GetBackupTabletBalancerWeight();
+    }
+
+    bool GetBackupDeletePacingEnabled() const {
+        return CurrentConfig.GetBackupDeletePacingEnabled();
     }
 
     TResourceNormalizedValues GetMinScatterToBalance() const {
