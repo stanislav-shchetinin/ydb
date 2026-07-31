@@ -541,6 +541,12 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
 
     double loadFactor = GetBackupLoadFactor(now);
     ui64 budget = GetBackupBootBudget(now, loadFactor);
+    // Placement restrictions are computed once per pass, not per candidate node, and are lifted by
+    // the same aging escape hatch as the rate and window gates - otherwise a uniformly loaded
+    // cluster would leave backup tablets unplaceable forever
+    auto pacerSettings = GetBackupBootPacerSettings();
+    BackupPlacementRestricted = (GetMaxBackupTabletsStartingPerNode() != 0 || GetBackupMaxNodeUsageToPlace() > 0)
+        && !BackupBootPacer.IsEscalated(now, pacerSettings, BootQueue.GetOldestBackupEnqueueTime());
     YDB_LOG_DEBUG("ProcessBackupBootQueue:",
         {"logPrefix", GetLogPrefix()},
         {"backupBootQueueSize", BootQueue.BackupQueueSize()},
@@ -555,6 +561,7 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
     ui64 tabletsStarted = 0;
     bool tooManyStarting = false;
     bool headNotReady = false;
+    bool placementRestricted = false;
     // Stale records cost no token, so the batch size is what bounds the time we spend in a single
     // transaction when the queue is full of them
     while (processedItems < budget && scannedItems < GetMaxBootBatchSize() && !BootQueue.BackupQueueEmpty()) {
@@ -601,6 +608,14 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         if (std::holds_alternative<TNotEnoughResources>(bestNodeResult)) {
             NotEnoughResources = true;
         }
+        if (BackupPlacementRestricted) {
+            // No node accepted the tablet, but the placement restrictions we put on backup tablets
+            // are transient by construction, so keep it in the queue and retry. Parking it in the
+            // wait queue would be wrong: that queue is only revisited when nodes change state.
+            BootQueue.ReturnToBackupQueueFront(record);
+            placementRestricted = true;
+            break;
+        }
         tablet->NotifyOnRestart("backup boot delay", sideEffects);
         tablet->InWaitQueue = true;
         BootQueue.AddToBackupWaitQueue(record);
@@ -621,9 +636,13 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         TabletCounters->Simple()[NHive::COUNTER_BACKUP_BOOT_DELAY_MS].Set(oldestDelayMs);
     }
 
-    if (BootQueue.BackupQueueEmpty() || tooManyStarting) {
-        // Nothing to do, or no capacity at all - in the latter case we will be woken up by
-        // TTxUpdateTabletStatus when a tablet reports that it has started
+    if (BootQueue.BackupQueueEmpty()) {
+        return;
+    }
+    if (tooManyStarting || placementRestricted) {
+        // Normally a starting tablet reporting in wakes us up, but if nothing is in flight at all
+        // there would be nothing to wake us, so re-check periodically as well
+        PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
         return;
     }
     if (headNotReady) {
@@ -640,7 +659,7 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
         return;
     }
-    if (auto timeToNextToken = BackupBootPacer.GetTimeToNextToken(GetBackupBootPacerSettings(), loadFactor)) {
+    if (auto timeToNextToken = BackupBootPacer.GetTimeToNextToken(pacerSettings, loadFactor)) {
         PostponeProcessBootQueue(*timeToNextToken);
     } else if (BackupBootPacer.Tokens + TBackupPacer::TOKEN_EPSILON < 1) {
         // Rate is configured to zero - only a config or load change can help

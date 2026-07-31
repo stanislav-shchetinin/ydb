@@ -2736,6 +2736,13 @@ message THiveConfig {
     optional double BackupDeleteUserWeight = 108 [default = 2.0]; // own slots one user deletion costs
     optional uint64 BackupDeleteMaxDelay = 109 [default = 300000]; // milliseconds
     optional double BackupDeleteMinRate = 110 [default = 1.0];
+
+    // Placement restrictions for backup tablets, on top of the global boot pacing. Both are off by
+    // default, and both are lifted for a tablet that has waited longer than BackupBootMaxDelay -
+    // otherwise a uniformly loaded cluster would never place a backup tablet at all, stalling the
+    // copy operation that is waiting for it.
+    optional uint64 MaxBackupTabletsStartingPerNode = 111 [default = 0]; // 0 - no limit
+    optional double BackupMaxNodeUsageToPlace = 112 [default = 0]; // 0 - no limit
 }
 
 message THealthCheckConfig {

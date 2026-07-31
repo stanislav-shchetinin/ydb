@@ -78,6 +78,9 @@ public:
     TDrainSettings DrainSettings;
     std::unordered_map<TTabletInfo::EVolatileState, std::unordered_set<TTabletInfo*>> Tablets;
     std::unordered_map<TTabletTypes::EType, std::unordered_set<TTabletInfo*>> TabletsRunningByType;
+    // How many of the tablets in STARTING state on this node are backup tablets. Kept incrementally
+    // because counting them would mean walking Tablets[STARTING] on every placement decision.
+    ui32 BackupTabletsStarting = 0;
     std::unordered_map<TFullObjectId, std::unordered_set<TTabletInfo*>> TabletsOfObject;
     std::vector<TFullTabletId> FrozenTablets;
     TResourceRawValues ResourceValues; // accumulated resources from tablet metrics
@@ -126,6 +129,10 @@ public:
         if (it != Tablets.end())
             return it->second.size();
         return 0;
+    }
+
+    ui32 GetBackupTabletsStarting() const {
+        return BackupTabletsStarting;
     }
 
     ui32 GetTabletsTotal() const {

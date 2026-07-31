@@ -73,11 +73,18 @@ bool TNodeInfo::OnTabletChangeVolatileState(TTabletInfo* tablet, TTabletInfo::EV
         FrozenTablets.push_back(tablet->GetFullTabletId());
     }
     TTabletInfo::EVolatileState oldState = tablet->GetVolatileState();
+    const bool isBackup = tablet->GetLeader().IsBackup;
     if (oldState == TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
         Hive.UpdateTabletsStarting(*tablet, -1);
+        if (isBackup && BackupTabletsStarting > 0) {
+            --BackupTabletsStarting;
+        }
     }
     if (newState == TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
         Hive.UpdateTabletsStarting(*tablet, +1);
+        if (isBackup) {
+            ++BackupTabletsStarting;
+        }
     }
     if (IsResourceDrainingState(oldState)) {
         if (Tablets[oldState].erase(tablet) != 0) {
@@ -287,6 +294,27 @@ bool TNodeInfo::IsAbleToRunTablet(const TTabletInfo& tablet, TTabletDebugState* 
                 }
                 return false;
             }
+        }
+    }
+
+    if (tablet.GetLeader().IsBackup && Hive.IsBackupPlacementRestricted()) {
+        // Do not pile backup starts onto one node - their cost is the boot itself, and concentrating
+        // it defeats the point of pacing
+        ui64 maxStarting = Hive.GetMaxBackupTabletsStartingPerNode();
+        if (maxStarting != 0 && GetBackupTabletsStarting() >= maxStarting) {
+            if (debugState) {
+                debugState->NodesWithoutResources++;
+            }
+            return false;
+        }
+        // Keep backup tablets off nodes that are already hot. Placement already prefers the least
+        // loaded node, so this is a hard floor under that preference, not the main mechanism.
+        double maxUsage = Hive.GetBackupMaxNodeUsageToPlace();
+        if (maxUsage > 0 && GetNodeUsage() > maxUsage) {
+            if (debugState) {
+                debugState->NodesWithoutResources++;
+            }
+            return false;
         }
     }
 

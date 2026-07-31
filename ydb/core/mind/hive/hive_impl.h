@@ -405,6 +405,7 @@ protected:
     // Load factor is shared by everything that paces backup work - the signal is the same
     double BackupLoadFactor = 1;
     TInstant BackupLoadFactorUpdated;
+    bool BackupPlacementRestricted = false;
     TInstant LastConnect;
     TInstant ProcessBootQueuePostponedUntil;
     TDuration MaxTimeBetweenConnects;
@@ -927,6 +928,21 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
 
     bool GetBackupDeletePacingEnabled() const {
         return CurrentConfig.GetBackupDeletePacingEnabled();
+    }
+
+    ui64 GetMaxBackupTabletsStartingPerNode() const {
+        return CurrentConfig.GetMaxBackupTabletsStartingPerNode();
+    }
+
+    double GetBackupMaxNodeUsageToPlace() const {
+        return CurrentConfig.GetBackupMaxNodeUsageToPlace();
+    }
+
+    // Placement restrictions are lifted while the oldest queued backup tablet has aged past
+    // BackupBootMaxDelay, so that they can never stall the queue permanently. Recomputed once per
+    // backup boot pass rather than per candidate node.
+    bool IsBackupPlacementRestricted() const {
+        return BackupPlacementRestricted;
     }
 
     TResourceNormalizedValues GetMinScatterToBalance() const {
