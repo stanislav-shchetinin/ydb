@@ -456,14 +456,10 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
         // Empty bucket: nothing until the next token
         hive->SetBackupBootTokens(0, T0);
         UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
-        // 100ms at 10 starts/sec is exactly one token
+        // 100ms at 10 starts/sec is exactly one token. This is the boundary case that floating
+        // point gets wrong without a tolerance: TDuration::SecondsFloat() makes it 0.9999999999999999
         hive->SetBackupBootTokens(0, T0);
-        ui64 budgetAfter100ms = hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0);
-        Ctest << "Budget: rate=" << hive->TestGetBackupBootRate()
-              << " burst=" << hive->TestGetBackupBootBurst()
-              << " tokens=" << hive->GetBackupBootTokens()
-              << " budget=" << budgetAfter100ms << Endl;
-        UNIT_ASSERT_VALUES_EQUAL(budgetAfter100ms, 1);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0), 1);
 
         // Refill is capped by burst
         hive->SetBackupBootTokens(0, T0);

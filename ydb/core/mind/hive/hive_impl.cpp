@@ -457,6 +457,11 @@ void THive::ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainP
     }
 }
 
+// Tolerance for token bucket arithmetic - a deficit this small means sub-nanosecond timing
+static constexpr double BACKUP_BOOT_TOKEN_EPSILON = 1e-9;
+// Never schedule a backup boot wake-up sooner than this, so that rounding cannot turn into a spin
+static constexpr TDuration BACKUP_BOOT_MIN_WAKEUP = TDuration::MilliSeconds(1);
+
 double THive::GetBackupBootLoadFactor(TInstant now) {
     static constexpr TDuration LOAD_FACTOR_CACHE_PERIOD = TDuration::Seconds(1);
     if (BackupBootLoadFactorUpdated && now < BackupBootLoadFactorUpdated + LOAD_FACTOR_CACHE_PERIOD) {
@@ -531,7 +536,12 @@ ui64 THive::GetBackupBootBudget(TInstant now, double loadFactor) {
     if (inflightBudget <= 0) {
         return 0;
     }
-    return std::min<ui64>(static_cast<ui64>(BackupBootTokens), static_cast<ui64>(inflightBudget));
+    // Rounding matters right at the moment the next token is due: TDuration::SecondsFloat()
+    // multiplies by (1 / 1000000.0), so 100ms is 0.09999999999999999, and at 10 starts/sec a full
+    // token comes out as 0.9999999999999999. Without the epsilon we would report a zero budget and
+    // then schedule a wake-up in ~0 time, spinning until the error accumulates away.
+    return std::min<ui64>(static_cast<ui64>(BackupBootTokens + BACKUP_BOOT_TOKEN_EPSILON),
+                          static_cast<ui64>(inflightBudget));
 }
 
 void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
@@ -660,14 +670,14 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
         return;
     }
-    if (BackupBootTokens < 1) {
+    if (BackupBootTokens + BACKUP_BOOT_TOKEN_EPSILON < 1) {
         double rate = GetBackupBootRate() * loadFactor;
         if (rate <= 0) {
             PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
         } else {
             double secondsToNextToken = (1.0 - BackupBootTokens) / rate;
-            PostponeProcessBootQueue(TDuration::MicroSeconds(
-                std::max<ui64>(1, static_cast<ui64>(secondsToNextToken * 1000000))));
+            PostponeProcessBootQueue(std::max(BACKUP_BOOT_MIN_WAKEUP,
+                TDuration::MicroSeconds(static_cast<ui64>(secondsToNextToken * 1000000))));
         }
     }
     // Otherwise we are limited by inflight and will be woken up by TTxUpdateTabletStatus
