@@ -527,7 +527,99 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
         });
 
         // No nodes at all - no reason to throttle
-        UNIT_ASSERT_DOUBLES_EQUAL(hive->TestGetBackupBootLoadFactor(T0), 1.0, 1e-6);
+        UNIT_ASSERT_DOUBLES_EQUAL(hive->TestGetBackupLoadFactor(T0), 1.0, 1e-6);
+    }
+}
+
+Y_UNIT_TEST_SUITE(THiveBackupPacerTest) {
+    static constexpr TInstant T0 = TInstant::Seconds(1000);
+
+    TBackupPacer::TSettings MakeSettings() {
+        return {
+            .Rate = 10,
+            .Burst = 10,
+            .WindowLimit = 16,
+            .UserWeight = 2,
+            .MaxDelay = TDuration::Seconds(300),
+            .MinRate = 1,
+        };
+    }
+
+    Y_UNIT_TEST(RateLimitsBudget) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+
+        // An idle bucket is a full bucket
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt), 10);
+
+        pacer.Spend(10);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt), 0);
+
+        // 100ms at 10 ops/sec is exactly one token. This is the boundary case that floating point
+        // gets wrong without TOKEN_EPSILON: SecondsFloat() makes it 0.9999999999999999
+        UNIT_ASSERT_VALUES_EQUAL(
+            pacer.GetBudget(T0 + TDuration::MilliSeconds(100), settings, 1.0, 0, 0, std::nullopt), 1);
+    }
+
+    Y_UNIT_TEST(BurstCapsRefill) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
+        pacer.Spend(10);
+        // A long idle period cannot accumulate more than the burst
+        UNIT_ASSERT_VALUES_EQUAL(
+            pacer.GetBudget(T0 + TDuration::Hours(1), settings, 1.0, 0, 0, std::nullopt), 10);
+    }
+
+    Y_UNIT_TEST(WindowShrinksWithUserWork) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+
+        // 8 user operations at weight 2 consume the whole window of 16
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 8, std::nullopt), 0);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 4, std::nullopt), 8);
+        // Own operations in flight count against the window directly
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 10, 0, std::nullopt), 6);
+        // Load factor scales the window
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0.5, 0, 0, std::nullopt), 8);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0.0, 0, 0, std::nullopt), 0);
+    }
+
+    Y_UNIT_TEST(AgingBypassesGates) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
+        pacer.Spend(10);
+
+        // Overloaded cluster and plenty of user work - nothing gets through
+        UNIT_ASSERT_VALUES_EQUAL(
+            pacer.GetBudget(T0 + TDuration::Seconds(1), settings, 0.0, 0, 100, T0), 0);
+
+        // ... but not forever: past MaxDelay both the window and the load gate are bypassed
+        UNIT_ASSERT_VALUES_EQUAL(
+            pacer.GetBudget(T0 + TDuration::Seconds(301), settings, 0.0, 0, 100, T0), 1);
+    }
+
+    Y_UNIT_TEST(TimeToNextTokenIsNeverZero) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
+
+        // There is a token to spend - no reason to wait
+        UNIT_ASSERT(!pacer.GetTimeToNextToken(settings, 1.0));
+
+        pacer.Spend(10);
+        auto delay = pacer.GetTimeToNextToken(settings, 1.0);
+        UNIT_ASSERT(delay);
+        // 10 ops/sec means the next token is 100ms away
+        UNIT_ASSERT_VALUES_EQUAL(*delay, TDuration::MilliSeconds(100));
+
+        // Almost a full token: the delay must still be bounded away from zero, otherwise rounding
+        // turns the wake-up into a spin
+        pacer.Tokens = 1.0 - 1e-6;
+        auto tinyDelay = pacer.GetTimeToNextToken(settings, 1.0);
+        UNIT_ASSERT(tinyDelay);
+        UNIT_ASSERT_VALUES_EQUAL(*tinyDelay, TBackupPacer::MIN_WAKEUP);
     }
 }
 

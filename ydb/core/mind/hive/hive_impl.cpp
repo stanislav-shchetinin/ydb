@@ -457,15 +457,10 @@ void THive::ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainP
     }
 }
 
-// Tolerance for token bucket arithmetic - a deficit this small means sub-nanosecond timing
-static constexpr double BACKUP_BOOT_TOKEN_EPSILON = 1e-9;
-// Never schedule a backup boot wake-up sooner than this, so that rounding cannot turn into a spin
-static constexpr TDuration BACKUP_BOOT_MIN_WAKEUP = TDuration::MilliSeconds(1);
-
-double THive::GetBackupBootLoadFactor(TInstant now) {
+double THive::GetBackupLoadFactor(TInstant now) {
     static constexpr TDuration LOAD_FACTOR_CACHE_PERIOD = TDuration::Seconds(1);
-    if (BackupBootLoadFactorUpdated && now < BackupBootLoadFactorUpdated + LOAD_FACTOR_CACHE_PERIOD) {
-        return BackupBootLoadFactor;
+    if (BackupLoadFactorUpdated && now < BackupLoadFactorUpdated + LOAD_FACTOR_CACHE_PERIOD) {
+        return BackupLoadFactor;
     }
     std::vector<double> usages;
     usages.reserve(Nodes.size());
@@ -495,53 +490,30 @@ double THive::GetBackupBootLoadFactor(TInstant now) {
         {"logPrefix", GetLogPrefix()},
         {"usage", usage},
         {"loadFactor", factor});
-    BackupBootLoadFactor = factor;
-    BackupBootLoadFactorUpdated = now;
+    BackupLoadFactor = factor;
+    BackupLoadFactorUpdated = now;
     return factor;
 }
 
-void THive::RefillBackupBootTokens(TInstant now, double rate) {
-    double burst = std::max(GetBackupBootBurst(), 1.0);
-    if (!BackupBootTokensUpdated) {
-        // An idle bucket is a full bucket
-        BackupBootTokens = burst;
-    } else if (now > BackupBootTokensUpdated) {
-        double refill = rate * (now - BackupBootTokensUpdated).SecondsFloat();
-        BackupBootTokens = std::min(burst, BackupBootTokens + refill);
-    }
-    BackupBootTokensUpdated = now;
+TBackupPacer::TSettings THive::GetBackupBootPacerSettings() const {
+    return {
+        .Rate = GetBackupBootRate(),
+        .Burst = GetBackupBootBurst(),
+        .WindowLimit = static_cast<i64>(GetMaxBackupTabletsStarting()),
+        .UserWeight = GetBackupStartUserWeight(),
+        .MaxDelay = GetBackupBootMaxDelay(),
+        .MinRate = GetBackupBootMinRate(),
+    };
 }
 
 ui64 THive::GetBackupBootBudget(TInstant now, double loadFactor) {
-    // Guarantee of progress: a tablet that has been waiting for too long is booted regardless of
-    // load and inflight, otherwise a permanently busy cluster would stall the copy operation in
-    // SchemeShard forever
-    auto oldestEnqueueTime = BootQueue.GetOldestBackupEnqueueTime();
-    bool escalated = oldestEnqueueTime.has_value()
-        && *oldestEnqueueTime + GetBackupBootMaxDelay() <= now;
-
-    double rate = GetBackupBootRate() * loadFactor;
-    if (escalated) {
-        rate = std::max(rate, GetBackupBootMinRate());
-    }
-    RefillBackupBootTokens(now, rate);
-
-    i64 userStarting = std::max<i64>(0, static_cast<i64>(TabletsStarting) - static_cast<i64>(BackupTabletsStarting));
-    i64 inflightBudget = static_cast<i64>(GetMaxBackupTabletsStarting() * loadFactor)
-        - static_cast<i64>(BackupTabletsStarting)
-        - static_cast<i64>(GetBackupStartUserWeight() * userStarting);
-    if (escalated) {
-        inflightBudget = std::max<i64>(inflightBudget, 1);
-    }
-    if (inflightBudget <= 0) {
-        return 0;
-    }
-    // Rounding matters right at the moment the next token is due: TDuration::SecondsFloat()
-    // multiplies by (1 / 1000000.0), so 100ms is 0.09999999999999999, and at 10 starts/sec a full
-    // token comes out as 0.9999999999999999. Without the epsilon we would report a zero budget and
-    // then schedule a wake-up in ~0 time, spinning until the error accumulates away.
-    return std::min<ui64>(static_cast<ui64>(BackupBootTokens + BACKUP_BOOT_TOKEN_EPSILON),
-                          static_cast<ui64>(inflightBudget));
+    i64 userStarting = static_cast<i64>(TabletsStarting) - static_cast<i64>(BackupTabletsStarting);
+    return BackupBootPacer.GetBudget(now,
+                                     GetBackupBootPacerSettings(),
+                                     loadFactor,
+                                     static_cast<i64>(BackupTabletsStarting),
+                                     userStarting,
+                                     BootQueue.GetOldestBackupEnqueueTime());
 }
 
 void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
@@ -567,7 +539,7 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         return;
     }
 
-    double loadFactor = GetBackupBootLoadFactor(now);
+    double loadFactor = GetBackupLoadFactor(now);
     ui64 budget = GetBackupBootBudget(now, loadFactor);
     YDB_LOG_DEBUG("ProcessBackupBootQueue:",
         {"logPrefix", GetLogPrefix()},
@@ -575,7 +547,7 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         {"backupTabletsStarting", BackupTabletsStarting},
         {"tabletsStarting", TabletsStarting},
         {"loadFactor", loadFactor},
-        {"tokens", BackupBootTokens},
+        {"tokens", BackupBootPacer.Tokens},
         {"budget", budget});
 
     ui64 processedItems = 0;
@@ -611,9 +583,7 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
             break;
         }
         ++processedItems;
-        // A token is spent per attempt, not per successful start - this way the pass is
-        // self-limiting under any failure mode
-        BackupBootTokens = std::max(0.0, BackupBootTokens - 1);
+        BackupBootPacer.Spend();
         TBestNodeResult bestNodeResult = FindBestNode(*tablet, record.Record.SuggestedNodeId);
         if (std::holds_alternative<TNodeInfo*>(bestNodeResult)) {
             if (tablet->InitiateStart(std::get<TNodeInfo*>(bestNodeResult))) {
@@ -670,15 +640,11 @@ void THive::ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects) {
         PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
         return;
     }
-    if (BackupBootTokens + BACKUP_BOOT_TOKEN_EPSILON < 1) {
-        double rate = GetBackupBootRate() * loadFactor;
-        if (rate <= 0) {
-            PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
-        } else {
-            double secondsToNextToken = (1.0 - BackupBootTokens) / rate;
-            PostponeProcessBootQueue(std::max(BACKUP_BOOT_MIN_WAKEUP,
-                TDuration::MicroSeconds(static_cast<ui64>(secondsToNextToken * 1000000))));
-        }
+    if (auto timeToNextToken = BackupBootPacer.GetTimeToNextToken(GetBackupBootPacerSettings(), loadFactor)) {
+        PostponeProcessBootQueue(*timeToNextToken);
+    } else if (BackupBootPacer.Tokens + TBackupPacer::TOKEN_EPSILON < 1) {
+        // Rate is configured to zero - only a config or load change can help
+        PostponeProcessBootQueue(GetResourceChangeReactionPeriod());
     }
     // Otherwise we are limited by inflight and will be woken up by TTxUpdateTabletStatus
 }

@@ -39,8 +39,8 @@ public:
         return GetBackupBootBudget(now, loadFactor);
     }
 
-    double TestGetBackupBootLoadFactor(TInstant now) {
-        return GetBackupBootLoadFactor(now);
+    double TestGetBackupLoadFactor(TInstant now) {
+        return GetBackupLoadFactor(now);
     }
 
     void SetTabletsStarting(ui64 total, ui64 backup) {
@@ -49,12 +49,12 @@ public:
     }
 
     void SetBackupBootTokens(double tokens, TInstant updatedAt) {
-        BackupBootTokens = tokens;
-        BackupBootTokensUpdated = updatedAt;
+        BackupBootPacer.Tokens = tokens;
+        BackupBootPacer.TokensUpdated = updatedAt;
     }
 
     double GetBackupBootTokens() const {
-        return BackupBootTokens;
+        return BackupBootPacer.Tokens;
     }
 
     void MakeNodes(size_t numNodes) {

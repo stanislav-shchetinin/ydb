@@ -53,6 +53,7 @@
 #include "storage_group_info.h"
 #include "storage_pool_info.h"
 #include "sequencer.h"
+#include "backup_pacer.h"
 #include "boot_queue.h"
 #include "object_distribution.h"
 #include "data_center_info.h"
@@ -400,10 +401,10 @@ protected:
     bool ProcessBootQueuePostponed = false;
     ui64 TabletsStarting = 0;
     ui64 BackupTabletsStarting = 0;
-    double BackupBootTokens = 0;
-    TInstant BackupBootTokensUpdated;
-    double BackupBootLoadFactor = 1;
-    TInstant BackupBootLoadFactorUpdated;
+    TBackupPacer BackupBootPacer;
+    // Load factor is shared by everything that paces backup work - the signal is the same
+    double BackupLoadFactor = 1;
+    TInstant BackupLoadFactorUpdated;
     TInstant LastConnect;
     TInstant ProcessBootQueuePostponedUntil;
     TDuration MaxTimeBetweenConnects;
@@ -777,8 +778,8 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     TBootPassResult ProcessMainBootQueue(TInstant now, TSideEffects& sideEffects);
     void ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects);
     void ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainPass);
-    double GetBackupBootLoadFactor(TInstant now);
-    void RefillBackupBootTokens(TInstant now, double rate);
+    double GetBackupLoadFactor(TInstant now);
+    TBackupPacer::TSettings GetBackupBootPacerSettings() const;
     ui64 GetBackupBootBudget(TInstant now, double loadFactor);
 
     void CreateTabletFollowers(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db, TSideEffects& sideEffects);

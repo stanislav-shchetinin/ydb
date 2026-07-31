@@ -1,6 +1,8 @@
 LIBRARY()
 
 SRCS(
+    backup_pacer.cpp
+    backup_pacer.h
     balancer.cpp
     balancer.h
     boot_queue.cpp
