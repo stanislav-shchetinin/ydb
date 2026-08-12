@@ -56,6 +56,12 @@ if __name__ == "__main__":
              "AES-256-GCM and ChaCha20-Poly1305 need 32 bytes. "
              "Also via EXPORT_ENCRYPTION_KEY (or YDB_ENCRYPTION_KEY as hex).",
     )
+    parser.add_argument(
+        "--source-path",
+        default=None,
+        help="Table or directory to export/import (relative to --database or absolute). "
+             "Default: large_test_table. Also via EXPORT_SOURCE_PATH.",
+    )
     args = parser.parse_args()
 
     if args.nfs_path:
@@ -66,6 +72,8 @@ if __name__ == "__main__":
         os.environ["EXPORT_ENCRYPTION_ALGORITHM"] = args.encryption_algorithm
     if args.encryption_key is not None:
         os.environ["EXPORT_ENCRYPTION_KEY"] = args.encryption_key
+    if args.source_path:
+        os.environ["EXPORT_SOURCE_PATH"] = args.source_path
 
     logger = logging.getLogger("nfs_backups")
     logger.info("Connecting to %s database=%s", args.endpoint, args.database)

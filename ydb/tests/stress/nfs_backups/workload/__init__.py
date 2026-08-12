@@ -23,7 +23,7 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
 from ydb.operation import OperationClient
-from ydb.export import ExportClient, ExportToS3Settings, ExportToS3Operation
+from ydb.export import ExportClient, ExportToS3Operation
 from ydb.import_client import ImportClient, ImportFromS3Settings, ImportFromS3Operation
 from ydb import issues as ydb_issues
 
@@ -229,6 +229,50 @@ def _get_s3_config(default_source_prefix=None):
         "secret_key": s3_secret_key,
         "source_prefix": s3_source_prefix,
     }
+
+
+def _get_export_source_path(default="large_test_table"):
+    """DB path (table or directory) to export. Relative to --database or absolute."""
+    return os.getenv("EXPORT_SOURCE_PATH", default).strip().rstrip("/") or default
+
+
+def _build_s3_export_prefix(run_id: str) -> str:
+    """S3 destination prefix: [S3_EXPORT_PREFIX/]stress_s3_export_{run_id}."""
+    base = f"stress_s3_export_{run_id}"
+    custom = os.getenv("S3_EXPORT_PREFIX", "").strip().strip("/")
+    if custom:
+        return f"{custom}/{base}"
+    return base
+
+
+def _resolve_db_path(client, path):
+    path = path.strip()
+    if path.startswith("/"):
+        return path
+    return f"{client.database.rstrip('/')}/{path}"
+
+
+def _ensure_source_exists(client, source_path):
+    """Ensure export source exists. For default large_test_table, may preload from S3."""
+    full_path = _resolve_db_path(client, source_path)
+    desc = client.describe(full_path)
+    if desc is not None:
+        kind = "directory" if desc.is_directory() else "object"
+        logger.info("[setup] Source %s '%s' exists", kind, full_path)
+        return full_path
+
+    # Backward-compatible preload only for the default single-table name.
+    if source_path.rstrip("/").endswith("large_test_table") or source_path == "large_test_table":
+        table_name = source_path.split("/")[-1]
+        _ensure_table_exists(client, table_name)
+        desc = client.describe(_resolve_db_path(client, table_name))
+        if desc is not None:
+            return _resolve_db_path(client, table_name)
+
+    raise RuntimeError(
+        f"Export source '{full_path}' does not exist. "
+        "Create the table/directory first, or set EXPORT_SOURCE_PATH to an existing path."
+    )
 
 
 def _ensure_table_exists(client, table_name):
@@ -568,17 +612,21 @@ class WorkloadNfsExportImport(NfsWorkloadBase):
 
 
 class WorkloadS3ExportImport(NfsWorkloadBase):
-    """Export/import roundtrip for large_test_table via S3 (same creds as table preload)."""
+    """Export/import roundtrip via S3 for a table or directory (EXPORT_SOURCE_PATH)."""
 
-    TABLE_NAME = "large_test_table"
+    DEFAULT_SOURCE = "large_test_table"
 
     def __init__(self, client, stop, nfs_mount_path, fatal_error_event):
         super().__init__(client, stop, nfs_mount_path, fatal_error_event, "s3_export_import")
-        self.s3 = _get_s3_config(default_source_prefix=self.TABLE_NAME)
+        self.source_path = _get_export_source_path(self.DEFAULT_SOURCE)
+        self.s3 = _get_s3_config(default_source_prefix=self.source_path.split("/")[-1])
         self.export_client = ExportClient(self.client.driver)
         self.import_client = ImportClient(self.client.driver)
         self.export_in_progress = None  # (export_id, s3_prefix, run_id) or None
         self.pending_import = None  # (s3_prefix, run_id) or None
+        # Prefer HTTP if endpoint looks like plain http://
+        endpoint = (self.s3["endpoint"] or "").lower()
+        self.s3_scheme = 1 if endpoint.startswith("http://") else 2
 
     def _poll_export(self, export_id):
         try:
@@ -614,12 +662,18 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
                            self._log_prefix, import_id, e)
             return None
 
-    def _cleanup_imported_table(self, table_name: str):
+    def _cleanup_imported_path(self, path: str):
         try:
-            self.client.query(f"DROP TABLE `{table_name}`;", True)
-            logger.info("[%s][cleanup] Dropped imported table: %s", self._log_prefix, table_name)
+            self.client.remove_recursively(path)
+            logger.info("[%s][cleanup] Removed imported path: %s", self._log_prefix, path)
+            return
         except Exception as e:
-            logger.warning("[%s][cleanup] Failed to drop table %s: %s", self._log_prefix, table_name, e)
+            logger.warning("[%s][cleanup] remove_recursively(%s) failed: %s", self._log_prefix, path, e)
+        try:
+            self.client.query(f"DROP TABLE `{path}`;", True)
+            logger.info("[%s][cleanup] Dropped imported table: %s", self._log_prefix, path)
+        except Exception as e:
+            logger.warning("[%s][cleanup] Failed to drop table %s: %s", self._log_prefix, path, e)
 
     def _cleanup_s3_prefix(self, prefix: str):
         try:
@@ -673,10 +727,6 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
 
         db_path = self.client.database.rstrip("/")
         import_dest = f"{db_path}/imported_s3_{run_id}"
-        # Encrypted imports restore under destination_path using SchemaMapping.
-        cleanup_table = (
-            f"{import_dest}/{self.TABLE_NAME}" if self.encryption else import_dest
-        )
 
         result = self._retry(
             lambda: self._import_from_s3(s3_prefix, import_dest),
@@ -693,7 +743,7 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
             return False
 
         self._inc_stat("import_started")
-        logger.info("[%s] ImportFromS3 started: op=%s", self._log_prefix, result.id)
+        logger.info("[%s] ImportFromS3 started: op=%s dest=%s", self._log_prefix, result.id, import_dest)
 
         status = self._wait_op(result.id, self._poll_import)
         if status is None:
@@ -702,7 +752,7 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         if status == "DONE":
             self._inc_stat("import_done")
             logger.info("[%s] Import DONE: op=%s, cleaning up", self._log_prefix, result.id[:16])
-            self._cleanup_imported_table(cleanup_table)
+            self._cleanup_imported_path(import_dest)
             self._cleanup_s3_prefix(s3_prefix)
         else:
             self._inc_stat("import_error")
@@ -714,31 +764,19 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         return True
 
     def _export_to_s3(self, s3_prefix):
-        """Encrypted exports require common destination_prefix (+ SchemaMapping)."""
-        if not self.encryption:
-            settings = (
-                ExportToS3Settings()
-                .with_endpoint(self.s3["endpoint"])
-                .with_bucket(self.s3["bucket"])
-                .with_access_key(self.s3["access_key"])
-                .with_secret_key(self.s3["secret_key"])
-                .with_number_of_retries(3)
-                .with_source_and_destination(self.TABLE_NAME, s3_prefix)
-            )
-            return self.export_client.export_to_s3(settings)
-
+        """Export table or directory. Always sets common destination_prefix (needed for encryption)."""
         request = ydb_export_pb2.ExportToS3Request(
             settings=ydb_export_pb2.ExportToS3Settings(
                 endpoint=self.s3["endpoint"],
                 bucket=self.s3["bucket"],
                 access_key=self.s3["access_key"],
                 secret_key=self.s3["secret_key"],
-                scheme=2,  # HTTPS — same default as Python SDK
+                scheme=self.s3_scheme,
                 number_of_retries=3,
                 destination_prefix=s3_prefix,
             )
         )
-        request.settings.items.add(source_path=self.TABLE_NAME)
+        request.settings.items.add(source_path=self.source_path)
         _apply_encryption_settings(request.settings, self.encryption)
         return self.client.driver(
             request,
@@ -750,26 +788,14 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         )
 
     def _import_from_s3(self, s3_prefix, import_dest):
-        """Encrypted imports require common source_prefix + destination_path."""
-        if not self.encryption:
-            settings = (
-                ImportFromS3Settings()
-                .with_endpoint(self.s3["endpoint"])
-                .with_bucket(self.s3["bucket"])
-                .with_access_key(self.s3["access_key"])
-                .with_secret_key(self.s3["secret_key"])
-                .with_number_of_retries(3)
-                .with_source_and_destination(s3_prefix, import_dest)
-            )
-            return self.import_client.import_from_s3(settings)
-
+        """Import whole export under destination_path (SchemaMapping / common prefix)."""
         request = ydb_import_pb2.ImportFromS3Request(
             settings=ydb_import_pb2.ImportFromS3Settings(
                 endpoint=self.s3["endpoint"],
                 bucket=self.s3["bucket"],
                 access_key=self.s3["access_key"],
                 secret_key=self.s3["secret_key"],
-                scheme=2,  # HTTPS — same default as Python SDK
+                scheme=self.s3_scheme,
                 number_of_retries=3,
                 source_prefix=s3_prefix,
                 destination_path=import_dest,
@@ -786,7 +812,7 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         )
 
     def _start_export(self, run_id: str) -> bool:
-        s3_prefix = f"stress_s3_export_{run_id}"
+        s3_prefix = _build_s3_export_prefix(run_id)
 
         result = self._retry(
             lambda: self._export_to_s3(s3_prefix),
@@ -805,20 +831,22 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         self._inc_stat("export_started")
         self.export_in_progress = (result.id, s3_prefix, run_id)
         progress = result.progress.name if result.progress is not None else "UNKNOWN"
-        logger.info("[%s] ExportToS3 started: op=%s progress=%s prefix=%s encrypted=%s",
-                    self._log_prefix, result.id, progress, s3_prefix, bool(self.encryption))
+        logger.info(
+            "[%s] ExportToS3 started: op=%s progress=%s source=%s prefix=%s encrypted=%s",
+            self._log_prefix, result.id, progress, self.source_path, s3_prefix, bool(self.encryption),
+        )
         return True
 
     def _main_loop(self):
         logger.info(
-            "[%s] Starting S3 export/import cycle, endpoint=%s bucket=%s encrypted=%s",
-            self._log_prefix, self.s3["endpoint"], self.s3["bucket"], bool(self.encryption),
+            "[%s] Starting S3 export/import cycle, source=%s endpoint=%s bucket=%s encrypted=%s",
+            self._log_prefix, self.source_path, self.s3["endpoint"], self.s3["bucket"], bool(self.encryption),
         )
 
         try:
-            _ensure_table_exists(self.client, self.TABLE_NAME)
+            self.source_path = _ensure_source_exists(self.client, self.source_path)
         except Exception as e:
-            self._signal_fatal_error(f"Cannot ensure table exists: {e}")
+            self._signal_fatal_error(f"Cannot ensure source exists: {e}")
             return
 
         iteration = 0
@@ -826,7 +854,8 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         while not self._should_stop():
             iteration += 1
             run_id = f"{uuid.uuid1()}".replace("-", "_")
-            logger.info("[%s] === Iteration %d, run_id=%s ===", self._log_prefix, iteration, run_id[:16])
+            logger.info("[%s] === Iteration %d, run_id=%s source=%s ===",
+                        self._log_prefix, iteration, run_id[:16], self.source_path)
 
             if not self._start_export(run_id):
                 return
