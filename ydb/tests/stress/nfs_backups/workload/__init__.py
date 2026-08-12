@@ -23,8 +23,8 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
 from ydb.operation import OperationClient
-from ydb.export import ExportClient, ExportToS3Settings
-from ydb.import_client import ImportClient, ImportFromS3Settings
+from ydb.export import ExportClient, ExportToS3Settings, ExportToS3Operation
+from ydb.import_client import ImportClient, ImportFromS3Settings, ImportFromS3Operation
 from ydb import issues as ydb_issues
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ class FsExportClient:
     def __init__(self, driver):
         self._driver = driver
 
-    def export_to_fs(self, base_path, items, description="", number_of_retries=3):
+    def export_to_fs(self, base_path, items, description="", number_of_retries=3, encryption=None):
         request = ydb_export_pb2.ExportToFsRequest(
             settings=ydb_export_pb2.ExportToFsSettings(
                 base_path=base_path,
@@ -94,6 +94,7 @@ class FsExportClient:
             request.settings.description = description
         for src, dst in items:
             request.settings.items.add(source_path=src, destination_path=dst)
+        _apply_encryption_settings(request.settings, encryption)
         return self._driver(
             request,
             ydb_export_v1_pb2_grpc.ExportServiceStub,
@@ -115,7 +116,8 @@ class FsExportClient:
             (self._driver,),
         )
 
-    def import_from_fs(self, base_path, items=None, description="", number_of_retries=3, destination_path=""):
+    def import_from_fs(self, base_path, items=None, description="", number_of_retries=3,
+                       destination_path="", encryption=None):
         request = ydb_import_pb2.ImportFromFsRequest(
             settings=ydb_import_pb2.ImportFromFsSettings(
                 base_path=base_path,
@@ -129,6 +131,7 @@ class FsExportClient:
         if items:
             for src, dst in items:
                 request.settings.items.add(source_path=src, destination_path=dst)
+        _apply_encryption_settings(request.settings, encryption)
         return self._driver(
             request,
             ydb_import_v1_pb2_grpc.ImportServiceStub,
@@ -149,6 +152,55 @@ class FsExportClient:
             None,
             (self._driver,),
         )
+
+
+# Default 32-byte key for ChaCha20-Poly1305 / AES-256-GCM (same as unit tests).
+_DEFAULT_ENCRYPTION_KEY = b"Very very secret export key!!!!!"
+_KEY_LENGTHS = {
+    "AES-128-GCM": 16,
+    "AES-256-GCM": 32,
+    "ChaCha20-Poly1305": 32,
+}
+
+
+def _get_encryption_config():
+    """Return encryption config if enabled via EXPORT_ENCRYPTION_ENABLED / --encrypted."""
+    enabled = os.getenv("EXPORT_ENCRYPTION_ENABLED", "").lower() in ("1", "true", "yes")
+    if not enabled:
+        return None
+
+    algorithm = os.getenv("EXPORT_ENCRYPTION_ALGORITHM", "ChaCha20-Poly1305")
+    expected_len = _KEY_LENGTHS.get(algorithm)
+    if expected_len is None:
+        raise RuntimeError(
+            f"Unsupported EXPORT_ENCRYPTION_ALGORITHM={algorithm!r}. "
+            f"Supported: {', '.join(_KEY_LENGTHS)}"
+        )
+
+    hex_key = os.getenv("YDB_ENCRYPTION_KEY")
+    if hex_key:
+        try:
+            key = bytes.fromhex(hex_key)
+        except ValueError as e:
+            raise RuntimeError(f"Invalid YDB_ENCRYPTION_KEY hex: {e}") from e
+    else:
+        raw = os.getenv("EXPORT_ENCRYPTION_KEY")
+        key = raw.encode("utf-8") if raw is not None else _DEFAULT_ENCRYPTION_KEY
+
+    if len(key) != expected_len:
+        raise RuntimeError(
+            f"Encryption key length is {len(key)} bytes, but {algorithm} requires {expected_len}"
+        )
+
+    return {"algorithm": algorithm, "key": key}
+
+
+def _apply_encryption_settings(proto_settings, encryption):
+    if not encryption:
+        return
+    enc = proto_settings.encryption_settings
+    enc.encryption_algorithm = encryption["algorithm"]
+    enc.symmetric_key.key = encryption["key"]
 
 
 def _get_s3_config(default_source_prefix=None):
@@ -251,6 +303,7 @@ class NfsWorkloadBase(WorkloadBase):
         self.fatal_error_event = fatal_error_event
         self.fs_client = FsExportClient(self.client.driver)
         self.op_client = OperationClient(self.client.driver)
+        self.encryption = _get_encryption_config()
 
         self._stats = {
             "export_started": 0,
@@ -262,6 +315,12 @@ class NfsWorkloadBase(WorkloadBase):
         }
         if extra_stats:
             self._stats.update(extra_stats)
+        if self.encryption:
+            self._stats["encrypted"] = 1
+            logger.info(
+                "[%s] Encryption enabled: algorithm=%s key_len=%d",
+                workload_name, self.encryption["algorithm"], len(self.encryption["key"]),
+            )
 
     @property
     def _log_prefix(self):
@@ -413,6 +472,7 @@ class WorkloadNfsExportImport(NfsWorkloadBase):
                 base_path=base_path,
                 items=[(self.TABLE_NAME, import_dest)],
                 description=f"stress_import_{run_id}",
+                encryption=self.encryption,
             ),
             "Import start",
         )
@@ -456,6 +516,7 @@ class WorkloadNfsExportImport(NfsWorkloadBase):
                 base_path=base_path,
                 items=[(self.TABLE_NAME, self.TABLE_NAME)],
                 description=f"stress_export_{run_id}",
+                encryption=self.encryption,
             ),
             "Export start",
         )
@@ -475,7 +536,10 @@ class WorkloadNfsExportImport(NfsWorkloadBase):
         return True
 
     def _main_loop(self):
-        logger.info("[%s] Starting export/import cycle, nfs_mount_path=%s", self._log_prefix, self.nfs_mount_path)
+        logger.info(
+            "[%s] Starting export/import cycle, nfs_mount_path=%s encrypted=%s",
+            self._log_prefix, self.nfs_mount_path, bool(self.encryption),
+        )
 
         try:
             _ensure_table_exists(self.client, self.TABLE_NAME)
@@ -609,19 +673,13 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
 
         db_path = self.client.database.rstrip("/")
         import_dest = f"{db_path}/imported_s3_{run_id}"
-
-        settings = (
-            ImportFromS3Settings()
-            .with_endpoint(self.s3["endpoint"])
-            .with_bucket(self.s3["bucket"])
-            .with_access_key(self.s3["access_key"])
-            .with_secret_key(self.s3["secret_key"])
-            .with_number_of_retries(3)
-            .with_source_and_destination(s3_prefix, import_dest)
+        # Encrypted imports restore under destination_path using SchemaMapping.
+        cleanup_table = (
+            f"{import_dest}/{self.TABLE_NAME}" if self.encryption else import_dest
         )
 
         result = self._retry(
-            lambda: self.import_client.import_from_s3(settings),
+            lambda: self._import_from_s3(s3_prefix, import_dest),
             "Import start",
         )
 
@@ -644,7 +702,7 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         if status == "DONE":
             self._inc_stat("import_done")
             logger.info("[%s] Import DONE: op=%s, cleaning up", self._log_prefix, result.id[:16])
-            self._cleanup_imported_table(import_dest)
+            self._cleanup_imported_table(cleanup_table)
             self._cleanup_s3_prefix(s3_prefix)
         else:
             self._inc_stat("import_error")
@@ -655,21 +713,83 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
 
         return True
 
-    def _start_export(self, run_id: str) -> bool:
-        s3_prefix = f"stress_s3_export_{run_id}/{self.TABLE_NAME}"
+    def _export_to_s3(self, s3_prefix):
+        """Encrypted exports require common destination_prefix (+ SchemaMapping)."""
+        if not self.encryption:
+            settings = (
+                ExportToS3Settings()
+                .with_endpoint(self.s3["endpoint"])
+                .with_bucket(self.s3["bucket"])
+                .with_access_key(self.s3["access_key"])
+                .with_secret_key(self.s3["secret_key"])
+                .with_number_of_retries(3)
+                .with_source_and_destination(self.TABLE_NAME, s3_prefix)
+            )
+            return self.export_client.export_to_s3(settings)
 
-        settings = (
-            ExportToS3Settings()
-            .with_endpoint(self.s3["endpoint"])
-            .with_bucket(self.s3["bucket"])
-            .with_access_key(self.s3["access_key"])
-            .with_secret_key(self.s3["secret_key"])
-            .with_number_of_retries(3)
-            .with_source_and_destination(self.TABLE_NAME, s3_prefix)
+        request = ydb_export_pb2.ExportToS3Request(
+            settings=ydb_export_pb2.ExportToS3Settings(
+                endpoint=self.s3["endpoint"],
+                bucket=self.s3["bucket"],
+                access_key=self.s3["access_key"],
+                secret_key=self.s3["secret_key"],
+                scheme=2,  # HTTPS — same default as Python SDK
+                number_of_retries=3,
+                destination_prefix=s3_prefix,
+            )
+        )
+        request.settings.items.add(source_path=self.TABLE_NAME)
+        _apply_encryption_settings(request.settings, self.encryption)
+        return self.client.driver(
+            request,
+            ydb_export_v1_pb2_grpc.ExportServiceStub,
+            "ExportToS3",
+            ExportToS3Operation,
+            None,
+            (self.client.driver,),
         )
 
+    def _import_from_s3(self, s3_prefix, import_dest):
+        """Encrypted imports require common source_prefix + destination_path."""
+        if not self.encryption:
+            settings = (
+                ImportFromS3Settings()
+                .with_endpoint(self.s3["endpoint"])
+                .with_bucket(self.s3["bucket"])
+                .with_access_key(self.s3["access_key"])
+                .with_secret_key(self.s3["secret_key"])
+                .with_number_of_retries(3)
+                .with_source_and_destination(s3_prefix, import_dest)
+            )
+            return self.import_client.import_from_s3(settings)
+
+        request = ydb_import_pb2.ImportFromS3Request(
+            settings=ydb_import_pb2.ImportFromS3Settings(
+                endpoint=self.s3["endpoint"],
+                bucket=self.s3["bucket"],
+                access_key=self.s3["access_key"],
+                secret_key=self.s3["secret_key"],
+                scheme=2,  # HTTPS — same default as Python SDK
+                number_of_retries=3,
+                source_prefix=s3_prefix,
+                destination_path=import_dest,
+            )
+        )
+        _apply_encryption_settings(request.settings, self.encryption)
+        return self.client.driver(
+            request,
+            ydb_import_v1_pb2_grpc.ImportServiceStub,
+            "ImportFromS3",
+            ImportFromS3Operation,
+            None,
+            (self.client.driver,),
+        )
+
+    def _start_export(self, run_id: str) -> bool:
+        s3_prefix = f"stress_s3_export_{run_id}"
+
         result = self._retry(
-            lambda: self.export_client.export_to_s3(settings),
+            lambda: self._export_to_s3(s3_prefix),
             "Export start",
         )
 
@@ -685,14 +805,14 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         self._inc_stat("export_started")
         self.export_in_progress = (result.id, s3_prefix, run_id)
         progress = result.progress.name if result.progress is not None else "UNKNOWN"
-        logger.info("[%s] ExportToS3 started: op=%s progress=%s prefix=%s",
-                    self._log_prefix, result.id, progress, s3_prefix)
+        logger.info("[%s] ExportToS3 started: op=%s progress=%s prefix=%s encrypted=%s",
+                    self._log_prefix, result.id, progress, s3_prefix, bool(self.encryption))
         return True
 
     def _main_loop(self):
         logger.info(
-            "[%s] Starting S3 export/import cycle, endpoint=%s bucket=%s",
-            self._log_prefix, self.s3["endpoint"], self.s3["bucket"],
+            "[%s] Starting S3 export/import cycle, endpoint=%s bucket=%s encrypted=%s",
+            self._log_prefix, self.s3["endpoint"], self.s3["bucket"], bool(self.encryption),
         )
 
         try:
@@ -807,7 +927,8 @@ class WorkloadFullRoundtrip(NfsWorkloadBase):
                 pass
 
     def _main_loop(self):
-        logger.info("[%s] Started, nfs_mount_path=%s", self._log_prefix, self.nfs_mount_path)
+        logger.info("[%s] Started, nfs_mount_path=%s encrypted=%s",
+                    self._log_prefix, self.nfs_mount_path, bool(self.encryption))
 
         while not self._should_stop():
             self._inc_stat("iterations")
@@ -836,6 +957,7 @@ class WorkloadFullRoundtrip(NfsWorkloadBase):
                         base_path=base_path,
                         items=[(prefix, prefix)],
                         description=f"full_export_{run_id}",
+                        encryption=self.encryption,
                     ),
                     "Export start",
                 )
@@ -871,6 +993,7 @@ class WorkloadFullRoundtrip(NfsWorkloadBase):
                         base_path=base_path,
                         items=import_items,
                         description=f"full_import_{run_id}",
+                        encryption=self.encryption,
                     ),
                     "Import start",
                 )
