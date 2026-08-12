@@ -62,6 +62,12 @@ if __name__ == "__main__":
         help="Table or directory to export/import (relative to --database or absolute). "
              "Default: large_test_table. Also via EXPORT_SOURCE_PATH.",
     )
+    parser.add_argument(
+        "--compression",
+        default=None,
+        help="Export data compression codec: 'zstd' or 'zstd-N' (e.g. zstd-3). "
+             "Also via EXPORT_COMPRESSION. Import detects codec automatically.",
+    )
     args = parser.parse_args()
 
     if args.nfs_path:
@@ -74,6 +80,8 @@ if __name__ == "__main__":
         os.environ["EXPORT_ENCRYPTION_KEY"] = args.encryption_key
     if args.source_path:
         os.environ["EXPORT_SOURCE_PATH"] = args.source_path
+    if args.compression:
+        os.environ["EXPORT_COMPRESSION"] = args.compression
 
     logger = logging.getLogger("nfs_backups")
     logger.info("Connecting to %s database=%s", args.endpoint, args.database)

@@ -112,7 +112,8 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
     # ------------------------------------------------------------------
 
     def _main_loop(self):
-        logger.info("[%s] Started, encrypted=%s", self._log_prefix, bool(self.encryption))
+        logger.info("[%s] Started, encrypted=%s compression=%s",
+                    self._log_prefix, bool(self.encryption), self.compression)
 
         while not self._should_stop():
             self._inc_stat("iterations")
@@ -135,7 +136,9 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
 
                 # Export the whole prefix directory via the backend.
                 result = self._retry(
-                    lambda: self._backend.start_export(prefix, run_id, self.encryption),
+                    lambda: self._backend.start_export(
+                        prefix, run_id, self.encryption, self.compression,
+                    ),
                     "Export start",
                 )
                 if result is None or isinstance(result, Exception):

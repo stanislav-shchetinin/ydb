@@ -15,7 +15,7 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_export_v1_pb2_grpc
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
-from .helpers import apply_encryption_settings
+from .helpers import apply_encryption_settings, apply_compression_settings
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,8 @@ class FsExportClient:
     def __init__(self, driver):
         self._driver = driver
 
-    def export_to_fs(self, base_path, items, description="", number_of_retries=3, encryption=None):
+    def export_to_fs(self, base_path, items, description="", number_of_retries=3,
+                     encryption=None, compression=None):
         request = ydb_export_pb2.ExportToFsRequest(
             settings=ydb_export_pb2.ExportToFsSettings(
                 base_path=base_path,
@@ -75,6 +76,7 @@ class FsExportClient:
         for src, dst in items:
             request.settings.items.add(source_path=src, destination_path=dst)
         apply_encryption_settings(request.settings, encryption)
+        apply_compression_settings(request.settings, compression)
         return self._driver(
             request,
             ydb_export_v1_pb2_grpc.ExportServiceStub,

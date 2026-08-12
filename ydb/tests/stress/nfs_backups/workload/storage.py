@@ -25,7 +25,7 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_export_v1_pb2_grpc
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
-from .helpers import apply_encryption_settings, build_s3_export_prefix
+from .helpers import apply_encryption_settings, apply_compression_settings, build_s3_export_prefix
 from . import _fs_client as _fs_mod
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,8 @@ class StorageBackend:
       - cleanup_location removes backend-side export artifacts (S3 prefix / FS dir).
     """
 
-    def start_export(self, source_path: str, run_id: str, encryption: dict | None):
+    def start_export(self, source_path: str, run_id: str, encryption: dict | None,
+                     compression: str | None = None):
         """Start an export operation. Returns (op, location) where location identifies
         the storage destination (s3_prefix or fs base_path)."""
         raise NotImplementedError
@@ -127,13 +128,14 @@ class FsStorageBackend(StorageBackend):
         self._log_prefix = log_prefix
         self._fs = _fs_mod.FsExportClient(driver)
 
-    def start_export(self, source_path: str, run_id: str, encryption):
+    def start_export(self, source_path: str, run_id: str, encryption, compression=None):
         base_path = os.path.join(self._nfs_mount_path, f"export_{run_id}")
         op = self._fs.export_to_fs(
             base_path=base_path,
             items=[(source_path, source_path)],
             description=f"stress_export_{run_id}",
             encryption=encryption,
+            compression=compression,
         )
         return op, base_path
 
@@ -203,7 +205,7 @@ class S3StorageBackend(StorageBackend):
         endpoint = (s3_config.get("endpoint") or "").lower()
         self._scheme = 1 if endpoint.startswith("http://") else 2
 
-    def start_export(self, source_path: str, run_id: str, encryption):
+    def start_export(self, source_path: str, run_id: str, encryption, compression=None):
         s3_prefix = build_s3_export_prefix(run_id)
         request = ydb_export_pb2.ExportToS3Request(
             settings=ydb_export_pb2.ExportToS3Settings(
@@ -218,6 +220,7 @@ class S3StorageBackend(StorageBackend):
         )
         request.settings.items.add(source_path=source_path)
         apply_encryption_settings(request.settings, encryption)
+        apply_compression_settings(request.settings, compression)
         op = self._driver(
             request,
             ydb_export_v1_pb2_grpc.ExportServiceStub,

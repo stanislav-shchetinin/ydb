@@ -64,6 +64,35 @@ def apply_encryption_settings(proto_settings, encryption):
 
 
 # ---------------------------------------------------------------------------
+# Compression (export-only; import detects codec from SchemaMapping)
+# ---------------------------------------------------------------------------
+
+def get_compression_config():
+    """
+    Return compression codec string if set via EXPORT_COMPRESSION / --compression.
+    Supported values (per ydb_export.proto): 'zstd' or 'zstd-N' (e.g. 'zstd-3').
+    Returns None when compression is disabled.
+    """
+    raw = os.getenv("EXPORT_COMPRESSION", "").strip()
+    if not raw:
+        return None
+    # Accept 'zstd' or 'zstd-<level>'
+    if raw == "zstd" or (raw.startswith("zstd-") and raw[5:].isdigit()):
+        return raw
+    raise RuntimeError(
+        f"Unsupported EXPORT_COMPRESSION={raw!r}. "
+        "Supported: 'zstd' or 'zstd-N' (e.g. 'zstd-3')."
+    )
+
+
+def apply_compression_settings(proto_settings, compression):
+    """Write compression codec into a proto export settings object."""
+    if not compression:
+        return
+    proto_settings.compression = compression
+
+
+# ---------------------------------------------------------------------------
 # S3 config
 # ---------------------------------------------------------------------------
 
