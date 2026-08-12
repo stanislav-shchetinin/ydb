@@ -36,10 +36,10 @@ _S3_WORKLOAD_NAMES = {"single_table_s3", "full_roundtrip_s3"}
 
 
 def _make_single_table(client, stop, nfs_mount_path, fatal_error_event):
-    backend = FsStorageBackend(client.driver, nfs_mount_path, log_prefix="single_table")
+    backend = FsStorageBackend(client.driver, nfs_mount_path, log_prefix="nfs_export_import")
     return ExportImportRoundtripWorkload(
         client, stop, backend, fatal_error_event,
-        workload_name="single_table",
+        workload_name="nfs_export_import",
         import_dest_prefix="imported",
     )
 
@@ -47,10 +47,10 @@ def _make_single_table(client, stop, nfs_mount_path, fatal_error_event):
 def _make_single_table_s3(client, stop, nfs_mount_path, fatal_error_event):
     source = get_export_source_path("large_test_table")
     s3 = get_s3_config(default_source_prefix=source.split("/")[-1])
-    backend = S3StorageBackend(client.driver, s3, log_prefix="single_table_s3")
+    backend = S3StorageBackend(client.driver, s3, log_prefix="s3_export_import")
     return ExportImportRoundtripWorkload(
         client, stop, backend, fatal_error_event,
-        workload_name="single_table_s3",
+        workload_name="s3_export_import",
         import_dest_prefix="imported_s3",
     )
 
@@ -153,12 +153,15 @@ class WorkloadRunner:
                 break
 
             elapsed = int(time.time() - started_at)
+            logger.info("[runner] Elapsed %ds", elapsed)
+            print(f"[runner] Elapsed {elapsed}s", file=sys.stderr)
             for w in workloads:
-                stat = w.get_stat()
-                msg = f"[runner] Elapsed {elapsed}s | {w.name}: {stat}"
-                logger.info(msg)
-                print(msg, file=sys.stderr)
-            time.sleep(10)
+                # Always print a stable one-line stats summary, e.g.:
+                # s3_export_import: export_started=2, export_done=2, ...
+                line = f"{w.name}: {w.get_stat()}"
+                logger.info(line)
+                print(line, file=sys.stderr)
+            time.sleep(30)
 
         logger.info("[runner] Sending stop signal")
         stop.set()

@@ -103,7 +103,7 @@ class ExportImportWorkloadBase(WorkloadBase):
             if status is not None:
                 self._op_forget(op_id)
                 return status
-            time.sleep(1)
+            time.sleep(30)
 
     def _retry(self, action, description):
         """Retry action indefinitely on transient errors, until stopped or success."""
