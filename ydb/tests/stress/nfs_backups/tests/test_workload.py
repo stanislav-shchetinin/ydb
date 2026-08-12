@@ -15,6 +15,7 @@ class TestYdbNfsWorkload(StressFixture):
                 "enable_export_auto_dropping": True,
                 "enable_changefeeds_export": True,
                 "enable_encrypted_export": True,
+                "enable_index_materialization": True,
             }
         )
 

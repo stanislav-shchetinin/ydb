@@ -15,6 +15,7 @@ from ydb.tests.stress.common.common import WorkloadBase
 from .helpers import (
     get_encryption_config,
     get_compression_config,
+    get_include_index_data_config,
     get_export_source_path,
     ensure_source_exists,
     snapshot_table_row_counts,
@@ -53,6 +54,7 @@ class ExportImportWorkloadBase(WorkloadBase):
         self.op_client = OperationClient(client.driver)
         self.encryption = get_encryption_config()
         self.compression = get_compression_config()
+        self.include_index_data = get_include_index_data_config()
 
         self._stats = {
             "export_started": 0,
@@ -73,6 +75,13 @@ class ExportImportWorkloadBase(WorkloadBase):
         if self.compression:
             self._stats["compression"] = self.compression
             logger.info("[%s] Compression enabled: %s", workload_name, self.compression)
+        if self.include_index_data:
+            self._stats["include_index_data"] = 1
+            logger.info(
+                "[%s] Materialized index data: export include_index_data=true, "
+                "import index_population_mode=IMPORT",
+                workload_name,
+            )
 
     @property
     def _log_prefix(self):
@@ -201,6 +210,7 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
         result = self._retry(
             lambda: self._backend.start_export(
                 self.source_path, run_id, self.encryption, self.compression,
+                self.include_index_data,
             ),
             "Export start",
         )
@@ -236,7 +246,9 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
         import_dest = f"{db_path}/{self._import_dest_prefix}_{run_id}"
 
         result = self._retry(
-            lambda: self._backend.start_import(location, import_dest, run_id, self.encryption),
+            lambda: self._backend.start_import(
+                location, import_dest, run_id, self.encryption, self.include_index_data,
+            ),
             "Import start",
         )
         if result is None:
@@ -271,8 +283,9 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
 
     def _main_loop(self):
         logger.info(
-            "[%s] Starting roundtrip, source=%s encrypted=%s compression=%s",
+            "[%s] Starting roundtrip, source=%s encrypted=%s compression=%s include_index_data=%s",
             self._log_prefix, self.source_path, bool(self.encryption), self.compression,
+            self.include_index_data,
         )
 
         try:

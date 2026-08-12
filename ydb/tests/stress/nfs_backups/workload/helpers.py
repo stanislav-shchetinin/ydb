@@ -93,6 +93,41 @@ def apply_compression_settings(proto_settings, compression):
 
 
 # ---------------------------------------------------------------------------
+# Materialized index data (export include_index_data + import population mode)
+# ---------------------------------------------------------------------------
+
+def get_include_index_data_config():
+    """
+    Whether to export materialized index data and restore from it on import.
+    Enabled via EXPORT_INCLUDE_INDEX_DATA / --include-index-data.
+    """
+    return os.getenv("EXPORT_INCLUDE_INDEX_DATA", "").lower() in ("1", "true", "yes")
+
+
+def apply_include_index_data(proto_settings, include_index_data):
+    """Set include_index_data on export settings."""
+    if include_index_data:
+        proto_settings.include_index_data = True
+
+
+def apply_index_population_mode(proto_settings, include_index_data):
+    """
+    Set index_population_mode on import settings.
+    When export included index data, restore from it (IMPORT); otherwise leave default (BUILD).
+    """
+    if not include_index_data:
+        return
+    # ImportFromS3Settings.IndexPopulationMode is shared by FS/S3 import settings.
+    try:
+        from ydb.public.api.protos import ydb_import_pb2
+    except ImportError:
+        from contrib.ydb.public.api.protos import ydb_import_pb2
+    proto_settings.index_population_mode = (
+        ydb_import_pb2.ImportFromS3Settings.INDEX_POPULATION_MODE_IMPORT
+    )
+
+
+# ---------------------------------------------------------------------------
 # S3 config
 # ---------------------------------------------------------------------------
 

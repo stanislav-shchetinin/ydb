@@ -112,8 +112,9 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
     # ------------------------------------------------------------------
 
     def _main_loop(self):
-        logger.info("[%s] Started, encrypted=%s compression=%s",
-                    self._log_prefix, bool(self.encryption), self.compression)
+        logger.info("[%s] Started, encrypted=%s compression=%s include_index_data=%s",
+                    self._log_prefix, bool(self.encryption), self.compression,
+                    self.include_index_data)
 
         while not self._should_stop():
             self._inc_stat("iterations")
@@ -138,6 +139,7 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 result = self._retry(
                     lambda: self._backend.start_export(
                         prefix, run_id, self.encryption, self.compression,
+                        self.include_index_data,
                     ),
                     "Export start",
                 )
@@ -169,7 +171,10 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 import_dest = f"{db_path}/imp_{run_id}"
 
                 imp_result = self._retry(
-                    lambda: self._backend.start_import(location, import_dest, run_id, self.encryption),
+                    lambda: self._backend.start_import(
+                        location, import_dest, run_id, self.encryption,
+                        self.include_index_data,
+                    ),
                     "Import start",
                 )
                 if imp_result is None or isinstance(imp_result, Exception):

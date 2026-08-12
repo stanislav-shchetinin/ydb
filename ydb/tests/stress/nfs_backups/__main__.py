@@ -68,6 +68,13 @@ if __name__ == "__main__":
         help="Export data compression codec: 'zstd' or 'zstd-N' (e.g. zstd-3). "
              "Also via EXPORT_COMPRESSION. Import detects codec automatically.",
     )
+    parser.add_argument(
+        "--include-index-data",
+        action="store_true",
+        help="Export materialized secondary index data and restore from it on import "
+             "(include_index_data + index_population_mode=IMPORT). "
+             "Also via EXPORT_INCLUDE_INDEX_DATA. Requires EnableIndexMaterialization on the cluster.",
+    )
     args = parser.parse_args()
 
     if args.nfs_path:
@@ -82,6 +89,8 @@ if __name__ == "__main__":
         os.environ["EXPORT_SOURCE_PATH"] = args.source_path
     if args.compression:
         os.environ["EXPORT_COMPRESSION"] = args.compression
+    if args.include_index_data:
+        os.environ["EXPORT_INCLUDE_INDEX_DATA"] = "1"
 
     logger = logging.getLogger("nfs_backups")
     logger.info("Connecting to %s database=%s", args.endpoint, args.database)

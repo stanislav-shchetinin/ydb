@@ -25,7 +25,13 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_export_v1_pb2_grpc
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
-from .helpers import apply_encryption_settings, apply_compression_settings, build_s3_export_prefix
+from .helpers import (
+    apply_encryption_settings,
+    apply_compression_settings,
+    apply_include_index_data,
+    apply_index_population_mode,
+    build_s3_export_prefix,
+)
 from . import _fs_client as _fs_mod
 
 logger = logging.getLogger(__name__)
@@ -73,7 +79,7 @@ class StorageBackend:
     """
 
     def start_export(self, source_path: str, run_id: str, encryption: dict | None,
-                     compression: str | None = None):
+                     compression: str | None = None, include_index_data: bool = False):
         """Start an export operation. Returns (op, location) where location identifies
         the storage destination (s3_prefix or fs base_path)."""
         raise NotImplementedError
@@ -82,7 +88,8 @@ class StorageBackend:
         """Return terminal status or None if still running."""
         raise NotImplementedError
 
-    def start_import(self, location: str, import_dest: str, run_id: str, encryption: dict | None):
+    def start_import(self, location: str, import_dest: str, run_id: str, encryption: dict | None,
+                     include_index_data: bool = False):
         """Start an import operation from location into import_dest. Returns op."""
         raise NotImplementedError
 
@@ -128,7 +135,8 @@ class FsStorageBackend(StorageBackend):
         self._log_prefix = log_prefix
         self._fs = _fs_mod.FsExportClient(driver)
 
-    def start_export(self, source_path: str, run_id: str, encryption, compression=None):
+    def start_export(self, source_path: str, run_id: str, encryption, compression=None,
+                     include_index_data=False):
         base_path = os.path.join(self._nfs_mount_path, f"export_{run_id}")
         op = self._fs.export_to_fs(
             base_path=base_path,
@@ -136,6 +144,7 @@ class FsStorageBackend(StorageBackend):
             description=f"stress_export_{run_id}",
             encryption=encryption,
             compression=compression,
+            include_index_data=include_index_data,
         )
         return op, base_path
 
@@ -155,12 +164,14 @@ class FsStorageBackend(StorageBackend):
             logger.warning("[%s][fs][export] Poll op=%s transient error: %s", self._log_prefix, op_id, e)
             return None
 
-    def start_import(self, location: str, import_dest: str, run_id: str, encryption):
+    def start_import(self, location: str, import_dest: str, run_id: str, encryption,
+                     include_index_data=False):
         op = self._fs.import_from_fs(
             base_path=location,
             destination_path=import_dest,
             description=f"stress_import_{run_id}",
             encryption=encryption,
+            include_index_data=include_index_data,
         )
         return op
 
@@ -205,7 +216,8 @@ class S3StorageBackend(StorageBackend):
         endpoint = (s3_config.get("endpoint") or "").lower()
         self._scheme = 1 if endpoint.startswith("http://") else 2
 
-    def start_export(self, source_path: str, run_id: str, encryption, compression=None):
+    def start_export(self, source_path: str, run_id: str, encryption, compression=None,
+                     include_index_data=False):
         s3_prefix = build_s3_export_prefix(run_id)
         request = ydb_export_pb2.ExportToS3Request(
             settings=ydb_export_pb2.ExportToS3Settings(
@@ -221,6 +233,7 @@ class S3StorageBackend(StorageBackend):
         request.settings.items.add(source_path=source_path)
         apply_encryption_settings(request.settings, encryption)
         apply_compression_settings(request.settings, compression)
+        apply_include_index_data(request.settings, include_index_data)
         op = self._driver(
             request,
             ydb_export_v1_pb2_grpc.ExportServiceStub,
@@ -246,7 +259,8 @@ class S3StorageBackend(StorageBackend):
             logger.warning("[%s][s3][export] Poll op=%s transient error: %s", self._log_prefix, op_id, e)
             return None
 
-    def start_import(self, location: str, import_dest: str, run_id: str, encryption):
+    def start_import(self, location: str, import_dest: str, run_id: str, encryption,
+                     include_index_data=False):
         request = ydb_import_pb2.ImportFromS3Request(
             settings=ydb_import_pb2.ImportFromS3Settings(
                 endpoint=self._s3["endpoint"],
@@ -260,6 +274,7 @@ class S3StorageBackend(StorageBackend):
             )
         )
         apply_encryption_settings(request.settings, encryption)
+        apply_index_population_mode(request.settings, include_index_data)
         op = self._driver(
             request,
             ydb_import_v1_pb2_grpc.ImportServiceStub,

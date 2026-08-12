@@ -15,7 +15,12 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_export_v1_pb2_grpc
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
-from .helpers import apply_encryption_settings, apply_compression_settings
+from .helpers import (
+    apply_encryption_settings,
+    apply_compression_settings,
+    apply_include_index_data,
+    apply_index_population_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +69,7 @@ class FsExportClient:
         self._driver = driver
 
     def export_to_fs(self, base_path, items, description="", number_of_retries=3,
-                     encryption=None, compression=None):
+                     encryption=None, compression=None, include_index_data=False):
         request = ydb_export_pb2.ExportToFsRequest(
             settings=ydb_export_pb2.ExportToFsSettings(
                 base_path=base_path,
@@ -77,6 +82,7 @@ class FsExportClient:
             request.settings.items.add(source_path=src, destination_path=dst)
         apply_encryption_settings(request.settings, encryption)
         apply_compression_settings(request.settings, compression)
+        apply_include_index_data(request.settings, include_index_data)
         return self._driver(
             request,
             ydb_export_v1_pb2_grpc.ExportServiceStub,
@@ -99,7 +105,7 @@ class FsExportClient:
         )
 
     def import_from_fs(self, base_path, items=None, description="", number_of_retries=3,
-                       destination_path="", encryption=None):
+                       destination_path="", encryption=None, include_index_data=False):
         request = ydb_import_pb2.ImportFromFsRequest(
             settings=ydb_import_pb2.ImportFromFsSettings(
                 base_path=base_path,
@@ -114,6 +120,7 @@ class FsExportClient:
             for src, dst in items:
                 request.settings.items.add(source_path=src, destination_path=dst)
         apply_encryption_settings(request.settings, encryption)
+        apply_index_population_mode(request.settings, include_index_data)
         return self._driver(
             request,
             ydb_import_v1_pb2_grpc.ImportServiceStub,
