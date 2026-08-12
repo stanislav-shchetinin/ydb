@@ -23,6 +23,8 @@ except ImportError:
     from contrib.ydb.public.api.grpc import ydb_import_v1_pb2_grpc
 
 from ydb.operation import OperationClient
+from ydb.export import ExportClient, ExportToS3Settings
+from ydb.import_client import ImportClient, ImportFromS3Settings
 from ydb import issues as ydb_issues
 
 logger = logging.getLogger(__name__)
@@ -149,23 +151,13 @@ class FsExportClient:
         )
 
 
-def _ensure_table_exists(client, table_name):
-    """Check if table exists; if not, import it from S3 using env vars."""
-    try:
-        result = client.query(
-            f"SELECT COUNT(*) AS cnt FROM `{table_name}` LIMIT 1;",
-            False,
-        )
-        logger.info("[setup] Table '%s' already exists", table_name)
-        return
-    except Exception:
-        logger.info("[setup] Table '%s' not found, will try to import from S3", table_name)
-
+def _get_s3_config(default_source_prefix=None):
+    """Read S3 credentials from the same env vars used to preload large_test_table."""
     s3_endpoint = os.getenv("S3_ENDPOINT")
     s3_bucket = os.getenv("S3_BUCKET")
     s3_access_key = os.getenv("S3_ACCESS_KEY_ID")
     s3_secret_key = os.getenv("S3_ACCESS_KEY_SECRET")
-    s3_source_prefix = os.getenv("S3_SOURCE_PREFIX", table_name)
+    s3_source_prefix = os.getenv("S3_SOURCE_PREFIX", default_source_prefix)
 
     if not all([s3_endpoint, s3_bucket, s3_access_key, s3_secret_key]):
         missing = [
@@ -176,29 +168,52 @@ def _ensure_table_exists(client, table_name):
                 ("S3_ACCESS_KEY_SECRET", s3_secret_key),
             ] if not val
         ]
+        raise RuntimeError(f"Missing S3 env vars: {', '.join(missing)}")
+
+    return {
+        "endpoint": s3_endpoint,
+        "bucket": s3_bucket,
+        "access_key": s3_access_key,
+        "secret_key": s3_secret_key,
+        "source_prefix": s3_source_prefix,
+    }
+
+
+def _ensure_table_exists(client, table_name):
+    """Check if table exists; if not, import it from S3 using env vars."""
+    try:
+        client.query(
+            f"SELECT COUNT(*) AS cnt FROM `{table_name}` LIMIT 1;",
+            False,
+        )
+        logger.info("[setup] Table '%s' already exists", table_name)
+        return
+    except Exception:
+        logger.info("[setup] Table '%s' not found, will try to import from S3", table_name)
+
+    s3 = _get_s3_config(default_source_prefix=table_name)
+    if not s3["source_prefix"]:
         raise RuntimeError(
             f"Table '{table_name}' does not exist and cannot import from S3: "
-            f"missing env vars: {', '.join(missing)}"
+            "S3_SOURCE_PREFIX is not set"
         )
-
-    from ydb.import_client import ImportClient, ImportFromS3Settings
 
     db_path = client.database.rstrip("/")
     dest_path = f"{db_path}/{table_name}"
 
     settings = (
         ImportFromS3Settings()
-        .with_endpoint(s3_endpoint)
-        .with_bucket(s3_bucket)
-        .with_access_key(s3_access_key)
-        .with_secret_key(s3_secret_key)
+        .with_endpoint(s3["endpoint"])
+        .with_bucket(s3["bucket"])
+        .with_access_key(s3["access_key"])
+        .with_secret_key(s3["secret_key"])
         .with_number_of_retries(3)
-        .with_source_and_destination(s3_source_prefix, dest_path)
+        .with_source_and_destination(s3["source_prefix"], dest_path)
     )
 
     logger.info(
         "[setup] Importing table from S3: endpoint=%s bucket=%s prefix=%s -> %s",
-        s3_endpoint, s3_bucket, s3_source_prefix, dest_path,
+        s3["endpoint"], s3["bucket"], s3["source_prefix"], dest_path,
     )
 
     import_client = ImportClient(client.driver)
@@ -488,6 +503,224 @@ class WorkloadNfsExportImport(NfsWorkloadBase):
         return [self._main_loop]
 
 
+class WorkloadS3ExportImport(NfsWorkloadBase):
+    """Export/import roundtrip for large_test_table via S3 (same creds as table preload)."""
+
+    TABLE_NAME = "large_test_table"
+
+    def __init__(self, client, stop, nfs_mount_path, fatal_error_event):
+        super().__init__(client, stop, nfs_mount_path, fatal_error_event, "s3_export_import")
+        self.s3 = _get_s3_config(default_source_prefix=self.TABLE_NAME)
+        self.export_client = ExportClient(self.client.driver)
+        self.import_client = ImportClient(self.client.driver)
+        self.export_in_progress = None  # (export_id, s3_prefix, run_id) or None
+        self.pending_import = None  # (s3_prefix, run_id) or None
+
+    def _poll_export(self, export_id):
+        try:
+            op = self.export_client.get_export_to_s3_operation(export_id)
+            progress = op.progress.name if op.progress is not None else "UNKNOWN"
+            logger.debug("[%s][export] Poll op=%s progress=%s", self._log_prefix, export_id, progress)
+            if progress in ("DONE", "CANCELLED", "UNSPECIFIED"):
+                return progress if progress != "UNSPECIFIED" else "DONE"
+            return None
+        except ydb_issues.NotFound:
+            logger.debug("[%s][export] Poll op=%s: NOT_FOUND (treating as DONE)",
+                         self._log_prefix, export_id)
+            return "DONE"
+        except _TRANSIENT_ERRORS as e:
+            logger.warning("[%s][export] Poll op=%s transient error (will retry): %s",
+                           self._log_prefix, export_id, e)
+            return None
+
+    def _poll_import(self, import_id):
+        try:
+            op = self.import_client.get_import_from_s3_operation(import_id)
+            progress = op.progress.name if op.progress is not None else "UNKNOWN"
+            logger.debug("[%s][import] Poll op=%s progress=%s", self._log_prefix, import_id, progress)
+            if progress in ("DONE", "CANCELLED", "UNSPECIFIED"):
+                return progress if progress != "UNSPECIFIED" else "DONE"
+            return None
+        except ydb_issues.NotFound:
+            logger.debug("[%s][import] Poll op=%s: NOT_FOUND (treating as DONE)",
+                         self._log_prefix, import_id)
+            return "DONE"
+        except _TRANSIENT_ERRORS as e:
+            logger.warning("[%s][import] Poll op=%s transient error (will retry): %s",
+                           self._log_prefix, import_id, e)
+            return None
+
+    def _cleanup_imported_table(self, table_name: str):
+        try:
+            self.client.query(f"DROP TABLE `{table_name}`;", True)
+            logger.info("[%s][cleanup] Dropped imported table: %s", self._log_prefix, table_name)
+        except Exception as e:
+            logger.warning("[%s][cleanup] Failed to drop table %s: %s", self._log_prefix, table_name, e)
+
+    def _cleanup_s3_prefix(self, prefix: str):
+        try:
+            import boto3
+            resource = boto3.resource(
+                "s3",
+                endpoint_url=self.s3["endpoint"],
+                aws_access_key_id=self.s3["access_key"],
+                aws_secret_access_key=self.s3["secret_key"],
+                region_name="us-east-1",
+            )
+            bucket = resource.Bucket(self.s3["bucket"])
+            deleted = 0
+            for obj in bucket.objects.filter(Prefix=prefix):
+                obj.delete()
+                deleted += 1
+            logger.info("[%s][cleanup] Removed %d objects under s3://%s/%s",
+                        self._log_prefix, deleted, self.s3["bucket"], prefix)
+        except Exception as e:
+            logger.warning("[%s][cleanup] Failed to remove s3 prefix %s: %s",
+                           self._log_prefix, prefix, e)
+
+    def _wait_for_export(self) -> bool:
+        if self.export_in_progress is None:
+            return True
+
+        export_id, s3_prefix, run_id = self.export_in_progress
+        status = self._wait_op(export_id, self._poll_export)
+        self.export_in_progress = None
+        if status is None:
+            return True
+
+        if status == "DONE":
+            self._inc_stat("export_done")
+            logger.info("[%s] Export DONE: op=%s, queuing import", self._log_prefix, export_id[:16])
+            self.pending_import = (s3_prefix, run_id)
+            return True
+
+        self._inc_stat("export_error")
+        logger.error("[%s] Export FAILED: op=%s status=%s prefix=%s. NOT cleaning up for investigation.",
+                     self._log_prefix, export_id[:16], status, s3_prefix)
+        self._signal_fatal_error(f"Export failed with status={status}, op={export_id}")
+        return False
+
+    def _process_pending_import(self) -> bool:
+        if self.pending_import is None:
+            return True
+
+        s3_prefix, run_id = self.pending_import
+        self.pending_import = None
+
+        db_path = self.client.database.rstrip("/")
+        import_dest = f"{db_path}/imported_s3_{run_id}"
+
+        settings = (
+            ImportFromS3Settings()
+            .with_endpoint(self.s3["endpoint"])
+            .with_bucket(self.s3["bucket"])
+            .with_access_key(self.s3["access_key"])
+            .with_secret_key(self.s3["secret_key"])
+            .with_number_of_retries(3)
+            .with_source_and_destination(s3_prefix, import_dest)
+        )
+
+        result = self._retry(
+            lambda: self.import_client.import_from_s3(settings),
+            "Import start",
+        )
+
+        if result is None or isinstance(result, Exception):
+            if self._should_stop():
+                return True
+            self._inc_stat("import_error")
+            logger.error("[%s] Import start failed after %d attempts for run_id=%s: %s",
+                         self._log_prefix, self.MAX_RETRIES, run_id[:16], result)
+            self._signal_fatal_error(f"Import start failed after retries for run_id={run_id}: {result}")
+            return False
+
+        self._inc_stat("import_started")
+        logger.info("[%s] ImportFromS3 started: op=%s", self._log_prefix, result.id)
+
+        status = self._wait_op(result.id, self._poll_import)
+        if status is None:
+            return True
+
+        if status == "DONE":
+            self._inc_stat("import_done")
+            logger.info("[%s] Import DONE: op=%s, cleaning up", self._log_prefix, result.id[:16])
+            self._cleanup_imported_table(import_dest)
+            self._cleanup_s3_prefix(s3_prefix)
+        else:
+            self._inc_stat("import_error")
+            logger.error("[%s] Import FAILED: op=%s status=%s. NOT cleaning up for investigation.",
+                         self._log_prefix, result.id[:16], status)
+            self._signal_fatal_error(f"Import failed with status={status}, op={result.id}")
+            return False
+
+        return True
+
+    def _start_export(self, run_id: str) -> bool:
+        s3_prefix = f"stress_s3_export_{run_id}/{self.TABLE_NAME}"
+
+        settings = (
+            ExportToS3Settings()
+            .with_endpoint(self.s3["endpoint"])
+            .with_bucket(self.s3["bucket"])
+            .with_access_key(self.s3["access_key"])
+            .with_secret_key(self.s3["secret_key"])
+            .with_number_of_retries(3)
+            .with_source_and_destination(self.TABLE_NAME, s3_prefix)
+        )
+
+        result = self._retry(
+            lambda: self.export_client.export_to_s3(settings),
+            "Export start",
+        )
+
+        if result is None or isinstance(result, Exception):
+            if self._should_stop():
+                return False
+            self._inc_stat("export_error")
+            logger.error("[%s] Export start failed after %d attempts for run_id=%s: %s",
+                         self._log_prefix, self.MAX_RETRIES, run_id[:16], result)
+            self._signal_fatal_error(f"Export start failed after retries for run_id={run_id}: {result}")
+            return False
+
+        self._inc_stat("export_started")
+        self.export_in_progress = (result.id, s3_prefix, run_id)
+        progress = result.progress.name if result.progress is not None else "UNKNOWN"
+        logger.info("[%s] ExportToS3 started: op=%s progress=%s prefix=%s",
+                    self._log_prefix, result.id, progress, s3_prefix)
+        return True
+
+    def _main_loop(self):
+        logger.info(
+            "[%s] Starting S3 export/import cycle, endpoint=%s bucket=%s",
+            self._log_prefix, self.s3["endpoint"], self.s3["bucket"],
+        )
+
+        try:
+            _ensure_table_exists(self.client, self.TABLE_NAME)
+        except Exception as e:
+            self._signal_fatal_error(f"Cannot ensure table exists: {e}")
+            return
+
+        iteration = 0
+
+        while not self._should_stop():
+            iteration += 1
+            run_id = f"{uuid.uuid1()}".replace("-", "_")
+            logger.info("[%s] === Iteration %d, run_id=%s ===", self._log_prefix, iteration, run_id[:16])
+
+            if not self._start_export(run_id):
+                return
+            if not self._wait_for_export():
+                return
+            if not self._process_pending_import():
+                return
+
+        logger.info("[%s] Stopped after %d iterations", self._log_prefix, iteration)
+
+    def get_workload_thread_funcs(self):
+        return [self._main_loop]
+
+
 class WorkloadFullRoundtrip(NfsWorkloadBase):
     NUM_TABLES = 5
     NUM_ROWS = 100
@@ -690,6 +923,7 @@ class WorkloadFullRoundtrip(NfsWorkloadBase):
 WORKLOADS = {
     "full_roundtrip": WorkloadFullRoundtrip,
     "single_table": WorkloadNfsExportImport,
+    "single_table_s3": WorkloadS3ExportImport,
 }
 
 DEFAULT_WORKLOAD = "full_roundtrip"

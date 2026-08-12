@@ -5,6 +5,7 @@ PY_SRCS(
 )
 
 PEERDIR(
+    contrib/python/boto3
     ydb/tests/library
     ydb/tests/stress/common
     ydb/public/sdk/python

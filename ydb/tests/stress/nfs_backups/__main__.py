@@ -16,7 +16,7 @@ logging.basicConfig(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="NFS export/import stress workload",
+        description="NFS/S3 export/import stress workload",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--endpoint", default="localhost:2135", help="An endpoint to be used")
