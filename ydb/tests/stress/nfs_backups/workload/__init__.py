@@ -252,6 +252,72 @@ def _resolve_db_path(client, path):
     return f"{client.database.rstrip('/')}/{path}"
 
 
+def _rel_to_database(client, full_path):
+    """Path relative to database root (no leading slash)."""
+    db = client.database.rstrip("/")
+    full = full_path.rstrip("/")
+    prefix = db + "/"
+    if full.startswith(prefix):
+        return full[len(prefix):]
+    if full == db:
+        return ""
+    return full.lstrip("/")
+
+
+def _list_tables_recursive(client, path):
+    """Return full paths of row/column tables under path (path itself may be a table)."""
+    desc = client.describe(path)
+    if desc is None:
+        return []
+    if desc.is_table() or desc.is_column_table():
+        return [path]
+    if not desc.is_directory():
+        return []
+
+    tables = []
+    listing = client.driver.scheme_client.list_directory(path)
+    for entry in listing.children:
+        if entry.name.startswith("."):
+            continue
+        entry_path = f"{path.rstrip('/')}/{entry.name}"
+        if entry.is_table() or entry.is_column_table():
+            tables.append(entry_path)
+        elif entry.is_directory():
+            tables.extend(_list_tables_recursive(client, entry_path))
+    return tables
+
+
+def _table_row_count(client, table_path):
+    result = client.query(f"SELECT COUNT(*) AS cnt FROM `{table_path}`;", False)
+    if not result or not result[0].rows:
+        raise RuntimeError(f"COUNT(*) returned empty result for `{table_path}`")
+    row = result[0].rows[0]
+    if hasattr(row, "cnt"):
+        return int(row.cnt)
+    try:
+        return int(row["cnt"])
+    except Exception:
+        return int(row[0])
+
+
+def _snapshot_table_row_counts(client, source_path):
+    """
+    Collect {db_relative_path: row_count} for all tables under source_path.
+    Keys are relative to the database root — same layout used under import destination_path.
+    """
+    tables = _list_tables_recursive(client, source_path)
+    if not tables:
+        raise RuntimeError(f"No tables found under source path '{source_path}'")
+
+    counts = {}
+    for full in sorted(tables):
+        rel = _rel_to_database(client, full)
+        cnt = _table_row_count(client, full)
+        counts[rel] = cnt
+        logger.info("[setup] Source table `%s` row_count=%d", rel, cnt)
+    return counts
+
+
 def _ensure_source_exists(client, source_path):
     """Ensure export source exists. For default large_test_table, may preload from S3."""
     full_path = _resolve_db_path(client, source_path)
@@ -624,9 +690,12 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         self.import_client = ImportClient(self.client.driver)
         self.export_in_progress = None  # (export_id, s3_prefix, run_id) or None
         self.pending_import = None  # (s3_prefix, run_id) or None
+        self.source_row_counts = None  # {db_relative_path: count}
         # Prefer HTTP if endpoint looks like plain http://
         endpoint = (self.s3["endpoint"] or "").lower()
         self.s3_scheme = 1 if endpoint.startswith("http://") else 2
+        self._stats["row_count_ok"] = 0
+        self._stats["row_count_mismatch"] = 0
 
     def _poll_export(self, export_id):
         try:
@@ -718,6 +787,44 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         self._signal_fatal_error(f"Export failed with status={status}, op={export_id}")
         return False
 
+    def _verify_imported_row_counts(self, import_dest: str) -> bool:
+        """Compare imported tables' COUNT(*) with snapshot taken at workload start."""
+        if not self.source_row_counts:
+            self._signal_fatal_error("source_row_counts is empty, nothing to verify")
+            return False
+
+        mismatches = []
+        for rel, expected in sorted(self.source_row_counts.items()):
+            imported_path = f"{import_dest.rstrip('/')}/{rel}"
+            try:
+                actual = _table_row_count(self.client, imported_path)
+            except Exception as e:
+                mismatches.append(f"{rel}: cannot COUNT imported `{imported_path}`: {e}")
+                continue
+            if actual != expected:
+                mismatches.append(
+                    f"{rel}: expected={expected} actual={actual} (imported `{imported_path}`)"
+                )
+            else:
+                logger.info(
+                    "[%s][verify] OK `%s` row_count=%d",
+                    self._log_prefix, rel, actual,
+                )
+
+        if mismatches:
+            self._inc_stat("row_count_mismatch")
+            msg = "Row count mismatch after import:\n  " + "\n  ".join(mismatches)
+            logger.error("[%s] %s", self._log_prefix, msg)
+            self._signal_fatal_error(msg)
+            return False
+
+        self._inc_stat("row_count_ok")
+        logger.info(
+            "[%s][verify] All %d imported tables match source row counts",
+            self._log_prefix, len(self.source_row_counts),
+        )
+        return True
+
     def _process_pending_import(self) -> bool:
         if self.pending_import is None:
             return True
@@ -749,18 +856,22 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
         if status is None:
             return True
 
-        if status == "DONE":
-            self._inc_stat("import_done")
-            logger.info("[%s] Import DONE: op=%s, cleaning up", self._log_prefix, result.id[:16])
-            self._cleanup_imported_path(import_dest)
-            self._cleanup_s3_prefix(s3_prefix)
-        else:
+        if status != "DONE":
             self._inc_stat("import_error")
             logger.error("[%s] Import FAILED: op=%s status=%s. NOT cleaning up for investigation.",
                          self._log_prefix, result.id[:16], status)
             self._signal_fatal_error(f"Import failed with status={status}, op={result.id}")
             return False
 
+        self._inc_stat("import_done")
+        logger.info("[%s] Import DONE: op=%s, verifying row counts", self._log_prefix, result.id[:16])
+
+        if not self._verify_imported_row_counts(import_dest):
+            # Keep imported data and S3 prefix for investigation.
+            return False
+
+        self._cleanup_imported_path(import_dest)
+        self._cleanup_s3_prefix(s3_prefix)
         return True
 
     def _export_to_s3(self, s3_prefix):
@@ -845,8 +956,13 @@ class WorkloadS3ExportImport(NfsWorkloadBase):
 
         try:
             self.source_path = _ensure_source_exists(self.client, self.source_path)
+            self.source_row_counts = _snapshot_table_row_counts(self.client, self.source_path)
+            logger.info(
+                "[%s] Snapshotted row counts for %d source table(s)",
+                self._log_prefix, len(self.source_row_counts),
+            )
         except Exception as e:
-            self._signal_fatal_error(f"Cannot ensure source exists: {e}")
+            self._signal_fatal_error(f"Cannot prepare source / row counts: {e}")
             return
 
         iteration = 0
