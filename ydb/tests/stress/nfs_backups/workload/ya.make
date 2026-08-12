@@ -2,6 +2,11 @@ PY3_LIBRARY()
 
 PY_SRCS(
     __init__.py
+    _fs_client.py
+    full_roundtrip.py
+    helpers.py
+    roundtrip.py
+    storage.py
 )
 
 PEERDIR(
