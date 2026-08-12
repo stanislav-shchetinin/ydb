@@ -75,6 +75,13 @@ if __name__ == "__main__":
              "(include_index_data + index_population_mode=IMPORT). "
              "Also via EXPORT_INCLUDE_INDEX_DATA. Requires EnableIndexMaterialization on the cluster.",
     )
+    parser.add_argument(
+        "--events-log",
+        default=None,
+        help="Path to a file for major events only (row counts, export/import start/done, "
+             "fatal errors). Verbose logs (polling, retries, etc.) still go to stderr. "
+             "Also via EXPORT_EVENTS_LOG.",
+    )
     args = parser.parse_args()
 
     if args.nfs_path:
@@ -91,6 +98,11 @@ if __name__ == "__main__":
         os.environ["EXPORT_COMPRESSION"] = args.compression
     if args.include_index_data:
         os.environ["EXPORT_INCLUDE_INDEX_DATA"] = "1"
+    if args.events_log:
+        os.environ["EXPORT_EVENTS_LOG"] = args.events_log
+
+    from ydb.tests.stress.nfs_backups.workload.helpers import init_event_log
+    init_event_log(os.getenv("EXPORT_EVENTS_LOG") or None)
 
     logger = logging.getLogger("nfs_backups")
     logger.info("Connecting to %s database=%s", args.endpoint, args.database)

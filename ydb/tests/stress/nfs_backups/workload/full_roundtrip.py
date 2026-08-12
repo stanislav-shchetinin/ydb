@@ -146,6 +146,7 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 if result is None or isinstance(result, Exception):
                     if not self._should_stop():
                         self._inc_stat("export_error")
+                        self._event(f"EXPORT ERROR start failed run_id={run_id}: {result}")
                         self._signal_fatal_error(
                             f"Export start failed after retries run_id={run_id}: {result}"
                         )
@@ -153,16 +154,19 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 op, location = result
                 self._inc_stat("export_started")
                 logger.info("[%s] Export started: op=%s location=%s", self._log_prefix, op.id, location)
+                self._event(f"EXPORT STARTED op={op.id} location={location} source={prefix}")
 
                 status = self._wait_op(op.id, self._backend.poll_export)
                 if status is None:
                     break
                 if status != "DONE":
                     self._inc_stat("export_error")
+                    self._event(f"EXPORT ERROR op={op.id} status={status}")
                     self._signal_fatal_error(f"Export failed status={status} op={op.id}")
                     break
                 self._inc_stat("export_done")
                 logger.info("[%s] Export DONE", self._log_prefix)
+                self._event(f"EXPORT DONE op={op.id} location={location}")
 
                 # Import into a different prefix.
                 # The backend maps the whole export to import_dest, so the imported
@@ -180,6 +184,7 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 if imp_result is None or isinstance(imp_result, Exception):
                     if not self._should_stop():
                         self._inc_stat("import_error")
+                        self._event(f"IMPORT ERROR start failed run_id={run_id}: {imp_result}")
                         self._signal_fatal_error(
                             f"Import start failed after retries run_id={run_id}: {imp_result}"
                         )
@@ -187,16 +192,19 @@ class WorkloadFullRoundtrip(ExportImportWorkloadBase):
                 self._inc_stat("import_started")
                 logger.info("[%s] Import started: op=%s dest=%s",
                             self._log_prefix, imp_result.id, import_dest)
+                self._event(f"IMPORT STARTED op={imp_result.id} location={location} dest={import_dest}")
 
                 imp_status = self._wait_op(imp_result.id, self._backend.poll_import)
                 if imp_status is None:
                     break
                 if imp_status != "DONE":
                     self._inc_stat("import_error")
+                    self._event(f"IMPORT ERROR op={imp_result.id} status={imp_status}")
                     self._signal_fatal_error(f"Import failed status={imp_status} op={imp_result.id}")
                     break
                 self._inc_stat("import_done")
                 logger.info("[%s] Import DONE", self._log_prefix)
+                self._event(f"IMPORT DONE op={imp_result.id} dest={import_dest}")
 
                 # Cleanup: remove import destination and backend export artifacts.
                 self._backend.cleanup_import_dest(import_dest, self.client)

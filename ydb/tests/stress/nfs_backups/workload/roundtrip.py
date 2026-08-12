@@ -21,6 +21,7 @@ from .helpers import (
     snapshot_table_row_counts,
     table_row_count,
     rel_to_database,
+    get_event_log,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class ExportImportWorkloadBase(WorkloadBase):
         self.encryption = get_encryption_config()
         self.compression = get_compression_config()
         self.include_index_data = get_include_index_data_config()
+        self._events = get_event_log()
 
         self._stats = {
             "export_started": 0,
@@ -98,8 +100,13 @@ class ExportImportWorkloadBase(WorkloadBase):
         with self.lock:
             self._stats[key] += 1
 
+    def _event(self, message: str):
+        """Write a major event to the events file (if configured). Verbose logs stay on stderr."""
+        self._events.write(f"[{self._log_prefix}] {message}")
+
     def _signal_fatal_error(self, message):
         logger.error("[%s][FATAL] %s", self._log_prefix, message)
+        self._event(f"FATAL: {message}")
         self.fatal_error_event.set()
 
     def _op_forget(self, op_id):
@@ -173,19 +180,25 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             return False
 
         mismatches = []
+        lines = []
         for rel, expected in sorted(self.source_row_counts.items()):
             imported_path = f"{import_dest.rstrip('/')}/{rel}"
             try:
                 actual = table_row_count(self.client, imported_path)
             except Exception as e:
                 mismatches.append(f"{rel}: cannot COUNT imported `{imported_path}`: {e}")
+                lines.append(f"  {rel}: ERROR counting `{imported_path}`: {e}")
                 continue
             if actual != expected:
                 mismatches.append(
                     f"{rel}: expected={expected} actual={actual} (imported `{imported_path}`)"
                 )
+                lines.append(f"  {rel}: MISMATCH expected={expected} actual={actual}")
             else:
                 logger.info("[%s][verify] OK `%s` row_count=%d", self._log_prefix, rel, actual)
+                lines.append(f"  {rel}: OK expected={expected} actual={actual}")
+
+        self._event("VERIFY row counts after import:\n" + "\n".join(lines))
 
         if mismatches:
             self._inc_stat("row_count_mismatch")
@@ -199,6 +212,7 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             "[%s][verify] All %d imported tables match source row counts",
             self._log_prefix, len(self.source_row_counts),
         )
+        self._event(f"VERIFY OK: all {len(self.source_row_counts)} table(s) match")
         return True
 
     # ------------------------------------------------------------------
@@ -218,12 +232,14 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             return None
         if isinstance(result, Exception):
             self._inc_stat("export_error")
+            self._event(f"EXPORT ERROR start failed run_id={run_id}: {result}")
             self._signal_fatal_error(f"Export start failed for run_id={run_id}: {result}")
             return None
 
         op, location = result
         self._inc_stat("export_started")
         logger.info("[%s] Export started: op=%s location=%s", self._log_prefix, op.id, location)
+        self._event(f"EXPORT STARTED op={op.id} location={location} source={self.source_path}")
 
         status = self._wait_op(op.id, self._backend.poll_export)
         if status is None:
@@ -233,11 +249,13 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             self._inc_stat("export_error")
             msg = f"Export FAILED: op={op.id} status={status} location={location}"
             logger.error("[%s] %s. NOT cleaning up for investigation.", self._log_prefix, msg)
+            self._event(f"EXPORT ERROR {msg}")
             self._signal_fatal_error(msg)
             return None
 
         self._inc_stat("export_done")
         logger.info("[%s] Export DONE: op=%s", self._log_prefix, op.id[:16])
+        self._event(f"EXPORT DONE op={op.id} location={location}")
         return location
 
     def _do_import(self, location: str, run_id: str) -> str | None:
@@ -255,12 +273,14 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             return None
         if isinstance(result, Exception):
             self._inc_stat("import_error")
+            self._event(f"IMPORT ERROR start failed run_id={run_id}: {result}")
             self._signal_fatal_error(f"Import start failed for run_id={run_id}: {result}")
             return None
 
         op = result
         self._inc_stat("import_started")
         logger.info("[%s] Import started: op=%s dest=%s", self._log_prefix, op.id, import_dest)
+        self._event(f"IMPORT STARTED op={op.id} location={location} dest={import_dest}")
 
         status = self._wait_op(op.id, self._backend.poll_import)
         if status is None:
@@ -270,11 +290,13 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             self._inc_stat("import_error")
             msg = f"Import FAILED: op={op.id} status={status}"
             logger.error("[%s] %s. NOT cleaning up for investigation.", self._log_prefix, msg)
+            self._event(f"IMPORT ERROR {msg}")
             self._signal_fatal_error(msg)
             return None
 
         self._inc_stat("import_done")
         logger.info("[%s] Import DONE: op=%s", self._log_prefix, op.id[:16])
+        self._event(f"IMPORT DONE op={op.id} dest={import_dest}")
         return import_dest
 
     # ------------------------------------------------------------------
@@ -294,6 +316,13 @@ class ExportImportRoundtripWorkload(ExportImportWorkloadBase):
             logger.info(
                 "[%s] Snapshotted row counts for %d source table(s)",
                 self._log_prefix, len(self.source_row_counts),
+            )
+            count_lines = "\n".join(
+                f"  {rel}: row_count={cnt}" for rel, cnt in sorted(self.source_row_counts.items())
+            )
+            self._event(
+                f"SOURCE ROW COUNTS source={self.source_path} tables={len(self.source_row_counts)}:\n"
+                + count_lines
             )
         except Exception as e:
             self._signal_fatal_error(f"Cannot prepare source / row counts: {e}")

@@ -2,12 +2,67 @@
 """Shared helpers: encryption config, S3 config, DB path utilities, row-count helpers."""
 import logging
 import os
+import threading
 import time
+from datetime import datetime, timezone
 
 from ydb import issues as ydb_issues
 from ydb.import_client import ImportClient, ImportFromS3Settings
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Major-events log (compact timeline file; verbose logs stay on stderr)
+# ---------------------------------------------------------------------------
+
+class EventLog:
+    """Thread-safe append-only log for major workload events."""
+
+    def __init__(self, path: str | None):
+        self._path = path
+        self._lock = threading.Lock()
+        if path:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # Truncate / create on start so each run has a clean file.
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"# events log started {datetime.now(timezone.utc).isoformat()}\n")
+            logger.info("[setup] Major events will be written to %s", path)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._path)
+
+    def write(self, message: str):
+        if not self._path:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+        line = f"{ts}  {message.rstrip()}\n"
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+
+
+_EVENT_LOG: EventLog | None = None
+
+
+def init_event_log(path: str | None = None) -> EventLog:
+    """Initialize global event log from path or EXPORT_EVENTS_LOG env."""
+    global _EVENT_LOG
+    if path is None:
+        path = os.getenv("EXPORT_EVENTS_LOG", "").strip() or None
+    _EVENT_LOG = EventLog(path)
+    return _EVENT_LOG
+
+
+def get_event_log() -> EventLog:
+    global _EVENT_LOG
+    if _EVENT_LOG is None:
+        _EVENT_LOG = EventLog(None)
+    return _EVENT_LOG
 
 # ---------------------------------------------------------------------------
 # Encryption
