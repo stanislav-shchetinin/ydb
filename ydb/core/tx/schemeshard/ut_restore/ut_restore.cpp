@@ -22,6 +22,7 @@
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
 #include <ydb/core/ydb_convert/table_description.h>
 #include <ydb/library/aws_init/aws.h>
+#include <ydb/public/lib/value/value.h>
 
 #include <yql/essentials/types/binary_json/write.h>
 #include <yql/essentials/types/dynumber/dynumber.h>
@@ -7087,6 +7088,198 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         UNIT_ASSERT(!issues.empty());
         Cerr << NYql::IssuesFromMessageAsString(issues) << Endl;
         UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "Restored");
+    }
+
+    // Both tests below reproduce the SchemeShard start failure
+    //   VERIFY failed: Import not found: importId# ...
+    //   schemeshard__init.cpp ReadEverything(): Self->Imports.contains(importId)
+    // using nothing but the public export/import/forget API.
+    //
+    // Encrypted (and any filtered) import goes through schema mapping, where
+    // FillItemsFromSchemaMapping replaces the whole item list via Items.swap().
+    // The list can become shorter than the one persisted by PersistCreateImport,
+    // but the excess ImportItems rows are never deleted. Forget then erases only
+    // rows 0..Items.size()-1 plus the Imports row, so the leftover rows lose
+    // their parent and the next TTxInit (node restart, version upgrade) dies.
+
+    // Number of ImportItems rows in the local database. The tests below run a
+    // single import, so a full-table scan is unambiguous.
+    ui64 CountImportItemRows(TTestActorRuntime& runtime) {
+        const auto result = LocalMiniKQL(runtime, TTestTxConfig::SchemeShard, R"(
+            (
+                (let range '(
+                    '('ImportId (Null) (Void))
+                    '('Index (Null) (Void))
+                ))
+                (let fields '('ImportId))
+                (return (AsList
+                    (SetResult 'Result (SelectRange 'ImportItems range fields '()))
+                ))
+            )
+        )");
+        return NKikimr::NClient::TValue::Create(result)[0]["List"].Size();
+    }
+
+    // Items count persisted in the Imports row, i.e. how many ImportItems rows
+    // TTxInit will accept and PersistRemoveImport will delete.
+    ui32 ReadPersistedItemsCount(TTestActorRuntime& runtime, ui64 importId) {
+        const auto result = LocalMiniKQL(runtime, TTestTxConfig::SchemeShard, TStringBuilder() << R"(
+            (
+                (let key '('('Id (Uint64 ')" << importId << R"())))
+                (let select '('Items))
+                (return (AsList
+                    (SetResult 'Result (SelectRow 'Imports key select))
+                ))
+            )
+        )");
+        const auto value = NKikimr::NClient::TValue::Create(result)[0];
+        UNIT_ASSERT(value.HaveValue());
+        return static_cast<ui32>(value["Items"]);
+    }
+
+    void ExportTwoEncryptedTables(TTestActorRuntime& runtime, TTestEnv& env, ui64& txId, ui16 port) {
+        for (const char* name : {"Table1", "Table2"}) {
+            TestCreateTable(runtime, ++txId, "/MyRoot", Sprintf(R"(
+                Name: "%s"
+                Columns { Name: "key" Type: "Utf8" }
+                Columns { Name: "value" Type: "Utf8" }
+                KeyColumnNames: ["key"]
+            )", name));
+            env.TestWaitNotification(runtime, txId);
+        }
+
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              source_path: "/MyRoot"
+              destination_prefix: "BackupPrefix"
+              items {
+                source_path: "/MyRoot/Table1"
+              }
+              items {
+                source_path: "/MyRoot/Table2"
+              }
+              encryption_settings {
+                encryption_algorithm: "ChaCha20-Poly1305"
+                symmetric_key {
+                    key: "Very very secret export key!!!!!"
+                }
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+    }
+
+    // Ordinary restore of an encrypted backup with an exclude filter: the import
+    // succeeds, is forgotten afterwards (the usual cleanup done by backup
+    // automation), and the node fails to start after that.
+    Y_UNIT_TEST(ForgetSucceededEncryptedImportWithExcludeBreaksSchemeShardStart) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        runtime.GetAppData().FeatureFlags.SetEnableEncryptedExport(true);
+        ui64 txId = 100;
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        ExportTwoEncryptedTables(runtime, env, txId, port);
+
+        // Two requested items are persisted at create time. exclude_regexps is
+        // matched against source object paths, which are known only after the
+        // schema mapping is downloaded, so Table2 is dropped later and the item
+        // list shrinks from 2 to 1.
+        const ui64 importId = ++txId;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              source_prefix: "BackupPrefix"
+              destination_path: "/MyRoot/Restored"
+              items {
+                source_path: "Table1"
+              }
+              items {
+                source_path: "Table2"
+              }
+              exclude_regexps: "^Table2$"
+              encryption_settings {
+                symmetric_key {
+                    key: "Very very secret export key!!!!!"
+                }
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot");
+
+        UNIT_ASSERT_VALUES_EQUAL(ReadPersistedItemsCount(runtime, importId), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 2u);
+
+        TestForgetImport(runtime, ++txId, "/MyRoot", importId);
+        UNIT_ASSERT(!CheckLocalRowExists(runtime, TTestTxConfig::SchemeShard, "Imports", "Id", importId));
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+
+        // Fails with "Import not found: importId# ..." until the leftover rows
+        // are cleaned up (in PersistRemoveImport, or skipped by TTxInit).
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+
+        // TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored/Table1"), {NLs::PathExist});
+    }
+
+    // Ordinary failed restore: an item filter does not match the backup contents
+    // (renamed or missing object), the import is cancelled, the operator forgets
+    // it, and the node fails to start after that.
+    Y_UNIT_TEST(ForgetCancelledEncryptedImportBreaksSchemeShardStart) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        runtime.GetAppData().FeatureFlags.SetEnableEncryptedExport(true);
+        ui64 txId = 100;
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        ExportTwoEncryptedTables(runtime, env, txId, port);
+
+        // The requested item is persisted at create time, but is not found in the
+        // schema mapping, so the item list becomes empty and the import is
+        // cancelled with an issue.
+        const ui64 importId = ++txId;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              source_prefix: "BackupPrefix"
+              destination_path: "/MyRoot/Restored"
+              items {
+                source_path: "TableRenamedInBackup"
+              }
+              encryption_settings {
+                symmetric_key {
+                    key: "Very very secret export key!!!!!"
+                }
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
+
+        UNIT_ASSERT_VALUES_EQUAL(ReadPersistedItemsCount(runtime, importId), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+
+        TestForgetImport(runtime, ++txId, "/MyRoot", importId);
+        UNIT_ASSERT(!CheckLocalRowExists(runtime, TTestTxConfig::SchemeShard, "Imports", "Id", importId));
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+
+        // Same failure as above: "Import not found: importId# ...".
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Table1"), {NLs::PathExist});
     }
 
     Y_UNIT_TEST(UnknownSchemeObjectImport) {
