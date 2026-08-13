@@ -293,6 +293,17 @@ void TSchemeShard::PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const T
     }
 }
 
+void TSchemeShard::PersistDropExcessImportItems(
+    NIceDb::TNiceDb& db,
+    ui64 importId,
+    ui32 newItemsCount,
+    ui32 previousItemsCount)
+{
+    for (ui32 itemIdx = newItemsCount; itemIdx < previousItemsCount; ++itemIdx) {
+        db.Table<Schema::ImportItems>().Key(importId, itemIdx).Delete();
+    }
+}
+
 void TSchemeShard::AddImport(const TImportInfo::TPtr& importInfo) {
     Imports[importInfo->Id] = importInfo;
     ImportsByTime.emplace(importInfo->StartTime, importInfo->Id);
@@ -301,18 +312,29 @@ void TSchemeShard::AddImport(const TImportInfo::TPtr& importInfo) {
     }
 }
 
-void TSchemeShard::PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo) {
+bool TSchemeShard::PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo) {
+    // Items may have been shrunk by schema mapping without deleting excess rows,
+    // so remove every ImportItems row for this importId — not just 0..Items.size()-1.
+    auto rowset = db.Table<Schema::ImportItems>().Prefix(importInfo.Id).Select();
+    if (!rowset.IsReady()) {
+        return false;
+    }
+    while (!rowset.EndOfSet()) {
+        const ui32 itemIdx = rowset.GetValue<Schema::ImportItems::Index>();
+        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Delete();
+        if (!rowset.Next()) {
+            return false;
+        }
+    }
+
     if (importInfo.Uid) {
         ImportsByUid.erase(importInfo.Uid);
     }
     ImportsByTime.erase(std::make_pair(importInfo.StartTime, importInfo.Id));
     Imports.erase(importInfo.Id);
 
-    for (ui32 itemIdx : xrange(importInfo.Items.size())) {
-        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Delete();
-    }
-
     db.Table<Schema::Imports>().Key(importInfo.Id).Delete();
+    return true;
 }
 
 void TSchemeShard::PersistImportState(NIceDb::TNiceDb& db, const TImportInfo& importInfo) {

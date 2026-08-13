@@ -5228,15 +5228,36 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 while (!rowset.EndOfSet()) {
                     ui64 importId = rowset.GetValue<Schema::ImportItems::ImportId>();
-                    Y_VERIFY_S(Self->Imports.contains(importId), "Import not found"
-                               << ": importId# " << importId);
+                    ui32 itemIdx = rowset.GetValue<Schema::ImportItems::Index>();
+
+                    // Self-heal leftover rows from schema-mapping shrink / incomplete forget:
+                    // without this already-corrupted tenants cannot boot after upgrade.
+                    if (!Self->Imports.contains(importId)) {
+                        LOG_ERROR_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                            "TTxInit: orphan ImportItems row, deleting"
+                            << ": importId# " << importId
+                            << ", itemIdx# " << itemIdx);
+                        db.Table<Schema::ImportItems>().Key(importId, itemIdx).Delete();
+                        if (!rowset.Next()) {
+                            return false;
+                        }
+                        continue;
+                    }
 
                     TImportInfo::TPtr importInfo = Self->Imports.at(importId);
 
-                    ui32 itemIdx = rowset.GetValue<Schema::ImportItems::Index>();
-                    Y_VERIFY_S(itemIdx < importInfo->Items.size(), "Invalid item's index"
-                               << ": importId# " << importId
-                               << ", itemIdx# " << itemIdx);
+                    if (itemIdx >= importInfo->Items.size()) {
+                        LOG_ERROR_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                            "TTxInit: ImportItems index out of range, deleting"
+                            << ": importId# " << importId
+                            << ", itemIdx# " << itemIdx
+                            << ", items# " << importInfo->Items.size());
+                        db.Table<Schema::ImportItems>().Key(importId, itemIdx).Delete();
+                        if (!rowset.Next()) {
+                            return false;
+                        }
+                        continue;
+                    }
 
                     TImportInfo::TItem& item = importInfo->Items[itemIdx];
                     item.DstPathName = rowset.GetValue<Schema::ImportItems::DstPathName>();

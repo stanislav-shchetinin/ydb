@@ -7090,17 +7090,12 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         UNIT_ASSERT_STRING_CONTAINS(NYql::IssuesFromMessageAsString(issues), "Restored");
     }
 
-    // Both tests below reproduce the SchemeShard start failure
-    //   VERIFY failed: Import not found: importId# ...
-    //   schemeshard__init.cpp ReadEverything(): Self->Imports.contains(importId)
-    // using nothing but the public export/import/forget API.
+    // Regression for SchemeShard boot failures after filtered/encrypted import:
+    //   VERIFY failed: Import not found / Invalid item's index
     //
-    // Encrypted (and any filtered) import goes through schema mapping, where
-    // FillItemsFromSchemaMapping replaces the whole item list via Items.swap().
-    // The list can become shorter than the one persisted by PersistCreateImport,
-    // but the excess ImportItems rows are never deleted. Forget then erases only
-    // rows 0..Items.size()-1 plus the Imports row, so the leftover rows lose
-    // their parent and the next TTxInit (node restart, version upgrade) dies.
+    // FillItemsFromSchemaMapping may shrink Items without deleting excess
+    // ImportItems rows. The fix drops those rows on shrink and removes all
+    // ImportItems on forget; TTxInit also self-heals leftovers.
 
     // Number of ImportItems rows in the local database. The tests below run a
     // single import, so a full-table scan is unambiguous.
@@ -7120,8 +7115,6 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         return NKikimr::NClient::TValue::Create(result)[0]["List"].Size();
     }
 
-    // Items count persisted in the Imports row, i.e. how many ImportItems rows
-    // TTxInit will accept and PersistRemoveImport will delete.
     ui32 ReadPersistedItemsCount(TTestActorRuntime& runtime, ui64 importId) {
         const auto result = LocalMiniKQL(runtime, TTestTxConfig::SchemeShard, TStringBuilder() << R"(
             (
@@ -7172,10 +7165,9 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         TestGetExport(runtime, txId, "/MyRoot");
     }
 
-    // Ordinary restore of an encrypted backup with an exclude filter: the import
-    // succeeds, is forgotten afterwards (the usual cleanup done by backup
-    // automation), and the node fails to start after that.
-    Y_UNIT_TEST(ForgetSucceededEncryptedImportWithExcludeBreaksSchemeShardStart) {
+    // Successful encrypted restore with exclude: item list shrinks 2→1, then
+    // forget + SchemeShard reboot must leave a consistent local DB.
+    Y_UNIT_TEST(ForgetSucceededEncryptedImportWithExcludeKeepsSchemeShardBootable) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
         runtime.GetAppData().FeatureFlags.SetEnableEncryptedExport(true);
@@ -7188,10 +7180,6 @@ Y_UNIT_TEST_SUITE(TImportTests) {
 
         ExportTwoEncryptedTables(runtime, env, txId, port);
 
-        // Two requested items are persisted at create time. exclude_regexps is
-        // matched against source object paths, which are known only after the
-        // schema mapping is downloaded, so Table2 is dropped later and the item
-        // list shrinks from 2 to 1.
         const ui64 importId = ++txId;
         TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
             ImportFromS3Settings {
@@ -7217,23 +7205,24 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         TestGetImport(runtime, importId, "/MyRoot");
 
         UNIT_ASSERT_VALUES_EQUAL(ReadPersistedItemsCount(runtime, importId), 1u);
-        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 2u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+
+        // Reboot before forget: no "Invalid item's index".
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+        TestGetImport(runtime, importId, "/MyRoot");
 
         TestForgetImport(runtime, ++txId, "/MyRoot", importId);
         UNIT_ASSERT(!CheckLocalRowExists(runtime, TTestTxConfig::SchemeShard, "Imports", "Id", importId));
-        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 0u);
 
-        // Fails with "Import not found: importId# ..." until the leftover rows
-        // are cleaned up (in PersistRemoveImport, or skipped by TTxInit).
+        // Reboot after forget: no "Import not found".
         RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
-
-        // TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored/Table1"), {NLs::PathExist});
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Restored/Table1"), {NLs::PathExist});
     }
 
-    // Ordinary failed restore: an item filter does not match the backup contents
-    // (renamed or missing object), the import is cancelled, the operator forgets
-    // it, and the node fails to start after that.
-    Y_UNIT_TEST(ForgetCancelledEncryptedImportBreaksSchemeShardStart) {
+    // Cancelled encrypted import (filter misses the backup): Items becomes empty,
+    // excess ImportItems must be dropped so cancel/forget/reboot stay safe.
+    Y_UNIT_TEST(ForgetCancelledEncryptedImportKeepsSchemeShardBootable) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
         runtime.GetAppData().FeatureFlags.SetEnableEncryptedExport(true);
@@ -7246,9 +7235,6 @@ Y_UNIT_TEST_SUITE(TImportTests) {
 
         ExportTwoEncryptedTables(runtime, env, txId, port);
 
-        // The requested item is persisted at create time, but is not found in the
-        // schema mapping, so the item list becomes empty and the import is
-        // cancelled with an issue.
         const ui64 importId = ++txId;
         TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
             ImportFromS3Settings {
@@ -7270,15 +7256,17 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
 
         UNIT_ASSERT_VALUES_EQUAL(ReadPersistedItemsCount(runtime, importId), 0u);
-        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 0u);
+
+        // Reboot before forget: no "Invalid item's index".
+        RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
+        TestGetImport(runtime, importId, "/MyRoot", Ydb::StatusIds::CANCELLED);
 
         TestForgetImport(runtime, ++txId, "/MyRoot", importId);
         UNIT_ASSERT(!CheckLocalRowExists(runtime, TTestTxConfig::SchemeShard, "Imports", "Id", importId));
-        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(CountImportItemRows(runtime), 0u);
 
-        // Same failure as above: "Import not found: importId# ...".
         RebootTablet(runtime, TTestTxConfig::SchemeShard, runtime.AllocateEdgeActor());
-
         TestDescribeResult(DescribePath(runtime, "/MyRoot/Table1"), {NLs::PathExist});
     }
 

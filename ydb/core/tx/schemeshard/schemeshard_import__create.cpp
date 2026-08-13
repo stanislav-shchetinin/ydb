@@ -539,7 +539,7 @@ struct TSchemeShard::TImport::TTxProgress: public TSchemeShard::TXxport::TTxBase
         if (SchemeResult) {
             OnSchemeResult(txc, ctx);
         } else if (SchemaMappingResult) {
-            OnSchemaMappingResult(txc, ctx);
+            return OnSchemaMappingResult(txc, ctx);
         } else if (SchemeQueryResult) {
             OnSchemeQueryPreparation(txc, ctx);
         } else if (AllocateResult) {
@@ -1414,7 +1414,7 @@ private:
         }
     }
 
-    void OnSchemaMappingResult(TTransactionContext& txc, const TActorContext& ctx) {
+    bool OnSchemaMappingResult(TTransactionContext& txc, const TActorContext& ctx) {
         Y_ABORT_UNLESS(SchemaMappingResult);
 
         const auto& msg = *SchemaMappingResult->Get();
@@ -1427,7 +1427,7 @@ private:
         if (!Self->Imports.contains(msg.ImportId)) {
             LOG_E("TImport::TTxProgress: OnSchemaMappingResult received unknown id"
                 << ": id# " << msg.ImportId);
-            return;
+            return true;
         }
 
         TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
@@ -1437,29 +1437,37 @@ private:
         Self->RunningImportSchemeGetters.erase(std::exchange(importInfo->SchemaMappingGetter, {}));
 
         if (!msg.Success) {
-            return CancelAndPersist(db, importInfo, -1,
+            CancelAndPersist(db, importInfo, -1,
                 TStringBuilder() << "cannot get schema mapping: " << msg.Error, "cannot get schema mapping");
+            return true;
         }
 
         if (!importInfo->SchemaMapping->Items.empty()) {
             if (importInfo->GetEncryptedBackup() != importInfo->SchemaMapping->Items[0].IV.Defined()) {
-                return CancelAndPersist(db, importInfo, -1,
+                CancelAndPersist(db, importInfo, -1,
                     importInfo->GetEncryptedBackup()
                         ? "encryption is requested, but the export is not encrypted"
                         : "the export is encrypted, but no encryption settings are specified",
                     "incorrect schema mapping");
+                return true;
             }
         }
 
+        // FillItemsFromSchemaMapping replaces Items via swap and may shrink the
+        // list. Drop leftover ImportItems rows that PersistCreateImport wrote.
+        const ui32 previousItemsCount = importInfo->Items.size();
         const TImportInfo::TFillItemsFromSchemaMappingResult fillResult = importInfo->FillItemsFromSchemaMapping(Self);
+        PersistDropExcessImportItems(db, importInfo->Id, importInfo->Items.size(), previousItemsCount);
         if (!fillResult.Success) {
-            return CancelAndPersist(db, importInfo, -1, fillResult.ErrorMessage, "invalid items in schema mapping");
+            CancelAndPersist(db, importInfo, -1, fillResult.ErrorMessage, "invalid items in schema mapping");
+            return true;
         }
 
         importInfo->State = EState::Waiting;
         PersistImportState(db, *importInfo);
         PersistSchemaMappingImportFields(db, *importInfo);
         Resume(txc, ctx);
+        return true;
     }
 
     void OnSchemeQueryPreparation(TTransactionContext& txc, const TActorContext& ctx) {

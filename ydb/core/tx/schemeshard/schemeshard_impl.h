@@ -1680,7 +1680,12 @@ public:
     static void PersistCreateImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistNewImportItem(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
-    void PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
+    // Deletes ImportItems rows with Index in [newItemsCount, previousItemsCount).
+    // Needed after FillItemsFromSchemaMapping shrinks the in-memory item list.
+    static void PersistDropExcessImportItems(NIceDb::TNiceDb& db, ui64 importId, ui32 newItemsCount, ui32 previousItemsCount);
+    // Deletes every ImportItems row for importId (not just 0..Items.size()-1).
+    // Returns false when the local DB page is not ready yet.
+    bool PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportState(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportSettings(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportItemState(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
