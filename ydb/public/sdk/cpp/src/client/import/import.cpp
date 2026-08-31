@@ -180,6 +180,63 @@ void TListObjectsInS3ExportResult::TItem::Out(IOutputStream& out) const {
         << ", path: \"" << Path << "\" }";
 }
 
+TListObjectsInFsExportResult::TListObjectsInFsExportResult(TStatus&& status, const Ydb::Import::ListObjectsInFsExportResult& proto)
+    : TStatus(std::move(status))
+    , Proto_(std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(proto))
+{
+    Items_.reserve(proto.items_size());
+    for (const auto& item : proto.items()) {
+        Items_.emplace_back(TItem{
+            .FsPath = item.fs_path(),
+            .DbPath = item.db_path()
+        });
+    }
+    NextPageToken_ = proto.next_page_token();
+}
+
+TListObjectsInFsExportResult::TListObjectsInFsExportResult(const TListObjectsInFsExportResult& result)
+    : TStatus(result)
+    , Items_(result.Items_)
+    , NextPageToken_(result.NextPageToken_)
+    , Proto_(std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(*result.Proto_))
+{
+}
+
+TListObjectsInFsExportResult::TListObjectsInFsExportResult(TListObjectsInFsExportResult&&) = default;
+
+TListObjectsInFsExportResult::~TListObjectsInFsExportResult() = default;
+
+TListObjectsInFsExportResult& TListObjectsInFsExportResult::operator=(TListObjectsInFsExportResult&&) = default;
+
+TListObjectsInFsExportResult& TListObjectsInFsExportResult::operator=(const TListObjectsInFsExportResult& result) {
+    TStatus::operator=(result);
+    Items_ = result.Items_;
+    NextPageToken_ = result.NextPageToken_;
+    Proto_ = std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(*result.Proto_);
+    return *this;
+}
+
+const std::vector<TListObjectsInFsExportResult::TItem>& TListObjectsInFsExportResult::GetItems() const {
+    return Items_;
+}
+
+const Ydb::Import::ListObjectsInFsExportResult& TListObjectsInFsExportResult::GetProto() const {
+    return *Proto_;
+}
+
+void TListObjectsInFsExportResult::Out(IOutputStream& out) const {
+    if (IsSuccess()) {
+        out << "{ items: [" << JoinSeq(", ", Items_) << "], next_page_token: \"" << NextPageToken_ << "\" }";
+    } else {
+        return TStatus::Out(out);
+    }
+}
+
+void TListObjectsInFsExportResult::TItem::Out(IOutputStream& out) const {
+    out << "{ fs_path: \"" << FsPath << "\""
+        << ", db_path: \"" << DbPath << "\" }";
+}
+
 /// Data
 TImportDataResult::TImportDataResult(TStatus&& status)
     : TStatus(std::move(status))
@@ -225,6 +282,30 @@ public:
             std::move(request),
             extractor,
             &V1::ImportService::Stub::AsyncListObjectsInS3Export,
+            DbDriverState_,
+            INITIAL_DEFERRED_CALL_DELAY,
+            TRpcRequestSettings::Make(settings));
+
+        return promise.GetFuture();
+    }
+
+    TAsyncListObjectsInFsExportResult ListObjectsInFsExport(ListObjectsInFsExportRequest&& request, const TListObjectsInFsExportSettings& settings) {
+        auto promise = NThreading::NewPromise<TListObjectsInFsExportResult>();
+
+        auto extractor = [promise]
+            (google::protobuf::Any* any, TPlainStatus status) mutable {
+                ListObjectsInFsExportResult result;
+                if (any) {
+                    any->UnpackTo(&result);
+                }
+
+                promise.SetValue(TListObjectsInFsExportResult(TStatus(std::move(status)), result));
+            };
+
+        Connections_->RunDeferred<V1::ImportService, ListObjectsInFsExportRequest, ListObjectsInFsExportResponse>(
+            std::move(request),
+            extractor,
+            &V1::ImportService::Stub::AsyncListObjectsInFsExport,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings));
@@ -408,6 +489,39 @@ TAsyncListObjectsInS3ExportResult TImportClient::ListObjectsInS3Export(const TLi
     request.set_page_token(pageToken);
 
     return Impl_->ListObjectsInS3Export(std::move(request), settings);
+}
+
+TAsyncListObjectsInFsExportResult TImportClient::ListObjectsInFsExport(const TListObjectsInFsExportSettings& settings, std::int64_t pageSize, const std::string& pageToken) {
+    auto request = MakeOperationRequest<ListObjectsInFsExportRequest>(settings);
+    Ydb::Import::ListObjectsInFsExportSettings& settingsProto = *request.mutable_settings();
+
+    settingsProto.set_base_path(TStringType{settings.BasePath_});
+
+    if (settings.NumberOfRetries_) {
+        settingsProto.set_number_of_retries(settings.NumberOfRetries_.value());
+    }
+
+    if (settings.SymmetricKey_) {
+        settingsProto.mutable_encryption_settings()->mutable_symmetric_key()->set_key(*settings.SymmetricKey_);
+    }
+
+    for (const auto& item : settings.Item_) {
+        if (item.Path.empty()) {
+            throw TContractViolation(
+                TStringBuilder() << "Invalid item: path is not set");
+        }
+
+        settingsProto.add_items()->set_path(item.Path);
+    }
+
+    for (const std::string& excludeRegexp : settings.ExcludeRegexp_) {
+        settingsProto.add_exclude_regexps(excludeRegexp);
+    }
+
+    request.set_page_size(pageSize);
+    request.set_page_token(pageToken);
+
+    return Impl_->ListObjectsInFsExport(std::move(request), settings);
 }
 
 TAsyncImportDataResult TImportClient::ImportData(const std::string& table, std::string&& data, const TImportYdbDumpDataSettings& settings) {

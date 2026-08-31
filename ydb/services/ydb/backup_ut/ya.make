@@ -14,6 +14,7 @@ SRCS(
     backup_path_ut.cpp
     encrypted_backup_ut.cpp
     fs_backup_validation_ut.cpp
+    list_objects_in_fs_export_ut.cpp
     list_objects_in_s3_export_ut.cpp
     ydb_backup_ut.cpp
 )

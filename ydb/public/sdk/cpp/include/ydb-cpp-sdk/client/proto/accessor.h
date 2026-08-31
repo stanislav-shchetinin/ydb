@@ -28,6 +28,7 @@ class TIndexDescription;
 }
 
 namespace NImport {
+class TListObjectsInFsExportResult;
 class TListObjectsInS3ExportResult;
 }
 
@@ -51,6 +52,7 @@ public:
     static const Ydb::Monitoring::SelfCheckResult& GetProto(const NYdb::NMonitoring::TSelfCheckResult& selfCheckResult);
     static const Ydb::Monitoring::ClusterStateResult& GetProto(const NYdb::NMonitoring::TClusterStateResult& clusterStateResult);
     static const Ydb::Coordination::DescribeNodeResult& GetProto(const NYdb::NCoordination::TNodeDescription& describeNodeResult);
+    static const Ydb::Import::ListObjectsInFsExportResult& GetProto(const NYdb::NImport::TListObjectsInFsExportResult& result);
     static const Ydb::Import::ListObjectsInS3ExportResult& GetProto(const NYdb::NImport::TListObjectsInS3ExportResult& result);
 
     static NTable::TQueryStats FromProto(const Ydb::TableStats::QueryStats& queryStats);

@@ -339,8 +339,8 @@ message ListObjectsInFsExportSettings {
 
 message ListObjectsInFsExportResult {
     message Item {
-        /* YDB database objects in S3 are stored in one or more S3 objects (see ydb_export.proto).
-          The S3 object name begins with a prefix, followed by:
+        /* YDB database objects in FS are stored in one or more files (see ydb_export.proto).
+          The directory path is followed by:
             * '/data_PartNumber', where 'PartNumber' represents the index of the part, starting at zero;
             * '/scheme.pb' - object with information about scheme, indexes, etc;
             * '/permissions.pb' - object with information about ACL and owner;

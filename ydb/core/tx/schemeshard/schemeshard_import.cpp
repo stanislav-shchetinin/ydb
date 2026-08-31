@@ -438,6 +438,10 @@ void TSchemeShard::Handle(TEvImport::TEvListObjectsInS3ExportRequest::TPtr& ev, 
     Register(CreateListObjectsInS3ExportGetter(std::move(ev)));
 }
 
+void TSchemeShard::Handle(TEvImport::TEvListObjectsInFsExportRequest::TPtr& ev, const TActorContext&) {
+    Register(CreateListObjectsInFsExportGetter(std::move(ev)));
+}
+
 void TSchemeShard::Handle(TEvPrivate::TEvImportSchemeReady::TPtr& ev, const TActorContext& ctx) {
     Execute(CreateTxProgressImport(ev), ctx);
 }

@@ -97,6 +97,7 @@ public:
     virtual int Run(TConfig& config) override;
 
     NImport::TImportFromFsSettings MakeImportSettings();
+    NImport::TListObjectsInFsExportSettings MakeListObjectsSettings();
 
 private:
     DEFINE_PARSEABLE_STRUCT(TItemNfs, TItemFields, Source, Destination);

@@ -4,6 +4,10 @@
 
 namespace NYdb::inline Dev {
 
+const Ydb::Import::ListObjectsInFsExportResult& TProtoAccessor::GetProto(const NYdb::NImport::TListObjectsInFsExportResult& result) {
+    return result.GetProto();
+}
+
 const Ydb::Import::ListObjectsInS3ExportResult& TProtoAccessor::GetProto(const NYdb::NImport::TListObjectsInS3ExportResult& result) {
     return result.GetProto();
 }

@@ -144,3 +144,16 @@ message TEvListObjectsInS3ExportResponse {
     repeated Ydb.Issue.IssueMessage Issues = 2;
     optional Ydb.Import.ListObjectsInS3ExportResult Result = 3;
 }
+
+message TEvListObjectsInFsExportRequest {
+    optional Ydb.Operations.OperationParams OperationParams = 1;
+    optional Ydb.Import.ListObjectsInFsExportSettings Settings = 2;
+    optional int64 PageSize = 3;
+    optional string PageToken = 4;
+}
+
+message TEvListObjectsInFsExportResponse {
+    optional Ydb.StatusIds.StatusCode Status = 1;
+    repeated Ydb.Issue.IssueMessage Issues = 2;
+    optional Ydb.Import.ListObjectsInFsExportResult Result = 3;
+}

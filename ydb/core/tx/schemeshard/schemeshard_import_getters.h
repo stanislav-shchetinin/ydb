@@ -12,6 +12,7 @@ IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo
 IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo);
 
 IActor* CreateListObjectsInS3ExportGetter(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev);
+IActor* CreateListObjectsInFsExportGetter(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev);
 
 } // NSchemeShard
 } // NKikimr

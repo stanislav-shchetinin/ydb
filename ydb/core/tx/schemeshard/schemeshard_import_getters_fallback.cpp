@@ -72,6 +72,25 @@ private:
     TEvImport::TEvListObjectsInS3ExportRequest::TPtr Request;
 }; // TListObjectsInS3ExportGetterFallback
 
+class TListObjectsInFsExportGetterFallback: public TActorBootstrapped<TListObjectsInFsExportGetterFallback> {
+public:
+    TListObjectsInFsExportGetterFallback(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev)
+        : Request(std::move(ev))
+    {
+    }
+
+    void Bootstrap() {
+        auto result = MakeHolder<TEvImport::TEvListObjectsInFsExportResponse>();
+        result->Record.set_status(Ydb::StatusIds::UNSUPPORTED);
+        result->Record.add_issues()->set_message("FS listings are disabled");
+        Send(Request->Sender, std::move(result));
+        PassAway();
+    }
+
+private:
+    TEvImport::TEvListObjectsInFsExportRequest::TPtr Request;
+}; // TListObjectsInFsExportGetterFallback
+
 IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV>) {
     return new TSchemeGetterFallback(replyTo, std::move(importInfo), itemIdx);
 }
@@ -82,6 +101,10 @@ IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr imp
 
 IActor* CreateListObjectsInS3ExportGetter(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev) {
     return new TListObjectsInS3ExportGetterFallback(std::move(ev));
+}
+
+IActor* CreateListObjectsInFsExportGetter(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev) {
+    return new TListObjectsInFsExportGetterFallback(std::move(ev));
 }
 
 } // NSchemeShard

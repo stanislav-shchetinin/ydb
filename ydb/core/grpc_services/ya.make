@@ -45,6 +45,7 @@ SRCS(
     rpc_kh_describe.cpp
     rpc_kh_snapshots.cpp
     rpc_list_objects_in_s3_export.cpp
+    rpc_list_objects_in_fs_export.cpp
     rpc_list_operations.cpp
     rpc_load_rows.cpp
     rpc_rate_limiter_api.cpp

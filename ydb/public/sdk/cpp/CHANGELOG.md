@@ -1,5 +1,7 @@
 # v3.22.0
 
+* Added `TImportClient::ListObjectsInFsExport` for listing database objects in an existing filesystem export.
+
 * Added `IWriteSession::Flush` to asynchronously wait until all previously accepted topic writes are acknowledged.
 
 * Fixed query parameters with incomplete types being sent to the server; the parameter builder now reports the error locally.

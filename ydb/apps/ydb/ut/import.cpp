@@ -20,6 +20,11 @@ public:
         TString Path;
     };
 
+    struct TExpectedFsListResultItem {
+        TString FsPath;
+        TString DbPath;
+    };
+
     grpc::Status ImportFromS3(grpc::ServerContext* context, const Ydb::Import::ImportFromS3Request* request, Ydb::Import::ImportFromS3Response* response) override {
         Y_UNUSED(context);
         ++ImportCalls;
@@ -34,6 +39,14 @@ public:
         CheckListS3Params(request);
         CheckListItems(request);
         return FillListResponse(response);
+    }
+
+    grpc::Status ListObjectsInFsExport(grpc::ServerContext* context, const Ydb::Import::ListObjectsInFsExportRequest* request, Ydb::Import::ListObjectsInFsExportResponse* response) override {
+        Y_UNUSED(context);
+        ++FsListCalls;
+        CheckListFsParams(request);
+        CheckListItems(request);
+        return FillFsListResponse(response);
     }
 
     grpc::Status FillImportResponse(Ydb::Import::ImportFromS3Response* response) {
@@ -60,6 +73,20 @@ public:
         return grpc::Status();
     }
 
+    grpc::Status FillFsListResponse(Ydb::Import::ListObjectsInFsExportResponse* response) {
+        Ydb::Import::ListObjectsInFsExportResult res;
+        for (const auto& item : FsListResultItems) {
+            auto* resultItem = res.add_items();
+            resultItem->set_fs_path(item.FsPath);
+            resultItem->set_db_path(item.DbPath);
+        }
+        auto* operation = response->mutable_operation();
+        operation->set_ready(true);
+        operation->set_status(Ydb::StatusIds::SUCCESS);
+        operation->mutable_result()->PackFrom(res);
+        return grpc::Status();
+    }
+
     void CheckS3Params(const Ydb::Import::ImportFromS3Request* request) {
         const auto& settings = request->settings();
         CheckCommonS3Params(settings);
@@ -75,6 +102,14 @@ public:
         const auto& settings = request->settings();
         CheckCommonS3Params(settings);
         CHECK_EXP(settings.prefix() == CommonSourcePrefix, "Incorrect common source prefix: \"" << settings.prefix() << "\" instead of \"" << CommonSourcePrefix << "\"");
+    }
+
+    void CheckListFsParams(const Ydb::Import::ListObjectsInFsExportRequest* request) {
+        const auto& settings = request->settings();
+        CHECK_EXP(settings.base_path() == CommonSourcePrefix, "Incorrect FS base path: \"" << settings.base_path() << "\" instead of \"" << CommonSourcePrefix << "\"");
+        CHECK_EXP(settings.number_of_retries() == NumberOfRetries, "Incorrect number of retries: " << settings.number_of_retries() << " instead of " << NumberOfRetries);
+        CheckEncryptionSettings(settings);
+        CheckExcludeRegexps(settings);
     }
 
     template <typename TSettings>
@@ -106,7 +141,8 @@ public:
         }
     }
 
-    void CheckListItems(const Ydb::Import::ListObjectsInS3ExportRequest* request) {
+    template <typename TRequest>
+    void CheckListItems(const TRequest* request) {
         const auto& settings = request->settings();
         CHECK_EXP(settings.items_size() == static_cast<int>(ListItems.size()),
             "List items size does not match. settings.items_size(): " << settings.items_size() << ". ListItems.size(): " << ListItems.size());
@@ -136,6 +172,7 @@ public:
     void CheckExpectations() override {
         CHECK_EXP(ImportCalls == ExpectedImportCalls, "Incorrect ImportFromS3 calls count: " << ImportCalls << " instead of " << ExpectedImportCalls);
         CHECK_EXP(ListCalls == ExpectedListCalls, "Incorrect ListObjectsInS3Export calls count: " << ListCalls << " instead of " << ExpectedListCalls);
+        CHECK_EXP(FsListCalls == ExpectedFsListCalls, "Incorrect ListObjectsInFsExport calls count: " << FsListCalls << " instead of " << ExpectedFsListCalls);
         TChecker::CheckExpectations();
     }
 
@@ -143,6 +180,7 @@ public:
         Items.clear();
         ListItems.clear();
         ListResultItems.clear();
+        FsListResultItems.clear();
         Bucket.clear();
         S3Endpoint.clear();
         Scheme = Ydb::Import::ImportFromS3Settings::HTTPS;
@@ -160,8 +198,10 @@ public:
         ExcludeRegexps.clear();
         ExpectedImportCalls = 1;
         ExpectedListCalls = 0;
+        ExpectedFsListCalls = 0;
         ImportCalls = 0;
         ListCalls = 0;
+        FsListCalls = 0;
     }
 
     TImportImpl& ExpectItem(TString sourcePrefix, TString destinationPath, TString sourcePath = {}) {
@@ -186,9 +226,23 @@ public:
         return *this;
     }
 
+    TImportImpl& AddFsListResultItem(TString fsPath, TString dbPath) {
+        FsListResultItems.push_back({
+            .FsPath = std::move(fsPath),
+            .DbPath = std::move(dbPath),
+        });
+        return *this;
+    }
+
     TImportImpl& ExpectListCall() {
         ExpectedImportCalls = 0;
         ExpectedListCalls = 1;
+        return *this;
+    }
+
+    TImportImpl& ExpectFsListCall() {
+        ExpectedImportCalls = 0;
+        ExpectedFsListCalls = 1;
         return *this;
     }
 
@@ -275,6 +329,7 @@ public:
     std::vector<TExpectedItem> Items;
     std::vector<TString> ListItems;
     std::vector<TExpectedListResultItem> ListResultItems;
+    std::vector<TExpectedFsListResultItem> FsListResultItems;
     TString Bucket;
     TString S3Endpoint;
     Ydb::Import::ImportFromS3Settings::Scheme Scheme = Ydb::Import::ImportFromS3Settings::HTTPS;
@@ -292,8 +347,10 @@ public:
     std::vector<TString> ExcludeRegexps;
     int ExpectedImportCalls = 1;
     int ExpectedListCalls = 0;
+    int ExpectedFsListCalls = 0;
     int ImportCalls = 0;
     int ListCalls = 0;
+    int FsListCalls = 0;
 };
 
 class TImportFixture : public TCliTestFixture {
@@ -615,6 +672,40 @@ Y_UNIT_TEST_SUITE(ImportTest) {
         UNIT_ASSERT_STRING_CONTAINS(output, "source/prefix/src/path");
         UNIT_ASSERT_STRING_CONTAINS(output, "another/path");
         UNIT_ASSERT_STRING_CONTAINS(output, "source/prefix/another/path");
+    }
+
+    Y_UNIT_TEST_F(ListObjectsFromNfs, TImportFixture) {
+        const TString encryptionKey = "test-encryption-key";
+        const TString encryptionKeyFile = EnvFile(encryptionKey, "import_nfs_list_encryption.key");
+
+        Service<TImportImpl>()
+            .ExpectFsListCall()
+            .ExpectCommonSourcePrefix("/mnt/export")
+            .ExpectNumberOfRetries(42)
+            .ExpectSymmetricKey(encryptionKey)
+            .ExpectListItem("src/path")
+            .ExpectListItem("another/path")
+            .AddFsListResultItem("src/path", "src/path")
+            .AddFsListResultItem("fs/another", "another/path");
+
+        const TString output = RunCli(
+            {
+                "-v",
+                "-e", GetEndpoint(),
+                "-d", GetDatabase(),
+                "import", "nfs",
+                "--list",
+                "--fs-path", "/mnt/export",
+                "--include", "src/path",
+                "--include", "another/path",
+                "--retries", "42",
+                "--encryption-key-file", encryptionKeyFile,
+            }
+        );
+
+        UNIT_ASSERT_STRING_CONTAINS(output, "src/path");
+        UNIT_ASSERT_STRING_CONTAINS(output, "another/path");
+        UNIT_ASSERT_STRING_CONTAINS(output, "fs/another");
     }
 
     Y_UNIT_TEST_F(PassEncryptionKey, TImportFixture) {

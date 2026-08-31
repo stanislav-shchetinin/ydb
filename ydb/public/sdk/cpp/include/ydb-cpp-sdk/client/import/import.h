@@ -5,6 +5,7 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/s3_settings.h>
 
 namespace Ydb::Import {
+class ListObjectsInFsExportResult;
 class ListObjectsInS3ExportResult;
 }
 
@@ -200,6 +201,59 @@ private:
 
 using TAsyncImportFromFsResponse = NThreading::TFuture<TImportFromFsResponse>;
 
+struct TListObjectsInFsExportSettings : public TOperationRequestSettings<TListObjectsInFsExportSettings> {
+    using TSelf = TListObjectsInFsExportSettings;
+
+    struct TItem {
+        // Database object path.
+        std::string Path = {};
+    };
+
+    FLUENT_SETTING(std::string, BasePath);
+    FLUENT_SETTING_VECTOR(TItem, Item);
+    FLUENT_SETTING_OPTIONAL(uint32_t, NumberOfRetries);
+    FLUENT_SETTING_OPTIONAL(std::string, SymmetricKey);
+    FLUENT_SETTING_VECTOR(std::string, ExcludeRegexp);
+};
+
+class TListObjectsInFsExportResult : public TStatus {
+    friend class NYdb::TProtoAccessor;
+
+public:
+    struct TItem {
+        // File system path relative to the export base path.
+        std::string FsPath;
+
+        // Database object path.
+        std::string DbPath;
+
+        void Out(IOutputStream& out) const;
+    };
+
+    TListObjectsInFsExportResult(TStatus&& status, const Ydb::Import::ListObjectsInFsExportResult& proto);
+    TListObjectsInFsExportResult(TListObjectsInFsExportResult&&);
+    TListObjectsInFsExportResult(const TListObjectsInFsExportResult&);
+    ~TListObjectsInFsExportResult();
+
+    TListObjectsInFsExportResult& operator=(TListObjectsInFsExportResult&&);
+    TListObjectsInFsExportResult& operator=(const TListObjectsInFsExportResult&);
+
+    const std::vector<TItem>& GetItems() const;
+    const std::string& NextPageToken() const { return NextPageToken_; }
+
+    void Out(IOutputStream& out) const;
+
+private:
+    const Ydb::Import::ListObjectsInFsExportResult& GetProto() const;
+
+private:
+    std::vector<TItem> Items_;
+    std::string NextPageToken_;
+    std::unique_ptr<Ydb::Import::ListObjectsInFsExportResult> Proto_;
+};
+
+using TAsyncListObjectsInFsExportResult = NThreading::TFuture<TListObjectsInFsExportResult>;
+
 /// Data
 struct TImportYdbDumpDataSettings : public TOperationRequestSettings<TImportYdbDumpDataSettings> {
     using TSelf = TImportYdbDumpDataSettings;
@@ -226,6 +280,7 @@ public:
     TAsyncImportFromFsResponse ImportFromFs(const TImportFromFsSettings& settings);
 
     TAsyncListObjectsInS3ExportResult ListObjectsInS3Export(const TListObjectsInS3ExportSettings& settings, std::int64_t pageSize = 0, const std::string& pageToken = {});
+    TAsyncListObjectsInFsExportResult ListObjectsInFsExport(const TListObjectsInFsExportSettings& settings, std::int64_t pageSize = 0, const std::string& pageToken = {});
 
     // ydb dump format
     TAsyncImportDataResult ImportData(const std::string& table, std::string&& data, const TImportYdbDumpDataSettings& settings);

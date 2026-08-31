@@ -12,6 +12,7 @@
 #include <ydb/core/base/appdata_fwd.h>
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/wrappers/retry_policy.h>
+#include <ydb/core/wrappers/fs_storage_config.h>
 #include <ydb/core/wrappers/s3_storage_config.h>
 #include <ydb/core/wrappers/s3_wrapper.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
@@ -75,6 +76,18 @@ struct TGetterSettings {
         }
         return settings;
     }
+
+    static TGetterSettings FromRequest(const TEvImport::TEvListObjectsInFsExportRequest::TPtr& ev) {
+        TGetterSettings settings;
+        settings.ExternalStorageConfig.reset(new NWrappers::NExternalStorage::TFsExternalStorageConfig(
+            ev->Get()->Record.settings()));
+        settings.Retries = ev->Get()->Record.settings().number_of_retries();
+        if (ev->Get()->Record.settings().has_encryption_settings()) {
+            settings.Key = NBackup::TEncryptionKey(ev->Get()->Record.settings().encryption_settings().symmetric_key().key());
+        }
+        settings.LogPrefix = "fs"sv;
+        return settings;
+    }
 };
 
 template <class TDerived>
@@ -108,9 +121,10 @@ protected:
         GetObject(key, std::make_pair(0, contentLength - 1), autoAddEncSuffix);
     }
 
-    void ListObjects(const TString& prefix) {
+    void ListObjects(const TString& prefix, const TString& marker = {}) {
         auto request = Model::ListObjectsRequest()
-            .WithPrefix(prefix);
+            .WithPrefix(prefix)
+            .WithMarker(marker);
 
         this->Send(Client, new TEvExternalStorage::TEvListObjectsRequest(request));
     }
@@ -1694,6 +1708,316 @@ private:
     std::vector<TRegExMatch> ExcludeRegexps;
 };
 
+class TListObjectsInFsExportGetter : public TGetterFromS3<TListObjectsInFsExportGetter> {
+    class TPathFilter {
+    public:
+        void Build(const Ydb::Import::ListObjectsInFsExportSettings& settings) {
+            for (const auto& item : settings.items()) {
+                TString path = NBackup::NormalizeItemPath(item.path());
+                if (path) {
+                    Paths.emplace(path);
+                    PathPrefixes.emplace_back(path + "/");
+                }
+            }
+        }
+
+        bool Match(const TString& path) const {
+            if (Paths.empty()) {
+                return true;
+            }
+
+            if (Paths.contains(path)) {
+                return true;
+            }
+
+            for (const TString& prefix : PathPrefixes) {
+                if (path.StartsWith(prefix)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+    private:
+        std::vector<TString> PathPrefixes;
+        THashSet<TString> Paths;
+    };
+
+public:
+    TListObjectsInFsExportGetter(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev)
+        : TGetterFromS3<TListObjectsInFsExportGetter>(TGetterSettings::FromRequest(ev))
+        , Request(std::move(ev))
+    {
+    }
+
+    void Bootstrap() {
+        if (ParseParameters()) {
+            CreateClient();
+            DownloadSchemaMapping();
+        }
+    }
+
+    bool ParseParameters() {
+        const auto& req = Request->Get()->Record;
+        if (req.GetPageSize() < 0) {
+            Reply(Ydb::StatusIds::BAD_REQUEST, "Page size should be greater than or equal to 0");
+            return false;
+        }
+        PageSize = static_cast<size_t>(req.GetPageSize());
+        if (req.GetPageToken()) {
+            if (!TryFromString(req.GetPageToken(), StartPos)) {
+                Reply(Ydb::StatusIds::BAD_REQUEST, "Failed to parse page token");
+                return false;
+            }
+            if (req.GetPageSize() == 0) {
+                Reply(Ydb::StatusIds::BAD_REQUEST, "Page size should be greater than 0");
+                return false;
+            }
+        }
+
+        const auto& settings = req.GetSettings();
+        if (settings.base_path().empty()) {
+            Reply(Ydb::StatusIds::BAD_REQUEST, "Empty FS base path specified");
+            return false;
+        }
+        if (!TFsPath(settings.base_path()).IsAbsolute()) {
+            Reply(Ydb::StatusIds::BAD_REQUEST, "base_path must be an absolute path");
+            return false;
+        }
+
+        try {
+            ExcludeRegexps = NBackup::CombineRegexps(settings.exclude_regexps());
+        } catch (const std::exception& ex) {
+            Reply(Ydb::StatusIds::BAD_REQUEST, TStringBuilder() << "Invalid regexp: " << ex.what());
+            return false;
+        }
+        return true;
+    }
+
+    void DownloadSchemaMapping() {
+        ResetRetries();
+        Download(GetSchemaMappingKey());
+        Become(&TThis::StateDownloadSchemaMapping);
+    }
+
+    void HandleSchemaMapping(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+
+        LOG_D("HandleSchemaMapping TEvExternalStorage::TEvHeadObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (IsNoSuchKeyError(result)) {
+            return ListObjectsInFsPath();
+        }
+
+        if (!CheckResult(result, "HeadObject")) {
+            return;
+        }
+
+        GetObject(GetSchemaMappingKey(), result.GetResult().GetContentLength());
+    }
+
+    void HandleSchemaMapping(TEvExternalStorage::TEvGetObjectResponse::TPtr& ev) {
+        const auto& msg = *ev->Get();
+        const auto& result = msg.Result;
+
+        LOG_D("HandleSchemaMapping TEvExternalStorage::TEvGetObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (IsNoSuchKeyError(result)) {
+            return ListObjectsInFsPath();
+        }
+
+        if (!CheckResult(result, "GetObject")) {
+            return;
+        }
+
+        TString content;
+        if (!MaybeDecryptAndSaveIV(msg.Body, content)) {
+            return;
+        }
+
+        LOG_T("Trying to parse schema mapping"
+            << ": self# " << SelfId()
+            << ", schemaMappingKey# " << GetSchemaMappingKey()
+            << ", body# " << SubstGlobalCopy(content, "\n", "\\n"));
+
+        TString error;
+        NBackup::TSchemaMapping schemaMapping;
+        if (!schemaMapping.Deserialize(content, error)) {
+            Reply(Ydb::StatusIds::BAD_REQUEST, error);
+            return;
+        }
+
+        ProcessItemsAndReply(std::move(schemaMapping.Items));
+    }
+
+    void ListObjectsInFsPath() {
+        ResetRetries();
+        ListObjects(GetBasePath(), ListMarker);
+        Become(&TThis::StateListObjects);
+    }
+
+    void HandleListObjects(TEvExternalStorage::TEvListObjectsResponse::TPtr& ev) {
+        const auto& result = ev.Get()->Get()->Result;
+        LOG_D("HandleListObjects TEvExternalStorage::TEvListObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (!CheckResult(result, "ListObjects")) {
+            return;
+        }
+
+        const auto& objects = result.GetResult().GetContents();
+        const TString basePath = GetBasePath();
+        const TString suffix = TString("/metadata.json") + (Key ? ".enc" : "");
+        ListedItems.reserve(ListedItems.size() + objects.size());
+        for (const auto& obj : objects) {
+            TStringBuf key(obj.GetKey().data(), obj.GetKey().size());
+            if (!key.StartsWith(basePath)) {
+                LOG_D("Unexpected path found: " << key);
+                continue;
+            }
+            key.Skip(basePath.size());
+            if (key.StartsWith("/")) {
+                key.Skip(1);
+            }
+
+            if (key.ChopSuffix(suffix)) {
+                TString relativePath(key);
+                if (relativePath.empty() || relativePath == "SchemaMapping") {
+                    continue;
+                }
+
+                ListedItems.emplace_back(NBackup::TSchemaMapping::TItem{
+                    .ExportPrefix = relativePath,
+                    .ObjectPath = relativePath,
+                });
+            }
+        }
+
+        if (result.GetResult().GetIsTruncated()) {
+            if (objects.empty()) {
+                return Reply(Ydb::StatusIds::INTERNAL_ERROR, "FS listing was truncated without a continuation marker");
+            }
+
+            const auto& lastKey = objects.back().GetKey();
+            ListMarker.assign(lastKey.data(), lastKey.size());
+            return ListObjectsInFsPath();
+        }
+
+        ProcessItemsAndReply(std::move(ListedItems));
+    }
+
+    STATEFN(StateDownloadSchemaMapping) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleSchemaMapping);
+            hFunc(TEvExternalStorage::TEvGetObjectResponse, HandleSchemaMapping);
+
+            sFunc(TEvents::TEvWakeup, DownloadSchemaMapping);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+    STATEFN(StateListObjects) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvListObjectsResponse, HandleListObjects);
+
+            sFunc(TEvents::TEvWakeup, ListObjectsInFsPath);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+    void Reply(Ydb::StatusIds::StatusCode statusCode = Ydb::StatusIds::SUCCESS, const TString& error = TString()) override {
+        LOG_I("Reply"
+            << ": self# " << SelfId()
+            << ", status# " << static_cast<int>(statusCode)
+            << ", error# " << error);
+
+        auto result = MakeHolder<TEvImport::TEvListObjectsInFsExportResponse>();
+        result->Record.set_status(statusCode);
+        if (error) {
+            result->Record.add_issues()->set_message(error);
+        }
+        if (statusCode == Ydb::StatusIds::SUCCESS) {
+            result->Record.mutable_result()->Swap(&Result);
+        }
+        Send(Request->Sender, std::move(result));
+        PassAway();
+    }
+
+    TString GetBasePath() const {
+        TString path = Request->Get()->Record.GetSettings().base_path();
+        while (path.size() > 1 && path.back() == '/') {
+            path.pop_back();
+        }
+        return path;
+    }
+
+    TString GetSchemaMappingKey() const {
+        return (TFsPath(GetBasePath()) / "SchemaMapping/mapping.json").GetPath();
+    }
+
+    void ProcessItemsAndReply(std::vector<NBackup::TSchemaMapping::TItem>&& items) {
+        std::sort(items.begin(), items.end(), [](const NBackup::TSchemaMapping::TItem& i1, const NBackup::TSchemaMapping::TItem& i2) {
+            return i1.ObjectPath < i2.ObjectPath;
+        });
+
+        PathFilter.Build(Request->Get()->Record.GetSettings());
+
+        size_t pos = 0;
+        for (const auto& item : items) {
+            if (!PathFilter.Match(item.ObjectPath)) {
+                continue;
+            }
+
+            if (IsExcludedFromListing(item.ObjectPath)) {
+                continue;
+            }
+
+            if (PageSize && pos >= StartPos + PageSize) {
+                NextPos = pos;
+                break;
+            }
+
+            if (pos >= StartPos) {
+                auto* result = Result.add_items();
+                result->set_fs_path(item.ExportPrefix);
+                result->set_db_path(item.ObjectPath);
+            }
+
+            ++pos;
+        }
+        if (NextPos) {
+            Result.set_next_page_token(ToString(NextPos));
+        }
+        Reply();
+    }
+
+    bool IsExcludedFromListing(const TString& path) const {
+        for (const auto& regexp : ExcludeRegexps) {
+            if (regexp.Match(path.c_str())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    TEvImport::TEvListObjectsInFsExportRequest::TPtr Request;
+    Ydb::Import::ListObjectsInFsExportResult Result;
+    size_t StartPos = 0;
+    size_t PageSize = 0;
+    size_t NextPos = 0;
+    TPathFilter PathFilter;
+    std::vector<TRegExMatch> ExcludeRegexps;
+    std::vector<NBackup::TSchemaMapping::TItem> ListedItems;
+    TString ListMarker;
+};
+
 class TFSHelper {
 public:
     static TString GetFullPath(const TString& basePath, const TString& relativePath) {
@@ -1730,6 +2054,10 @@ IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr imp
 
 IActor* CreateListObjectsInS3ExportGetter(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev) {
     return new TListObjectsInS3ExportGetter(std::move(ev));
+}
+
+IActor* CreateListObjectsInFsExportGetter(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev) {
+    return new TListObjectsInFsExportGetter(std::move(ev));
 }
 
 } // NSchemeShard

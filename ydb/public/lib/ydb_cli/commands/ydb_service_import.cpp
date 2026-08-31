@@ -441,6 +441,34 @@ static int PrintListObjectResult(const NImport::TListObjectsInS3ExportResult& re
     }
 }
 
+static int PrintListObjectResultPretty(const NImport::TListObjectsInFsExportResult& result) {
+    TVector<TString> tableColums {"Database Path", "FS Path"};
+    TPrettyTable table(tableColums);
+    for (const NImport::TListObjectsInFsExportResult::TItem& item : result.GetItems()) {
+        auto& row = table.AddRow();
+        row.Column(0, item.DbPath);
+        row.Column(1, item.FsPath);
+    }
+    table.Print(Cout);
+    return EXIT_SUCCESS;
+}
+
+static int PrintListObjectResultProtoJsonBase64(const NImport::TListObjectsInFsExportResult& result) {
+    return PrintProtoJsonBase64(TProtoAccessor::GetProto(result), Cout);
+}
+
+static int PrintListObjectResult(const NImport::TListObjectsInFsExportResult& result, EDataFormat format) {
+    switch (format) {
+        case EDataFormat::Default:
+        case EDataFormat::Pretty:
+            return PrintListObjectResultPretty(result);
+        case EDataFormat::ProtoJsonBase64:
+            return PrintListObjectResultProtoJsonBase64(result);
+        default:
+            throw std::runtime_error(TStringBuilder() << "Unsupported output format: " << format);
+    }
+}
+
 int TCommandImportFromS3::Run(TConfig& config) {
     if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
         try {
@@ -503,6 +531,9 @@ void TCommandImportFromNfs::Config(TConfig& config) {
 
     config.Opts->AddLongOption("item", TItemNfs::FormatHelp("Item specification", config.HelpCommandVerbosityLevel, 2))
         .RequiredArgument("PROPERTY=VALUE,...");
+
+    config.Opts->AddLongOption('l', "list", "List objects in an existing export")
+        .RequiredArgument("BOOL").StoreTrue(&ListObjectsInExistingExport).DefaultValue("false");
 }
 
 void TCommandImportFromNfs::Parse(TConfig& config) {
@@ -526,6 +557,25 @@ NImport::TImportFromFsSettings TCommandImportFromNfs::MakeImportSettings() {
     return settings;
 }
 
+NImport::TListObjectsInFsExportSettings TCommandImportFromNfs::MakeListObjectsSettings() {
+    using namespace NImport;
+
+    TListObjectsInFsExportSettings settings = FillSettings<TListObjectsInFsExportSettings>(TListObjectsInFsExportSettings());
+    settings.BasePath(CommonSourcePrefix);
+    settings.NumberOfRetries(NumberOfRetries);
+
+    const bool encryption = !EncryptionKey.empty();
+    if (encryption) {
+        settings.SymmetricKey(EncryptionKey);
+    }
+
+    for (const TString& path : IncludePaths) {
+        settings.AppendItem({.Path = path});
+    }
+
+    return settings;
+}
+
 int TCommandImportFromNfs::Run(TConfig& config) {
     if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
         try {
@@ -541,12 +591,20 @@ int TCommandImportFromNfs::Run(TConfig& config) {
     auto driver = CreateDriver(config);
     TImportClient client(driver);
 
-    auto settings = MakeImportSettings();
-    auto response = client.ImportFromFs(std::move(settings)).GetValueSync();
-    ThrowOnError(response);
-    PrintOperation(response, OutputFormat);
+    int returnCode = EXIT_SUCCESS;
+    if (ListObjectsInExistingExport) {
+        TListObjectsInFsExportSettings settings = MakeListObjectsSettings();
+        TListObjectsInFsExportResult result = client.ListObjectsInFsExport(std::move(settings)).GetValueSync();
+        NStatusHelpers::ThrowOnErrorOrPrintIssues(result);
+        returnCode = PrintListObjectResult(result, OutputFormat);
+    } else {
+        TImportFromFsSettings settings = MakeImportSettings();
+        TImportFromFsResponse response = client.ImportFromFs(std::move(settings)).GetValueSync();
+        ThrowOnError(response);
+        PrintOperation(response, OutputFormat);
+    }
 
-    return EXIT_SUCCESS;
+    return returnCode;
 }
 
 /// File

@@ -36,6 +36,48 @@ public:
         return settings;
     }
 
+    NYdb::NImport::TListObjectsInFsExportSettings MakeListObjectsInFsExportSettings() {
+        NYdb::NImport::TListObjectsInFsExportSettings settings;
+        settings.BasePath(TString(GetTempDir().Path()));
+        return settings;
+    }
+
+    void ValidateListObjectsInFsExport(
+        const TSet<std::pair<TString /* fsPath */, TString /* dbPath */>>& paths,
+        const NYdb::NImport::TListObjectsInFsExportSettings& settings)
+    {
+        auto res = YdbImportClient().ListObjectsInFsExport(settings).GetValueSync();
+        UNIT_ASSERT_C(res.IsSuccess(), "Status: " << res.GetStatus() << ". Issues: " << res.GetIssues().ToString());
+
+        TSet<std::pair<TString, TString>> pathsInResponse;
+        for (const auto& item : res.GetItems()) {
+            const bool inserted = pathsInResponse.emplace(item.FsPath, item.DbPath).second;
+            UNIT_ASSERT_C(inserted, "Duplicate item: {" << item.FsPath << ", " << item.DbPath << "}. Listing result: " << res);
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL_C(pathsInResponse, paths, "Listing result: " << res);
+    }
+
+    void ValidateListObjectsInFsExport(const TSet<std::pair<TString, TString>>& paths) {
+        ValidateListObjectsInFsExport(paths, MakeListObjectsInFsExportSettings());
+    }
+
+    void ValidateListObjectPathsInFsExport(
+        const TSet<TString>& paths,
+        const NYdb::NImport::TListObjectsInFsExportSettings& settings)
+    {
+        auto res = YdbImportClient().ListObjectsInFsExport(settings).GetValueSync();
+        UNIT_ASSERT_C(res.IsSuccess(), "Status: " << res.GetStatus() << ". Issues: " << res.GetIssues().ToString());
+
+        TSet<TString> pathsInResponse;
+        for (const auto& item : res.GetItems()) {
+            const bool inserted = pathsInResponse.emplace(item.DbPath).second;
+            UNIT_ASSERT_C(inserted, "Duplicate item: {" << item.FsPath << ", " << item.DbPath << "}. Listing result: " << res);
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL_C(pathsInResponse, paths, "Listing result: " << res);
+    }
+
     void ModifyChecksumAndCheckThatImportFails(const TString& checksumFile, const NYdb::NImport::TImportFromFsSettings& importSettings) {
         TString fullPath = TString(GetTempDir().Path()) + "/" + checksumFile;
         TString original = TFileInput(fullPath).ReadAll();
