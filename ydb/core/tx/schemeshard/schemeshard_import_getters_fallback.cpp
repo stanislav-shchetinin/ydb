@@ -53,43 +53,31 @@ private:
     TImportInfo::TPtr ImportInfo;
 }; // TSchemeGetterFallback
 
-class TListObjectsInS3ExportGetterFallback: public TActorBootstrapped<TListObjectsInS3ExportGetterFallback> {
+template <typename TRequestEvent, typename TResponseEvent>
+class TListObjectsInExportGetterFallback
+    : public TActorBootstrapped<TListObjectsInExportGetterFallback<TRequestEvent, TResponseEvent>>
+{
 public:
-    TListObjectsInS3ExportGetterFallback(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev)
+    using TThis = TListObjectsInExportGetterFallback<TRequestEvent, TResponseEvent>;
+
+    TListObjectsInExportGetterFallback(typename TRequestEvent::TPtr&& ev, TStringBuf storageName)
         : Request(std::move(ev))
+        , StorageName(storageName)
     {
     }
 
     void Bootstrap() {
-        auto result = MakeHolder<TEvImport::TEvListObjectsInS3ExportResponse>();
+        auto result = MakeHolder<TResponseEvent>();
         result->Record.set_status(Ydb::StatusIds::UNSUPPORTED);
-        result->Record.add_issues()->set_message("S3 listings are disabled");
-        Send(Request->Sender, std::move(result));
-        PassAway();
+        result->Record.add_issues()->set_message(TStringBuilder() << StorageName << " listings are disabled");
+        this->Send(Request->Sender, std::move(result));
+        this->PassAway();
     }
 
 private:
-    TEvImport::TEvListObjectsInS3ExportRequest::TPtr Request;
-}; // TListObjectsInS3ExportGetterFallback
-
-class TListObjectsInFsExportGetterFallback: public TActorBootstrapped<TListObjectsInFsExportGetterFallback> {
-public:
-    TListObjectsInFsExportGetterFallback(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev)
-        : Request(std::move(ev))
-    {
-    }
-
-    void Bootstrap() {
-        auto result = MakeHolder<TEvImport::TEvListObjectsInFsExportResponse>();
-        result->Record.set_status(Ydb::StatusIds::UNSUPPORTED);
-        result->Record.add_issues()->set_message("FS listings are disabled");
-        Send(Request->Sender, std::move(result));
-        PassAway();
-    }
-
-private:
-    TEvImport::TEvListObjectsInFsExportRequest::TPtr Request;
-}; // TListObjectsInFsExportGetterFallback
+    typename TRequestEvent::TPtr Request;
+    const TString StorageName;
+}; // TListObjectsInExportGetterFallback
 
 IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV>) {
     return new TSchemeGetterFallback(replyTo, std::move(importInfo), itemIdx);
@@ -100,11 +88,15 @@ IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr imp
 }
 
 IActor* CreateListObjectsInS3ExportGetter(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev) {
-    return new TListObjectsInS3ExportGetterFallback(std::move(ev));
+    return new TListObjectsInExportGetterFallback<
+        TEvImport::TEvListObjectsInS3ExportRequest,
+        TEvImport::TEvListObjectsInS3ExportResponse>(std::move(ev), "S3");
 }
 
 IActor* CreateListObjectsInFsExportGetter(TEvImport::TEvListObjectsInFsExportRequest::TPtr&& ev) {
-    return new TListObjectsInFsExportGetterFallback(std::move(ev));
+    return new TListObjectsInExportGetterFallback<
+        TEvImport::TEvListObjectsInFsExportRequest,
+        TEvImport::TEvListObjectsInFsExportResponse>(std::move(ev), "FS");
 }
 
 } // NSchemeShard
