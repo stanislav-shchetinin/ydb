@@ -145,4 +145,12 @@ Y_UNIT_TEST_SUITE_F(ListObjectsInFsExport, TListObjectsInFsExportTestFixture) {
         UNIT_ASSERT_VALUES_EQUAL_C(res.GetStatus(), EStatus::BAD_REQUEST,
             "Status: " << res.GetStatus() << ". Issues: " << res.GetIssues().ToString());
     }
+
+    Y_UNIT_TEST(FeatureDisabled) {
+        Server().GetRuntime()->GetAppData().FeatureFlags.SetEnableFsBackups(false);
+
+        auto res = YdbImportClient().ListObjectsInFsExport(MakeListObjectsInFsExportSettings()).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(res.GetStatus(), EStatus::UNSUPPORTED,
+            "Status: " << res.GetStatus() << ". Issues: " << res.GetIssues().ToString());
+    }
 }

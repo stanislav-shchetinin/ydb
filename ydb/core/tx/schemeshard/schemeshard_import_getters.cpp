@@ -1464,12 +1464,12 @@ struct TListObjectsInS3ExportTraits {
     using TResult = Ydb::Import::ListObjectsInS3ExportResult;
     using TSettings = Ydb::Import::ListObjectsInS3ExportSettings;
 
-    static bool ValidateSettings(const TSettings& settings, TString& error) {
+    static Ydb::StatusIds::StatusCode ValidateSettings(const TSettings& settings, TString& error) {
         if (NBackup::NormalizeExportPrefix(settings.prefix()).empty()) {
             error = "Empty S3 prefix specified";
-            return false;
+            return Ydb::StatusIds::BAD_REQUEST;
         }
-        return true;
+        return Ydb::StatusIds::SUCCESS;
     }
 
     static TString GetSchemaMappingKey(const TSettings& settings) {
@@ -1516,16 +1516,20 @@ struct TListObjectsInFsExportTraits {
     using TResult = Ydb::Import::ListObjectsInFsExportResult;
     using TSettings = Ydb::Import::ListObjectsInFsExportSettings;
 
-    static bool ValidateSettings(const TSettings& settings, TString& error) {
+    static Ydb::StatusIds::StatusCode ValidateSettings(const TSettings& settings, TString& error) {
+        if (!AppData()->FeatureFlags.GetEnableFsBackups()) {
+            error = "The feature flag \"EnableFsBackups\" is disabled. The operation cannot be performed.";
+            return Ydb::StatusIds::UNSUPPORTED;
+        }
         if (settings.base_path().empty()) {
             error = "Empty FS base path specified";
-            return false;
+            return Ydb::StatusIds::BAD_REQUEST;
         }
         if (!TFsPath(settings.base_path()).IsAbsolute()) {
             error = "base_path must be an absolute path";
-            return false;
+            return Ydb::StatusIds::BAD_REQUEST;
         }
-        return true;
+        return Ydb::StatusIds::SUCCESS;
     }
 
     static TString GetBasePath(const TSettings& settings) {
@@ -1618,8 +1622,9 @@ public:
         }
         const auto& settings = req.GetSettings();
         TString error;
-        if (!TTraits::ValidateSettings(settings, error)) {
-            Reply(Ydb::StatusIds::BAD_REQUEST, error);
+        const auto status = TTraits::ValidateSettings(settings, error);
+        if (status != Ydb::StatusIds::SUCCESS) {
+            Reply(status, error);
             return false;
         }
 
