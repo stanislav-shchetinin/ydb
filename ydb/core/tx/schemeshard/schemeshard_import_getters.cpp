@@ -65,26 +65,28 @@ struct TGetterSettings {
         return settings;
     }
 
+    template <typename TSettings>
+    static void FillFromRequest(TGetterSettings& settings, const TSettings& requestSettings) {
+        settings.Retries = requestSettings.number_of_retries();
+        if (requestSettings.has_encryption_settings()) {
+            settings.Key = NBackup::TEncryptionKey(requestSettings.encryption_settings().symmetric_key().key());
+        }
+    }
+
     static TGetterSettings FromRequest(const TEvImport::TEvListObjectsInS3ExportRequest::TPtr& ev) {
+        const auto& requestSettings = ev->Get()->Record.settings();
         TGetterSettings settings;
         settings.ExternalStorageConfig.reset(new NWrappers::NExternalStorage::TS3ExternalStorageConfig(
-            AppData()->AwsClientConfig,
-            ev->Get()->Record.settings()));
-        settings.Retries = ev->Get()->Record.settings().number_of_retries();
-        if (ev->Get()->Record.settings().has_encryption_settings()) {
-            settings.Key = NBackup::TEncryptionKey(ev->Get()->Record.settings().encryption_settings().symmetric_key().key());
-        }
+            AppData()->AwsClientConfig, requestSettings));
+        FillFromRequest(settings, requestSettings);
         return settings;
     }
 
     static TGetterSettings FromRequest(const TEvImport::TEvListObjectsInFsExportRequest::TPtr& ev) {
+        const auto& requestSettings = ev->Get()->Record.settings();
         TGetterSettings settings;
-        settings.ExternalStorageConfig.reset(new NWrappers::NExternalStorage::TFsExternalStorageConfig(
-            ev->Get()->Record.settings()));
-        settings.Retries = ev->Get()->Record.settings().number_of_retries();
-        if (ev->Get()->Record.settings().has_encryption_settings()) {
-            settings.Key = NBackup::TEncryptionKey(ev->Get()->Record.settings().encryption_settings().symmetric_key().key());
-        }
+        settings.ExternalStorageConfig.reset(new NWrappers::NExternalStorage::TFsExternalStorageConfig(requestSettings));
+        FillFromRequest(settings, requestSettings);
         settings.LogPrefix = "fs"sv;
         return settings;
     }
@@ -1480,24 +1482,17 @@ struct TListObjectsInS3ExportTraits {
         return NBackup::NormalizeExportPrefix(settings.prefix()) + "/";
     }
 
-    static TMaybe<NBackup::TSchemaMapping::TItem> TryParseListedItem(TStringBuf key, const TSettings& settings, bool encrypted) {
+    static TMaybe<TStringBuf> GetListedItemPath(TStringBuf key, const TSettings& settings) {
         const TString prefix = GetListPrefix(settings);
         const size_t prefixPos = key.find(prefix);
         if (prefixPos == TStringBuf::npos) {
             return {};
         }
-        key = key.SubString(prefixPos + prefix.size(), TStringBuf::npos);
+        return key.SubString(prefixPos + prefix.size(), TStringBuf::npos);
+    }
 
-        const TString suffix = TString("/metadata.json") + (encrypted ? ".enc" : "");
-        if (!key.ChopSuffix(suffix)) {
-            return {};
-        }
-
-        TString path(key);
-        return NBackup::TSchemaMapping::TItem{
-            .ExportPrefix = path,
-            .ObjectPath = path,
-        };
+    static bool IsValidListedItemPath(TStringBuf) {
+        return true;
     }
 
     static void FillResultItem(TResult::Item& result, const NBackup::TSchemaMapping::TItem& item) {
@@ -1548,7 +1543,7 @@ struct TListObjectsInFsExportTraits {
         return GetBasePath(settings);
     }
 
-    static TMaybe<NBackup::TSchemaMapping::TItem> TryParseListedItem(TStringBuf key, const TSettings& settings, bool encrypted) {
+    static TMaybe<TStringBuf> GetListedItemPath(TStringBuf key, const TSettings& settings) {
         const TString basePath = GetBasePath(settings);
         if (!key.StartsWith(basePath)) {
             return {};
@@ -1557,17 +1552,11 @@ struct TListObjectsInFsExportTraits {
         if (key.StartsWith("/")) {
             key.Skip(1);
         }
+        return key;
+    }
 
-        const TString suffix = TString("/metadata.json") + (encrypted ? ".enc" : "");
-        if (!key.ChopSuffix(suffix) || key.empty() || key == "SchemaMapping") {
-            return {};
-        }
-
-        TString path(key);
-        return NBackup::TSchemaMapping::TItem{
-            .ExportPrefix = path,
-            .ObjectPath = path,
-        };
+    static bool IsValidListedItemPath(TStringBuf path) {
+        return path && path != "SchemaMapping";
     }
 
     static void FillResultItem(TResult::Item& result, const NBackup::TSchemaMapping::TItem& item) {
@@ -1703,6 +1692,24 @@ public:
         this->Become(&TThis::StateListObjects);
     }
 
+    TMaybe<NBackup::TSchemaMapping::TItem> TryParseListedItem(TStringBuf key) const {
+        auto path = TTraits::GetListedItemPath(key, Request->Get()->Record.GetSettings());
+        if (!path) {
+            return {};
+        }
+
+        const TString suffix = TString("/metadata.json") + (this->Key.Defined() ? ".enc" : "");
+        if (!path->ChopSuffix(suffix) || !TTraits::IsValidListedItemPath(*path)) {
+            return {};
+        }
+
+        TString itemPath(*path);
+        return NBackup::TSchemaMapping::TItem{
+            .ExportPrefix = itemPath,
+            .ObjectPath = itemPath,
+        };
+    }
+
     void HandleListObjects(TEvExternalStorage::TEvListObjectsResponse::TPtr& ev) {
         const auto& result = ev.Get()->Get()->Result;
         LOG_D("HandleListObjects TEvExternalStorage::TEvListObjectResponse"
@@ -1718,7 +1725,7 @@ public:
         for (const auto& obj : objects) {
             const auto& objectKey = obj.GetKey();
             TStringBuf key(objectKey.data(), objectKey.size());
-            if (auto item = TTraits::TryParseListedItem(key, Request->Get()->Record.GetSettings(), this->Key.Defined())) {
+            if (auto item = TryParseListedItem(key)) {
                 ListedItems.emplace_back(std::move(*item));
             }
         }

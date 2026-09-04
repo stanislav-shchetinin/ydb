@@ -36,6 +36,17 @@ std::vector<TImportItemProgress> ItemsProgressFromProto(const google::protobuf::
     return result;
 }
 
+template <class TSettingsProto, class TSettings>
+void FillRetriesAndEncryptionSettings(TSettingsProto& proto, const TSettings& settings) {
+    if (settings.NumberOfRetries_) {
+        proto.set_number_of_retries(settings.NumberOfRetries_.value());
+    }
+
+    if (settings.SymmetricKey_) {
+        proto.mutable_encryption_settings()->mutable_symmetric_key()->set_key(*settings.SymmetricKey_);
+    }
+}
+
 template <class TS3SettingsProto, class TSettings>
 void FillS3Settings(TS3SettingsProto& proto, const TSettings& settings) {
     proto.set_endpoint(TStringType{settings.Endpoint_});
@@ -44,15 +55,65 @@ void FillS3Settings(TS3SettingsProto& proto, const TSettings& settings) {
     proto.set_access_key(TStringType{settings.AccessKey_});
     proto.set_secret_key(TStringType{settings.SecretKey_});
 
-    if (settings.NumberOfRetries_) {
-        proto.set_number_of_retries(settings.NumberOfRetries_.value());
-    }
-
-    if (settings.SymmetricKey_) {
-        proto.mutable_encryption_settings()->mutable_symmetric_key()->set_key(*settings.SymmetricKey_);
-    }
-
+    FillRetriesAndEncryptionSettings(proto, settings);
     proto.set_disable_virtual_addressing(!settings.UseVirtualAddressing_);
+}
+
+template <class TRequest, class TSettingsProto, class TSettings>
+void FillListObjectsRequest(TRequest& request, TSettingsProto& settingsProto, const TSettings& settings,
+        std::int64_t pageSize, const std::string& pageToken) {
+    for (const auto& item : settings.Item_) {
+        if (item.Path.empty()) {
+            throw TContractViolation(
+                TStringBuilder() << "Invalid item: path is not set");
+        }
+
+        settingsProto.add_items()->set_path(item.Path);
+    }
+
+    for (const std::string& excludeRegexp : settings.ExcludeRegexp_) {
+        settingsProto.add_exclude_regexps(excludeRegexp);
+    }
+
+    request.set_page_size(pageSize);
+    request.set_page_token(pageToken);
+}
+
+template <class TItem, class TProto, class TMakeItem>
+std::vector<TItem> ListObjectsItemsFromProto(const TProto& proto, TMakeItem makeItem) {
+    std::vector<TItem> items;
+    items.reserve(proto.items_size());
+    for (const auto& item : proto.items()) {
+        items.emplace_back(makeItem(item));
+    }
+    return items;
+}
+
+template <class TProto>
+std::unique_ptr<TProto> CloneProto(const std::unique_ptr<TProto>& proto) {
+    return std::make_unique<TProto>(*proto);
+}
+
+template <class TItem, class TProto>
+void AssignListObjectsResult(
+        std::vector<TItem>& items,
+        std::string& nextPageToken,
+        std::unique_ptr<TProto>& proto,
+        const std::vector<TItem>& sourceItems,
+        const std::string& sourceNextPageToken,
+        const std::unique_ptr<TProto>& sourceProto) {
+    items = sourceItems;
+    nextPageToken = sourceNextPageToken;
+    proto = CloneProto(sourceProto);
+}
+
+template <class TItems>
+void OutListObjectsResult(IOutputStream& out, const TStatus& status, const TItems& items, const std::string& nextPageToken) {
+    if (status.IsSuccess()) {
+        out << "{ items: [" << JoinSeq(", ", items) << "], next_page_token: \"" << nextPageToken << "\" }";
+    } else {
+        status.Out(out);
+    }
 }
 
 } // anonymous
@@ -125,23 +186,22 @@ const TImportFromFsResponse::TMetadata& TImportFromFsResponse::Metadata() const 
 
 TListObjectsInS3ExportResult::TListObjectsInS3ExportResult(TStatus&& status, const Ydb::Import::ListObjectsInS3ExportResult& proto)
     : TStatus(std::move(status))
-    , Proto_(std::make_unique<Ydb::Import::ListObjectsInS3ExportResult>(proto))
-{
-    Items_.reserve(proto.items_size());
-    for (const auto& item : proto.items()) {
-        Items_.emplace_back(TItem{
+    , Items_(ListObjectsItemsFromProto<TItem>(proto, [](const auto& item) {
+        return TItem{
             .Prefix = item.prefix(),
             .Path = item.path()
-        });
-    }
-    NextPageToken_ = proto.next_page_token();
+        };
+    }))
+    , NextPageToken_(proto.next_page_token())
+    , Proto_(std::make_unique<Ydb::Import::ListObjectsInS3ExportResult>(proto))
+{
 }
 
 TListObjectsInS3ExportResult::TListObjectsInS3ExportResult(const TListObjectsInS3ExportResult& result)
     : TStatus(result)
     , Items_(result.Items_)
     , NextPageToken_(result.NextPageToken_)
-    , Proto_(std::make_unique<Ydb::Import::ListObjectsInS3ExportResult>(*result.Proto_))
+    , Proto_(CloneProto(result.Proto_))
 {
 }
 
@@ -153,9 +213,7 @@ TListObjectsInS3ExportResult& TListObjectsInS3ExportResult::operator=(TListObjec
 
 TListObjectsInS3ExportResult& TListObjectsInS3ExportResult::operator=(const TListObjectsInS3ExportResult& result) {
     TStatus::operator=(result);
-    Items_ = result.Items_;
-    NextPageToken_ = result.NextPageToken_;
-    Proto_ = std::make_unique<Ydb::Import::ListObjectsInS3ExportResult>(*result.Proto_);
+    AssignListObjectsResult(Items_, NextPageToken_, Proto_, result.Items_, result.NextPageToken_, result.Proto_);
     return *this;
 }
 
@@ -168,11 +226,7 @@ const Ydb::Import::ListObjectsInS3ExportResult& TListObjectsInS3ExportResult::Ge
 }
 
 void TListObjectsInS3ExportResult::Out(IOutputStream& out) const {
-    if (IsSuccess()) {
-        out << "{ items: [" << JoinSeq(", ", Items_) << "], next_page_token: \"" << NextPageToken_ << "\" }";
-    } else {
-        return TStatus::Out(out);
-    }
+    OutListObjectsResult(out, *this, Items_, NextPageToken_);
 }
 
 void TListObjectsInS3ExportResult::TItem::Out(IOutputStream& out) const {
@@ -182,23 +236,22 @@ void TListObjectsInS3ExportResult::TItem::Out(IOutputStream& out) const {
 
 TListObjectsInFsExportResult::TListObjectsInFsExportResult(TStatus&& status, const Ydb::Import::ListObjectsInFsExportResult& proto)
     : TStatus(std::move(status))
-    , Proto_(std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(proto))
-{
-    Items_.reserve(proto.items_size());
-    for (const auto& item : proto.items()) {
-        Items_.emplace_back(TItem{
+    , Items_(ListObjectsItemsFromProto<TItem>(proto, [](const auto& item) {
+        return TItem{
             .FsPath = item.fs_path(),
             .DbPath = item.db_path()
-        });
-    }
-    NextPageToken_ = proto.next_page_token();
+        };
+    }))
+    , NextPageToken_(proto.next_page_token())
+    , Proto_(std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(proto))
+{
 }
 
 TListObjectsInFsExportResult::TListObjectsInFsExportResult(const TListObjectsInFsExportResult& result)
     : TStatus(result)
     , Items_(result.Items_)
     , NextPageToken_(result.NextPageToken_)
-    , Proto_(std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(*result.Proto_))
+    , Proto_(CloneProto(result.Proto_))
 {
 }
 
@@ -210,9 +263,7 @@ TListObjectsInFsExportResult& TListObjectsInFsExportResult::operator=(TListObjec
 
 TListObjectsInFsExportResult& TListObjectsInFsExportResult::operator=(const TListObjectsInFsExportResult& result) {
     TStatus::operator=(result);
-    Items_ = result.Items_;
-    NextPageToken_ = result.NextPageToken_;
-    Proto_ = std::make_unique<Ydb::Import::ListObjectsInFsExportResult>(*result.Proto_);
+    AssignListObjectsResult(Items_, NextPageToken_, Proto_, result.Items_, result.NextPageToken_, result.Proto_);
     return *this;
 }
 
@@ -225,11 +276,7 @@ const Ydb::Import::ListObjectsInFsExportResult& TListObjectsInFsExportResult::Ge
 }
 
 void TListObjectsInFsExportResult::Out(IOutputStream& out) const {
-    if (IsSuccess()) {
-        out << "{ items: [" << JoinSeq(", ", Items_) << "], next_page_token: \"" << NextPageToken_ << "\" }";
-    } else {
-        return TStatus::Out(out);
-    }
+    OutListObjectsResult(out, *this, Items_, NextPageToken_);
 }
 
 void TListObjectsInFsExportResult::TItem::Out(IOutputStream& out) const {
@@ -265,23 +312,24 @@ public:
             TRpcRequestSettings::Make(settings));
     }
 
-    TAsyncListObjectsInS3ExportResult ListObjectsInS3Export(ListObjectsInS3ExportRequest&& request, const TListObjectsInS3ExportSettings& settings) {
-        auto promise = NThreading::NewPromise<TListObjectsInS3ExportResult>();
+    template <class TClientResult, class TProtoResult, class TResponse, class TRequest, class TSettings, class TAsyncMethod>
+    NThreading::TFuture<TClientResult> ListObjects(TRequest&& request, const TSettings& settings, TAsyncMethod asyncMethod) {
+        auto promise = NThreading::NewPromise<TClientResult>();
 
         auto extractor = [promise]
             (google::protobuf::Any* any, TPlainStatus status) mutable {
-                ListObjectsInS3ExportResult result;
+                TProtoResult result;
                 if (any) {
                     any->UnpackTo(&result);
                 }
 
-                promise.SetValue(TListObjectsInS3ExportResult(TStatus(std::move(status)), result));
+                promise.SetValue(TClientResult(TStatus(std::move(status)), result));
             };
 
-        Connections_->RunDeferred<V1::ImportService, ListObjectsInS3ExportRequest, ListObjectsInS3ExportResponse>(
+        Connections_->RunDeferred<V1::ImportService, TRequest, TResponse>(
             std::move(request),
             extractor,
-            &V1::ImportService::Stub::AsyncListObjectsInS3Export,
+            asyncMethod,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings));
@@ -289,28 +337,14 @@ public:
         return promise.GetFuture();
     }
 
+    TAsyncListObjectsInS3ExportResult ListObjectsInS3Export(ListObjectsInS3ExportRequest&& request, const TListObjectsInS3ExportSettings& settings) {
+        return ListObjects<TListObjectsInS3ExportResult, Ydb::Import::ListObjectsInS3ExportResult, ListObjectsInS3ExportResponse>(
+            std::move(request), settings, &V1::ImportService::Stub::AsyncListObjectsInS3Export);
+    }
+
     TAsyncListObjectsInFsExportResult ListObjectsInFsExport(ListObjectsInFsExportRequest&& request, const TListObjectsInFsExportSettings& settings) {
-        auto promise = NThreading::NewPromise<TListObjectsInFsExportResult>();
-
-        auto extractor = [promise]
-            (google::protobuf::Any* any, TPlainStatus status) mutable {
-                ListObjectsInFsExportResult result;
-                if (any) {
-                    any->UnpackTo(&result);
-                }
-
-                promise.SetValue(TListObjectsInFsExportResult(TStatus(std::move(status)), result));
-            };
-
-        Connections_->RunDeferred<V1::ImportService, ListObjectsInFsExportRequest, ListObjectsInFsExportResponse>(
-            std::move(request),
-            extractor,
-            &V1::ImportService::Stub::AsyncListObjectsInFsExport,
-            DbDriverState_,
-            INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings));
-
-        return promise.GetFuture();
+        return ListObjects<TListObjectsInFsExportResult, Ydb::Import::ListObjectsInFsExportResult, ListObjectsInFsExportResponse>(
+            std::move(request), settings, &V1::ImportService::Stub::AsyncListObjectsInFsExport);
     }
 
     template <typename TSettings>
@@ -471,22 +505,7 @@ TAsyncListObjectsInS3ExportResult TImportClient::ListObjectsInS3Export(const TLi
         settingsProto.set_prefix(settings.Prefix_.value());
     }
 
-    for (const auto& item : settings.Item_) {
-        if (item.Path.empty()) {
-            throw TContractViolation(
-                TStringBuilder() << "Invalid item: path is not set");
-        }
-
-        settingsProto.add_items()->set_path(item.Path);
-    }
-
-    for (const std::string& excludeRegexp : settings.ExcludeRegexp_) {
-        settingsProto.add_exclude_regexps(excludeRegexp);
-    }
-
-    // Paging
-    request.set_page_size(pageSize);
-    request.set_page_token(pageToken);
+    FillListObjectsRequest(request, settingsProto, settings, pageSize, pageToken);
 
     return Impl_->ListObjectsInS3Export(std::move(request), settings);
 }
@@ -496,30 +515,8 @@ TAsyncListObjectsInFsExportResult TImportClient::ListObjectsInFsExport(const TLi
     Ydb::Import::ListObjectsInFsExportSettings& settingsProto = *request.mutable_settings();
 
     settingsProto.set_base_path(TStringType{settings.BasePath_});
-
-    if (settings.NumberOfRetries_) {
-        settingsProto.set_number_of_retries(settings.NumberOfRetries_.value());
-    }
-
-    if (settings.SymmetricKey_) {
-        settingsProto.mutable_encryption_settings()->mutable_symmetric_key()->set_key(*settings.SymmetricKey_);
-    }
-
-    for (const auto& item : settings.Item_) {
-        if (item.Path.empty()) {
-            throw TContractViolation(
-                TStringBuilder() << "Invalid item: path is not set");
-        }
-
-        settingsProto.add_items()->set_path(item.Path);
-    }
-
-    for (const std::string& excludeRegexp : settings.ExcludeRegexp_) {
-        settingsProto.add_exclude_regexps(excludeRegexp);
-    }
-
-    request.set_page_size(pageSize);
-    request.set_page_token(pageToken);
+    FillRetriesAndEncryptionSettings(settingsProto, settings);
+    FillListObjectsRequest(request, settingsProto, settings, pageSize, pageToken);
 
     return Impl_->ListObjectsInFsExport(std::move(request), settings);
 }

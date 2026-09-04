@@ -42,6 +42,9 @@ protected:
 
     template <typename TSettings>
     void FillCommonImportSettings(TSettings& settings);
+    template <typename TSettings>
+    void FillListObjectsSettings(TSettings& settings) const;
+    bool DecodeEncryptionKeyIfNeeded();
 
     TVector<TItem> Items;
     TVector<TRegExMatch> ExclusionPatterns;

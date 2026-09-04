@@ -60,25 +60,26 @@ public:
     }
 
     grpc::Status FillListResponse(Ydb::Import::ListObjectsInS3ExportResponse* response) {
-        Ydb::Import::ListObjectsInS3ExportResult res;
-        for (const auto& item : ListResultItems) {
-            auto* resultItem = res.add_items();
-            resultItem->set_prefix(item.Prefix);
-            resultItem->set_path(item.Path);
-        }
-        auto* operation = response->mutable_operation();
-        operation->set_ready(true);
-        operation->set_status(Ydb::StatusIds::SUCCESS);
-        operation->mutable_result()->PackFrom(res);
-        return grpc::Status();
+        return FillListResponseImpl<Ydb::Import::ListObjectsInS3ExportResult>(response, ListResultItems,
+            [](auto* resultItem, const auto& item) {
+                resultItem->set_prefix(item.Prefix);
+                resultItem->set_path(item.Path);
+            });
     }
 
     grpc::Status FillFsListResponse(Ydb::Import::ListObjectsInFsExportResponse* response) {
-        Ydb::Import::ListObjectsInFsExportResult res;
-        for (const auto& item : FsListResultItems) {
-            auto* resultItem = res.add_items();
-            resultItem->set_fs_path(item.FsPath);
-            resultItem->set_db_path(item.DbPath);
+        return FillListResponseImpl<Ydb::Import::ListObjectsInFsExportResult>(response, FsListResultItems,
+            [](auto* resultItem, const auto& item) {
+                resultItem->set_fs_path(item.FsPath);
+                resultItem->set_db_path(item.DbPath);
+            });
+    }
+
+    template <typename TResult, typename TResponse, typename TItems, typename TFillItem>
+    grpc::Status FillListResponseImpl(TResponse* response, const TItems& items, TFillItem fillItem) {
+        TResult res;
+        for (const auto& item : items) {
+            fillItem(res.add_items(), item);
         }
         auto* operation = response->mutable_operation();
         operation->set_ready(true);

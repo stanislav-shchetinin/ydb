@@ -188,6 +188,35 @@ void TCommandImportBase::FillCommonImportSettings(TSettings& settings) {
     }
 }
 
+template <typename TSettings>
+void TCommandImportBase::FillListObjectsSettings(TSettings& settings) const {
+    settings.NumberOfRetries(NumberOfRetries);
+
+    if (EncryptionKey) {
+        settings.SymmetricKey(EncryptionKey);
+    }
+
+    for (const TString& path : IncludePaths) {
+        settings.AppendItem({.Path = path});
+    }
+}
+
+bool TCommandImportBase::DecodeEncryptionKeyIfNeeded() {
+    if (!EncryptionKey || EncryptionKeyFile) {
+        return true;
+    }
+
+    try {
+        EncryptionKey = HexDecode(EncryptionKey);
+    } catch (const std::exception&) {
+        // Don't print error, it may contain secret.
+        Cerr << "Failed to decode encryption key from hex" << Endl;
+        return false;
+    }
+
+    return true;
+}
+
 bool IsSupportedObject(TStringBuf& key) {
     return key.ChopSuffix(NDump::NFiles::TableScheme().FileName)
         || key.ChopSuffix(NDump::NFiles::CreateView().FileName)
@@ -395,19 +424,10 @@ NImport::TListObjectsInS3ExportSettings TCommandImportFromS3::MakeListObjectsSet
     auto settings = FillSettings<NImport::TListObjectsInS3ExportSettings>(NImport::TListObjectsInS3ExportSettings());
 
     FillS3Settings(settings);
-    settings.NumberOfRetries(NumberOfRetries);
-
-    const bool encryption = !EncryptionKey.empty();
-    if (encryption) {
-        settings.SymmetricKey(EncryptionKey);
-    }
+    FillListObjectsSettings(settings);
 
     if (CommonSourcePrefix) {
         settings.Prefix(CommonSourcePrefix);
-    }
-
-    for (const TString& path : IncludePaths) {
-        settings.AppendItem({.Path = path});
     }
 
     return settings;
@@ -425,22 +445,6 @@ static int PrintListObjectResultPretty(const NImport::TListObjectsInS3ExportResu
     return EXIT_SUCCESS;
 }
 
-static int PrintListObjectResultProtoJsonBase64(const NImport::TListObjectsInS3ExportResult& result) {
-    return PrintProtoJsonBase64(TProtoAccessor::GetProto(result), Cout);
-}
-
-static int PrintListObjectResult(const NImport::TListObjectsInS3ExportResult& result, EDataFormat format) {
-    switch (format) {
-        case EDataFormat::Default:
-        case EDataFormat::Pretty:
-            return PrintListObjectResultPretty(result);
-        case EDataFormat::ProtoJsonBase64:
-            return PrintListObjectResultProtoJsonBase64(result);
-        default:
-            throw std::runtime_error(TStringBuilder() << "Unsupported output format: " << format);
-    }
-}
-
 static int PrintListObjectResultPretty(const NImport::TListObjectsInFsExportResult& result) {
     TVector<TString> tableColums {"Database Path", "FS Path"};
     TPrettyTable table(tableColums);
@@ -453,11 +457,13 @@ static int PrintListObjectResultPretty(const NImport::TListObjectsInFsExportResu
     return EXIT_SUCCESS;
 }
 
-static int PrintListObjectResultProtoJsonBase64(const NImport::TListObjectsInFsExportResult& result) {
+template <typename TResult>
+static int PrintListObjectResultProtoJsonBase64(const TResult& result) {
     return PrintProtoJsonBase64(TProtoAccessor::GetProto(result), Cout);
 }
 
-static int PrintListObjectResult(const NImport::TListObjectsInFsExportResult& result, EDataFormat format) {
+template <typename TResult>
+static int PrintListObjectResult(const TResult& result, EDataFormat format) {
     switch (format) {
         case EDataFormat::Default:
         case EDataFormat::Pretty:
@@ -470,14 +476,8 @@ static int PrintListObjectResult(const NImport::TListObjectsInFsExportResult& re
 }
 
 int TCommandImportFromS3::Run(TConfig& config) {
-    if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
-        try {
-            EncryptionKey = HexDecode(EncryptionKey);
-        } catch (const std::exception&) {
-            // Don't print error, it may contain secret.
-            Cerr << "Failed to decode encryption key from hex" << Endl;
-            return EXIT_FAILURE;
-        }
+    if (!DecodeEncryptionKeyIfNeeded()) {
+        return EXIT_FAILURE;
     }
 
     const bool encryption = !EncryptionKey.empty();
@@ -562,29 +562,14 @@ NImport::TListObjectsInFsExportSettings TCommandImportFromNfs::MakeListObjectsSe
 
     TListObjectsInFsExportSettings settings = FillSettings<TListObjectsInFsExportSettings>(TListObjectsInFsExportSettings());
     settings.BasePath(CommonSourcePrefix);
-    settings.NumberOfRetries(NumberOfRetries);
-
-    const bool encryption = !EncryptionKey.empty();
-    if (encryption) {
-        settings.SymmetricKey(EncryptionKey);
-    }
-
-    for (const TString& path : IncludePaths) {
-        settings.AppendItem({.Path = path});
-    }
+    FillListObjectsSettings(settings);
 
     return settings;
 }
 
 int TCommandImportFromNfs::Run(TConfig& config) {
-    if (EncryptionKey && !EncryptionKeyFile) { // We read key from env YDB_ENCRYPTION_KEY, treat as hex encoded
-        try {
-            EncryptionKey = HexDecode(EncryptionKey);
-        } catch (const std::exception&) {
-            // Don't print error, it may contain secret.
-            Cerr << "Failed to decode encryption key from hex" << Endl;
-            return EXIT_FAILURE;
-        }
+    if (!DecodeEncryptionKeyIfNeeded()) {
+        return EXIT_FAILURE;
     }
 
     using namespace NImport;
@@ -860,6 +845,8 @@ int TCommandImportFromParquet::Run(TConfig& config) {
 // Explicit template instantiations
 template void TCommandImportBase::FillCommonImportSettings<NImport::TImportFromS3Settings>(NImport::TImportFromS3Settings& settings);
 template void TCommandImportBase::FillCommonImportSettings<NImport::TImportFromFsSettings>(NImport::TImportFromFsSettings& settings);
+template void TCommandImportBase::FillListObjectsSettings<NImport::TListObjectsInS3ExportSettings>(NImport::TListObjectsInS3ExportSettings& settings) const;
+template void TCommandImportBase::FillListObjectsSettings<NImport::TListObjectsInFsExportSettings>(NImport::TListObjectsInFsExportSettings& settings) const;
 
 template void TCommandImportFromS3::FillS3Settings<NImport::TImportFromS3Settings>(NImport::TImportFromS3Settings& settings);
 template void TCommandImportFromS3::FillS3Settings<NImport::TListObjectsInS3ExportSettings>(NImport::TListObjectsInS3ExportSettings& settings);
