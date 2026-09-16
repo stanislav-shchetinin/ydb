@@ -371,6 +371,21 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
         UNIT_ASSERT(bootQueue.Empty());
     }
 
+    Y_UNIT_TEST(FollowerUsesLeaderBackupClassification) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo leader(1UL, *hive);
+        leader.IsBackup = true;
+        TFollowerGroup group(*hive);
+        TFollowerTabletInfo follower(leader, 1UL, group);
+        queue.AddToBootQueue(follower, 0, T0);
+        UNIT_ASSERT(queue.MainQueueEmpty());
+        auto record = queue.PopFromBackupQueue();
+        UNIT_ASSERT_VALUES_EQUAL(record.Record.TabletId, leader.Id);
+        UNIT_ASSERT_VALUES_EQUAL(record.Record.FollowerId, follower.Id);
+    }
+
     Y_UNIT_TEST(QueueRoutingWhenPacingDisabled) {
         // With pacing disabled the behaviour must be exactly as it was before
         TIntrusivePtr<TTabletStorageInfo> hiveStorage;
@@ -407,127 +422,135 @@ Y_UNIT_TEST_SUITE(THiveBackupBootTest) {
         }
     }
 
-    Y_UNIT_TEST(WaitQueueReturnsToFront) {
-        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
-        auto hive = MakeHive(hiveStorage, true);
-        auto& bootQueue = hive->GetBootQueue();
-
-        std::vector<THolder<TLeaderTabletInfo>> tablets;
-        for (TTabletId id = 1; id <= 3; ++id) {
-            auto& tablet = tablets.emplace_back(MakeHolder<TLeaderTabletInfo>(id, *hive));
-            tablet->SetType(TTabletTypes::DataShard);
-            tablet->IsBackup = true;
-            bootQueue.AddToBootQueue(*tablet, 0UL, T0 + TDuration::Seconds(id));
+    Y_UNIT_TEST(WaitQueueRetryIsBounded) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo tablet(1UL, *hive);
+        tablet.IsBackup = true;
+        for (ui64 i = 0; i < 3; ++i) {
+            queue.AddToBootQueue(tablet, 0, T0 + TDuration::Seconds(i));
+            queue.AddToBackupWaitQueue(queue.PopFromBackupQueue());
         }
-
-        // Tablets 1 and 2 could not be placed and went to the wait queue
-        bootQueue.AddToBackupWaitQueue(bootQueue.PopFromBackupQueue());
-        bootQueue.AddToBackupWaitQueue(bootQueue.PopFromBackupQueue());
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupWaitQueue.size(), 2);
-
-        // A new node has appeared - the waiting ones are older, so they go first
-        bootQueue.IncludeBackupWaitQueue();
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupWaitQueue.size(), 0);
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.BackupQueueSize(), 3);
-        UNIT_ASSERT_VALUES_EQUAL(*bootQueue.GetOldestBackupEnqueueTime(), T0 + TDuration::Seconds(1));
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 1UL);
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 2UL);
-        UNIT_ASSERT_VALUES_EQUAL(bootQueue.PopFromBackupQueue().Record.TabletId, 3UL);
+        UNIT_ASSERT_VALUES_EQUAL(*queue.GetOldestBackupEnqueueTime(), T0);
+        queue.IncludeBackupWaitQueue(1);
+        UNIT_ASSERT_VALUES_EQUAL(queue.BackupWaitQueue.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(queue.BackupQueueSize(), 1);
+        queue.PopFromBackupQueue();
+        UNIT_ASSERT_VALUES_EQUAL(*queue.GetOldestBackupEnqueueTime(), T0 + TDuration::Seconds(1));
     }
 
-    Y_UNIT_TEST(Budget) {
-        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
-        auto hive = MakeHive(hiveStorage, true);
-        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
-            config.SetBackupBootPacingEnabled(true);
-            config.SetBackupBootRate(10);
-            config.SetBackupBootBurst(10);
-            config.SetMaxBackupTabletsStarting(16);
-            config.SetBackupStartUserWeight(2);
-            config.SetBackupBootMaxDelay(300000);
-        });
-
-        // Full bucket, quiet cluster: limited by burst
-        hive->SetBackupBootTokens(10, T0);
-        hive->SetTabletsStarting(0, 0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 10);
-
-        // Empty bucket: nothing until the next token
-        hive->SetBackupBootTokens(0, T0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
-        // 100ms at 10 starts/sec is exactly one token. This is the boundary case that floating
-        // point gets wrong without a tolerance: TDuration::SecondsFloat() makes it 0.9999999999999999
-        hive->SetBackupBootTokens(0, T0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::MilliSeconds(100), 1.0), 1);
-
-        // Refill is capped by burst
-        hive->SetBackupBootTokens(0, T0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Seconds(100), 1.0), 10);
-
-        // User tablets starting crowd out backup starts: 8 * weight 2 == 16 == the whole window
-        hive->SetBackupBootTokens(10, T0);
-        hive->SetTabletsStarting(8, 0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 0);
-
-        hive->SetBackupBootTokens(10, T0);
-        hive->SetTabletsStarting(4, 0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 8); // 16 - 2*4
-
-        // Backup tablets already starting count against the window directly
-        hive->SetBackupBootTokens(10, T0);
-        hive->SetTabletsStarting(10, 10);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 1.0), 6); // 16 - 10
-
-        // Load factor scales both the window and the refill rate
-        hive->SetBackupBootTokens(10, T0);
-        hive->SetTabletsStarting(0, 0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 0.5), 8); // 16 * 0.5
-        hive->SetBackupBootTokens(10, T0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0, 0.0), 0);
+    Y_UNIT_TEST(DeferredRecordDoesNotBlockReadyRecords) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo delayed(1UL, *hive);
+        delayed.IsBackup = true;
+        TLeaderTabletInfo ready(2UL, *hive);
+        ready.IsBackup = true;
+        queue.AddToBootQueue(delayed, 0, T0);
+        queue.AddToBootQueue(ready, 0, T0 + TDuration::Seconds(1));
+        queue.DeferBackup(queue.PopFromBackupQueue(), T0 + TDuration::Hours(1));
+        UNIT_ASSERT_VALUES_EQUAL(queue.PopFromBackupQueue().Record.TabletId, 2);
+        UNIT_ASSERT_VALUES_EQUAL(*queue.GetOldestBackupEnqueueTime(), T0);
+        queue.PromoteBackupDeferred(T0 + TDuration::Minutes(1), 1);
+        UNIT_ASSERT(queue.BackupQueueEmpty());
+        queue.PromoteBackupDeferred(T0 + TDuration::Hours(1), 1);
+        UNIT_ASSERT_VALUES_EQUAL(queue.PopFromBackupQueue().Record.TabletId, 1);
+        UNIT_ASSERT(!queue.GetOldestBackupEnqueueTime());
     }
 
-    Y_UNIT_TEST(BudgetAgingGuaranteesProgress) {
-        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
-        auto hive = MakeHive(hiveStorage, true);
-        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
-            config.SetBackupBootPacingEnabled(true);
-            config.SetBackupBootRate(10);
-            config.SetBackupBootBurst(10);
-            config.SetMaxBackupTabletsStarting(16);
-            config.SetBackupStartUserWeight(2);
-            config.SetBackupBootMaxDelay(300000); // 5 minutes
-            config.SetBackupBootMinRate(1);
-        });
-        auto& bootQueue = hive->GetBootQueue();
-
-        TLeaderTabletInfo backupTablet(1UL, *hive);
-        backupTablet.SetType(TTabletTypes::DataShard);
-        backupTablet.IsBackup = true;
-        bootQueue.AddToBootQueue(backupTablet, 0UL, T0);
-
-        // Overloaded cluster and a lot of user starts - nothing gets through
-        hive->SetBackupBootTokens(0, T0);
-        hive->SetTabletsStarting(100, 0);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Seconds(1), 0.0), 0);
-
-        // ... but not forever: after BackupBootMaxDelay both gates are bypassed
-        hive->SetBackupBootTokens(0, T0);
-        TInstant escalated = T0 + TDuration::Seconds(301);
-        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(escalated, 0.0), 1);
+    Y_UNIT_TEST(OverdueBackupDoesNotSpinOrHideForegroundDeadline) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo tablet(1UL, *hive);
+        tablet.IsBackup = true;
+        queue.AddToBootQueue(tablet, 0, T0);
+        auto record = queue.PopFromBackupQueue();
+        queue.DeferBackup(record, T0);
+        UNIT_ASSERT(!queue.GetNextDeferredWakeup(T0));
+        queue.Defer(record.Record, T0 + TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(*queue.GetNextDeferredWakeup(T0), T0 + TDuration::Seconds(1));
+        UNIT_ASSERT(!queue.GetNextDeferredWakeup(T0 + TDuration::Seconds(1)));
+        UNIT_ASSERT(queue.HasReadyMainQueue(T0 + TDuration::Seconds(1)));
     }
 
-    Y_UNIT_TEST(LoadFactor) {
-        TIntrusivePtr<TTabletStorageInfo> hiveStorage;
-        auto hive = MakeHive(hiveStorage, true);
-        hive->UpdateConfig([](NKikimrConfig::THiveConfig& config) {
-            config.SetBackupBootPacingEnabled(true);
-            config.SetBackupBootFullSpeedUsage(0.5);
-            config.SetBackupBootStopUsage(0.8);
-        });
+    Y_UNIT_TEST(BlockedRetryRoundDoesNotRescanNewlyBlockedRecords) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, false);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo tablet(1UL, *hive);
+        for (ui32 i = 0; i < 3; ++i) {
+            queue.AddToBootQueue(tablet, 0, T0);
+            queue.Block(queue.PopFromBootQueue());
+        }
+        UNIT_ASSERT(!queue.HasReadyMainQueue(T0));
+        UNIT_ASSERT_VALUES_EQUAL(queue.Size(), 3);
+        queue.IncludeBlockedQueue();
+        for (ui32 i = 0; i < 3; ++i) {
+            UNIT_ASSERT(queue.HasReadyMainQueue(T0));
+            queue.PromoteBlocked(1);
+            UNIT_ASSERT_VALUES_EQUAL(queue.MainQueueSize(), 1);
+            queue.Block(queue.PopFromBootQueue());
+        }
+        UNIT_ASSERT(!queue.HasReadyMainQueue(T0));
+        UNIT_ASSERT_VALUES_EQUAL(queue.Size(), 3);
+        queue.PromoteBlocked(1);
+        UNIT_ASSERT(queue.MainQueueEmpty());
+        // A new state event permits a new round, without losing any record.
+        queue.IncludeBlockedQueue();
+        queue.PromoteBlocked(3);
+        UNIT_ASSERT_VALUES_EQUAL(queue.MainQueueSize(), 3);
+        UNIT_ASSERT(!queue.HasBlockedRecords());
+    }
 
-        // No nodes at all - no reason to throttle
-        UNIT_ASSERT_DOUBLES_EQUAL(hive->TestGetBackupLoadFactor(T0), 1.0, 1e-6);
+    Y_UNIT_TEST(DisablePreservesDeferredAndWaitState) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        auto& queue = hive->GetBootQueue();
+        TLeaderTabletInfo tablet(1UL, *hive);
+        tablet.IsBackup = true;
+        queue.AddToBootQueue(tablet, 0, T0);
+        queue.DeferBackup(queue.PopFromBackupQueue(), T0 + TDuration::Hours(1));
+        queue.AddToBootQueue(tablet, 0, T0);
+        queue.AddToBackupWaitQueue(queue.PopFromBackupQueue());
+        queue.HandOverBackupQueues(1);
+        UNIT_ASSERT_VALUES_EQUAL(queue.DeferredQueue.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(queue.BackupWaitQueue.size(), 1);
+        UNIT_ASSERT(!queue.HasReadyMainQueue(T0));
+        UNIT_ASSERT(queue.HasReadyMainQueue(T0 + TDuration::Hours(1)));
+        queue.HandOverBackupQueues(1);
+        UNIT_ASSERT_VALUES_EQUAL(queue.WaitQueue.size(), 1);
+        UNIT_ASSERT(!queue.GetOldestBackupEnqueueTime());
+    }
+
+    Y_UNIT_TEST(ZeroPerNodeLimitFailsClosed) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        hive->UpdateConfig([](auto& config) {
+            config.SetMaxBackupTabletsStartingPerNode(0);
+        });
+        hive->SetBackupBootTokens(10, T0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0), 0);
+        hive->UpdateConfig([](auto& config) {
+            config.SetMaxBackupTabletsStartingPerNode(2);
+        });
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0), 10);
+    }
+
+    Y_UNIT_TEST(InflightLimitNeverExpires) {
+        TIntrusivePtr<TTabletStorageInfo> storage;
+        auto hive = MakeHive(storage, true);
+        hive->UpdateConfig([](auto& config) {
+            config.SetMaxBackupTabletsStarting(2);
+        });
+        hive->SetBackupBootTokens(10, T0);
+        hive->SetTabletsStarting(2, 2);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0), 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Hours(1)), 0);
+        hive->SetTabletsStarting(1, 1);
+        UNIT_ASSERT_VALUES_EQUAL(hive->TestGetBackupBootBudget(T0 + TDuration::Hours(1)), 1);
     }
 }
 
@@ -535,174 +558,138 @@ Y_UNIT_TEST_SUITE(THiveBackupPacerTest) {
     static constexpr TInstant T0 = TInstant::Seconds(1000);
 
     TBackupPacer::TSettings MakeSettings() {
-        return {
-            .Rate = 10,
-            .Burst = 10,
-            .WindowLimit = 16,
-            .UserWeight = 2,
-            .MaxDelay = TDuration::Seconds(300),
-            .MinRate = 1,
-        };
+        return {.Rate = 10, .Burst = 10, .WindowLimit = 16};
     }
 
     Y_UNIT_TEST(RateLimitsBudget) {
         auto settings = MakeSettings();
         TBackupPacer pacer;
-
-        // An idle bucket is a full bucket
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt), 10);
-
-        pacer.Spend(10);
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt), 0);
-
-        // 100ms at 10 ops/sec is exactly one token. This is the boundary case that floating point
-        // gets wrong without TOKEN_EPSILON: SecondsFloat() makes it 0.9999999999999999
-        UNIT_ASSERT_VALUES_EQUAL(
-            pacer.GetBudget(T0 + TDuration::MilliSeconds(100), settings, 1.0, 0, 0, std::nullopt), 1);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0), 1);
+        pacer.Spend();
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0), 0);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 + TDuration::MilliSeconds(100), settings, 0), 1);
     }
 
-    Y_UNIT_TEST(BurstCapsRefill) {
+    Y_UNIT_TEST(BurstCapsRefillAndConfigReduction) {
         auto settings = MakeSettings();
         TBackupPacer pacer;
-        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
-        pacer.Spend(10);
-        // A long idle period cannot accumulate more than the burst
-        UNIT_ASSERT_VALUES_EQUAL(
-            pacer.GetBudget(T0 + TDuration::Hours(1), settings, 1.0, 0, 0, std::nullopt), 10);
+        pacer.GetBudget(T0, settings, 0);
+        auto now = T0 + TDuration::Hours(1);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(now, settings, 0), 10);
+        settings.Burst = 2;
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(now, settings, 0), 2);
     }
 
-    Y_UNIT_TEST(WindowShrinksWithUserWork) {
+    Y_UNIT_TEST(WindowIsHardEvenAfterLongWait) {
         auto settings = MakeSettings();
         TBackupPacer pacer;
-
-        // 8 user operations at weight 2 consume the whole window of 16
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 8, std::nullopt), 0);
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 0, 4, std::nullopt), 8);
-        // Own operations in flight count against the window directly
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 1.0, 10, 0, std::nullopt), 6);
-        // Load factor scales the window
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0.5, 0, 0, std::nullopt), 8);
-        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0.0, 0, 0, std::nullopt), 0);
+        pacer.GetBudget(T0, settings, 16);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 + TDuration::Hours(1), settings, 16), 0);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 + TDuration::Hours(2), settings, 17), 0);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 + TDuration::Hours(2), settings, 15), 1);
     }
 
-    Y_UNIT_TEST(AgingBypassesGates) {
+    Y_UNIT_TEST(RestartDoesNotRestoreFullBurst) {
+        auto settings = MakeSettings();
+        TBackupPacer before;
+        before.GetBudget(T0, settings, 0);
+        UNIT_ASSERT_VALUES_EQUAL(before.GetBudget(T0 + TDuration::Hours(1), settings, 0), 10);
+        TBackupPacer after;
+        UNIT_ASSERT_VALUES_EQUAL(after.GetBudget(T0 + TDuration::Hours(1), settings, 0), 1);
+    }
+
+    Y_UNIT_TEST(BackwardClockDoesNotRefillTwice) {
         auto settings = MakeSettings();
         TBackupPacer pacer;
-        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
+        pacer.GetBudget(T0, settings, 0);
+        pacer.Spend();
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 - TDuration::Seconds(1), settings, 0), 0);
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0), 0);
+    }
+
+    Y_UNIT_TEST(ZeroTimestampDoesNotReinitializeBucket) {
+        auto settings = MakeSettings();
+        TBackupPacer pacer;
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(TInstant::Zero(), settings, 0), 1);
+        pacer.Spend();
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(TInstant::Zero(), settings, 0), 0);
+    }
+
+    Y_UNIT_TEST(HighRateWakeupsAreBatched) {
+        auto settings = MakeSettings();
+        settings.Rate = 1000;
+        TBackupPacer pacer;
+        pacer.GetBudget(T0, settings, 0);
+        pacer.Spend();
+        auto delay = pacer.GetTimeToNextToken(settings);
+        UNIT_ASSERT(delay);
+        UNIT_ASSERT_VALUES_EQUAL(*delay, TDuration::MilliSeconds(10));
+        UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0 + *delay, settings, 0), 10);
         pacer.Spend(10);
-
-        // Overloaded cluster and plenty of user work - nothing gets through
-        UNIT_ASSERT_VALUES_EQUAL(
-            pacer.GetBudget(T0 + TDuration::Seconds(1), settings, 0.0, 0, 100, T0), 0);
-
-        // ... but not forever: past MaxDelay both the window and the load gate are bypassed
-        UNIT_ASSERT_VALUES_EQUAL(
-            pacer.GetBudget(T0 + TDuration::Seconds(301), settings, 0.0, 0, 100, T0), 1);
+        settings.Burst = 1;
+        UNIT_ASSERT_VALUES_EQUAL(*pacer.GetTimeToNextToken(settings), TDuration::MilliSeconds(1));
     }
 
     Y_UNIT_TEST(TimeToNextTokenIsNeverZero) {
         auto settings = MakeSettings();
         TBackupPacer pacer;
-        pacer.GetBudget(T0, settings, 1.0, 0, 0, std::nullopt);
-
-        // There is a token to spend - no reason to wait
-        UNIT_ASSERT(!pacer.GetTimeToNextToken(settings, 1.0));
-
-        pacer.Spend(10);
-        auto delay = pacer.GetTimeToNextToken(settings, 1.0);
-        UNIT_ASSERT(delay);
-        // 10 ops/sec means the next token is 100ms away
-        UNIT_ASSERT_VALUES_EQUAL(*delay, TDuration::MilliSeconds(100));
-
-        // Almost a full token: the delay must still be bounded away from zero, otherwise rounding
-        // turns the wake-up into a spin
+        pacer.GetBudget(T0, settings, 0);
+        UNIT_ASSERT(!pacer.GetTimeToNextToken(settings));
+        pacer.Spend();
+        UNIT_ASSERT_VALUES_EQUAL(*pacer.GetTimeToNextToken(settings), TDuration::MilliSeconds(100));
         pacer.Tokens = 1.0 - 1e-6;
-        auto tinyDelay = pacer.GetTimeToNextToken(settings, 1.0);
-        UNIT_ASSERT(tinyDelay);
-        UNIT_ASSERT_VALUES_EQUAL(*tinyDelay, TBackupPacer::MIN_WAKEUP);
+        UNIT_ASSERT_VALUES_EQUAL(*pacer.GetTimeToNextToken(settings), TBackupPacer::MIN_WAKEUP);
+    }
+
+    Y_UNIT_TEST(InvalidConfigurationFailsClosed) {
+        for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+            auto settings = MakeSettings();
+            settings.Rate = invalid;
+            TBackupPacer pacer;
+            UNIT_ASSERT(!settings.IsValid());
+            UNIT_ASSERT_VALUES_EQUAL(pacer.GetBudget(T0, settings, 0), 0);
+            UNIT_ASSERT(!pacer.GetTimeToNextToken(settings));
+        }
+        auto settings = MakeSettings();
+        settings.WindowLimit = 0;
+        UNIT_ASSERT(!settings.IsValid());
+        settings = MakeSettings();
+        settings.Burst = 0;
+        UNIT_ASSERT(!settings.IsValid());
     }
 }
 
-Y_UNIT_TEST_SUITE(THiveBackupBalancerTest) {
-    // Memory has to be above THive::IsValidMetricsMemory threshold to survive FilterRawValues
-    static constexpr ui64 SOME_MEMORY = 10'000'000;
-
-    Y_UNIT_TEST(BackupTabletIsPreferredVictim) {
-        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
-        hiveStorage->TabletType = TTabletTypes::Hive;
-        TTestHive hive(hiveStorage.Get(), TActorId());
-        hive.UpdateConfig([](NKikimrConfig::THiveConfig& config) {
-            config.SetBackupTabletBalancerWeight(4.0);
+Y_UNIT_TEST_SUITE(THiveBackupDeleteAccountingTest) {
+    Y_UNIT_TEST(SharedWindowAndIdempotentCompletion) {
+        auto storage = MakeIntrusive<TTabletStorageInfo>();
+        storage->TabletType = TTabletTypes::Hive;
+        TTestHive hive(storage.Get(), TActorId());
+        hive.UpdateConfig([](auto& config) {
+            config.SetMaxDeleteTabletInProgress(3);
+            config.SetMaxBackupDeleteInProgress(2);
         });
+        UNIT_ASSERT(hive.RegisterDeleteInFlight(1, true));
+        UNIT_ASSERT(hive.RegisterDeleteInFlight(2, true));
+        UNIT_ASSERT(!hive.RegisterDeleteInFlight(3, true));
+        UNIT_ASSERT(hive.RegisterDeleteInFlight(3, false));
+        UNIT_ASSERT(!hive.RegisterDeleteInFlight(4, false));
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetDeleteInFlight(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetBackupDeleteInFlight(), 2);
 
-        TLeaderTabletInfo userTablet(1UL, hive);
-        userTablet.SetType(TTabletTypes::DataShard);
-        userTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
-        userTablet.UpdateWeight();
-
-        TLeaderTabletInfo backupTablet(2UL, hive);
-        backupTablet.SetType(TTabletTypes::DataShard);
-        backupTablet.IsBackup = true;
-        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
-        backupTablet.UpdateWeight();
-
-        UNIT_ASSERT_DOUBLES_EQUAL(userTablet.BalancerWeightMultiplier, 1.0, 1e-9);
-        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.BalancerWeightMultiplier, 4.0, 1e-9);
-
-        double userWeight = userTablet.GetWeight(EResourceToBalance::Memory);
-        double backupWeight = backupTablet.GetWeight(EResourceToBalance::Memory);
-        UNIT_ASSERT(userWeight > 0);
-        UNIT_ASSERT_DOUBLES_EQUAL(backupWeight, userWeight * 4.0, 1e-9);
-
-        // Boot priority must not be affected - Weight itself is shared with the boot queue
-        UNIT_ASSERT_VALUES_EQUAL(backupTablet.Weight, userTablet.Weight);
-    }
-
-    Y_UNIT_TEST(PreferenceIsNotExclusion) {
-        // A much heavier user tablet is still moved first - otherwise the balancer would waste its
-        // movement budget on a negligible backup tablet and leave the overload in place
-        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
-        hiveStorage->TabletType = TTabletTypes::Hive;
-        TTestHive hive(hiveStorage.Get(), TActorId());
-        hive.UpdateConfig([](NKikimrConfig::THiveConfig& config) {
-            config.SetBackupTabletBalancerWeight(4.0);
-        });
-
-        TLeaderTabletInfo backupTablet(1UL, hive);
-        backupTablet.SetType(TTabletTypes::DataShard);
-        backupTablet.IsBackup = true;
-        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
-        backupTablet.UpdateWeight();
-
-        TLeaderTabletInfo heavyUserTablet(2UL, hive);
-        heavyUserTablet.SetType(TTabletTypes::DataShard);
-        heavyUserTablet.GetMutableResourceValues().Memory = SOME_MEMORY * 10;
-        heavyUserTablet.UpdateWeight();
-
-        UNIT_ASSERT(heavyUserTablet.GetWeight(EResourceToBalance::Memory)
-                    > backupTablet.GetWeight(EResourceToBalance::Memory));
-    }
-
-    Y_UNIT_TEST(DefaultConfigIsNoop) {
-        auto hiveStorage = MakeIntrusive<TTabletStorageInfo>();
-        hiveStorage->TabletType = TTabletTypes::Hive;
-        TTestHive hive(hiveStorage.Get(), TActorId());
-        hive.UpdateConfig([](NKikimrConfig::THiveConfig&){});
-
-        TLeaderTabletInfo userTablet(1UL, hive);
-        userTablet.SetType(TTabletTypes::DataShard);
-        userTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
-        userTablet.UpdateWeight();
-
-        TLeaderTabletInfo backupTablet(2UL, hive);
-        backupTablet.SetType(TTabletTypes::DataShard);
-        backupTablet.IsBackup = true;
-        backupTablet.GetMutableResourceValues().Memory = SOME_MEMORY;
-        backupTablet.UpdateWeight();
-
-        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.BalancerWeightMultiplier, 1.0, 1e-9);
-        UNIT_ASSERT_DOUBLES_EQUAL(backupTablet.GetWeight(EResourceToBalance::Memory),
-                                  userTablet.GetWeight(EResourceToBalance::Memory), 1e-9);
+        UNIT_ASSERT(hive.CompleteDeleteInFlight(1));
+        UNIT_ASSERT(!hive.CompleteDeleteInFlight(1));
+        UNIT_ASSERT(!hive.CompleteDeleteInFlight(999));
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetDeleteInFlight(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetBackupDeleteInFlight(), 1);
+        UNIT_ASSERT(!hive.RegisterDeleteInFlight(2, false));
+        UNIT_ASSERT(hive.RegisterDeleteInFlight(4, false));
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetDeleteInFlight(), 3);
+        UNIT_ASSERT(hive.CompleteDeleteInFlight(2));
+        UNIT_ASSERT(hive.CompleteDeleteInFlight(3));
+        UNIT_ASSERT(hive.CompleteDeleteInFlight(4));
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetDeleteInFlight(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(hive.GetBackupDeleteInFlight(), 0);
     }
 }
 

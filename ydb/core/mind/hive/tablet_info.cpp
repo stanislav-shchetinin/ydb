@@ -222,9 +222,6 @@ void TTabletInfo::UpdateWeight() {
 
     ResourceNormalizedValues = NormalizeRawValues(current, maximum);
     Weight = ExtractResourceUsage(ResourceNormalizedValues);
-    // A backup tablet is a preferred victim for the balancer: moving it costs the backup a restart,
-    // moving a user tablet costs user requests a latency spike
-    BalancerWeightMultiplier = GetLeader().IsBackup ? Hive.GetBackupTabletBalancerWeight() : 1.0;
 }
 
 bool TTabletInfo::IsGoodForBalancer(TInstant now) const {

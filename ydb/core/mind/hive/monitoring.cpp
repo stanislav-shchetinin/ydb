@@ -969,6 +969,7 @@ public:
             Self->BuildCurrentConfig();
             db.Table<Schema::State>().Key(TSchemeIds::State::DefaultState).Update<Schema::State::Config>(Self->DatabaseConfig);
             Self->ProcessWaitQueue();
+            Self->ProcessBackupDeleteQueue();
         }
         if (params.contains("resetAllowedMetrics")) {
             ChangeRequest = true;
@@ -1617,8 +1618,12 @@ public:
         out << "<tr><td>" << "Tablets:" << "</td><td id='runningTablets'>" << runningTablets << "</td></tr>";
         out << "<tr><td>" << "Boot Queue:" << "</td><td id='bootQueue'>" << Self->BootQueue.BootQueue.size() << "</td></tr>";
         out << "<tr><td>" << "Wait Queue:" << "</td><td id='waitQueue'>" << Self->BootQueue.WaitQueue.size() << "</td></tr>";
-        out << "<tr><td>" << "Backup Boot Queue:" << "</td><td id='backupBootQueue'>" << Self->BootQueue.BackupBootQueue.size() << "</td></tr>";
+        out << "<tr><td>" << "Backup Boot Queue:" << "</td><td id='backupBootQueue'>" << Self->BootQueue.BackupQueueSize() << "</td></tr>";
+        out << "<tr><td>" << "Backup Deferred Queue:" << "</td><td id='backupDeferredQueue'>" << Self->BootQueue.BackupDeferredQueue.size() << "</td></tr>";
         out << "<tr><td>" << "Backup Wait Queue:" << "</td><td id='backupWaitQueue'>" << Self->BootQueue.BackupWaitQueue.size() << "</td></tr>";
+        out << "<tr><td>Backup Starting:</td><td id='backupStarting'>" << Self->BackupTabletsStarting << "</td></tr>";
+        out << "<tr><td>Backup Delete Queue:</td><td id='backupDeleteQueue'>" << Self->BackupDeleteQueue.size() << "</td></tr>";
+        out << "<tr><td>Deleting (total / backup):</td><td id='deletingByClass'>" << Self->DeleteTabletInProgress << " / " << Self->BackupTabletsDeleting << "</td></tr>";
         out << "</table></div>";
         out << "<div style='width:180px'><table class='simple-table1'>";
         out << "<tr><th colspan='2'>Totals</th></tr>";
@@ -2313,6 +2318,12 @@ function fillDataShort(result) {
             $('#runningTablets').html(warmup + percent + ' (' + values + ')');
             $('#aliveNodes').html(result.AliveNodes);
             $('#bootQueue').html(result.BootQueueSize);
+            $('#backupBootQueue').html(result.BackupBootQueueSize);
+            $('#backupDeferredQueue').html(result.BackupBootDeferredQueueSize);
+            $('#backupWaitQueue').html(result.BackupWaitQueueSize);
+            $('#backupStarting').html(result.BackupTabletsStarting);
+            $('#backupDeleteQueue').html(result.BackupDeleteQueueSize);
+            $('#deletingByClass').html(result.TabletsDeleting + ' / ' + result.BackupTabletsDeleting);
             $('#waitQueue').html(result.WaitQueueSize);
             $('#maxUsage').html(result.MaxUsage);
             $('#objectImbalance').html(result.ObjectImbalance);
@@ -2680,11 +2691,18 @@ public:
         jsonData["ResourceVariance"] = GetResourceValuesJson(Self->GetStDevResourceValues());
         jsonData["BootQueueSize"] = Self->BootQueue.BootQueue.size();
         jsonData["WaitQueueSize"] = Self->BootQueue.WaitQueue.size();
-        jsonData["BackupBootQueueSize"] = Self->BootQueue.BackupBootQueue.size();
+        jsonData["BackupBootQueueSize"] = Self->BootQueue.BackupQueueSize();
+        jsonData["BackupBootDeferredQueueSize"] = Self->BootQueue.BackupDeferredQueue.size();
         jsonData["BackupWaitQueueSize"] = Self->BootQueue.BackupWaitQueue.size();
         jsonData["BackupTabletsStarting"] = Self->BackupTabletsStarting;
         jsonData["BackupDeleteQueueSize"] = Self->BackupDeleteQueue.size();
-        jsonData["BackupTabletsDeleting"] = Self->BackupDeleteInFlight.size();
+        jsonData["BackupTabletsDeleting"] = Self->BackupTabletsDeleting;
+        jsonData["TabletsDeleting"] = Self->DeleteTabletInProgress;
+        jsonData["BackupBootRate"] = Self->GetBackupBootRate();
+        jsonData["BackupBootBurst"] = Self->GetBackupBootBurst();
+        auto oldestBackup = Self->BootQueue.GetOldestBackupEnqueueTime();
+        jsonData["BackupBootOldestDelayMs"] = oldestBackup && TActivationContext::Now() > *oldestBackup
+            ? (TActivationContext::Now() - *oldestBackup).MilliSeconds() : 0;
         jsonData["Balancers"] = Self->GetBalancerProgressJson();
         jsonData["MaxUsage"] =  GetValueWithColoredGlyph(stats.MaxUsage, Self->GetMaxNodeUsageToKick()) ;
         auto scatterHtml = convert(stats.ScatterByResource, Self->GetMinScatterToBalance(), GetValueWithColoredGlyph);
@@ -2750,6 +2768,7 @@ public:
                 jsonNode["Uptime"] = node.IsAlive() ? GetDurationString(node.GetUptime()) : "";
                 jsonNode["Unknown"] = node.Tablets[TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_UNKNOWN].size();
                 jsonNode["Starting"] = node.Tablets[TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING].size();
+                jsonNode["BackupStarting"] = node.GetBackupTabletsStarting();
                 jsonNode["Running"] = node.Tablets[TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_RUNNING].size();
                 {
                     TString types;

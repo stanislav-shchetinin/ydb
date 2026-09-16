@@ -297,20 +297,11 @@ bool TNodeInfo::IsAbleToRunTablet(const TTabletInfo& tablet, TTabletDebugState* 
         }
     }
 
-    if (tablet.GetLeader().IsBackup && Hive.IsBackupPlacementRestricted()) {
-        // Do not pile backup starts onto one node - their cost is the boot itself, and concentrating
-        // it defeats the point of pacing
-        ui64 maxStarting = Hive.GetMaxBackupTabletsStartingPerNode();
-        if (maxStarting != 0 && GetBackupTabletsStarting() >= maxStarting) {
-            if (debugState) {
-                debugState->NodesWithoutResources++;
-            }
-            return false;
-        }
-        // Keep backup tablets off nodes that are already hot. Placement already prefers the least
-        // loaded node, so this is a hard floor under that preference, not the main mechanism.
-        double maxUsage = Hive.GetBackupMaxNodeUsageToPlace();
-        if (maxUsage > 0 && GetNodeUsage() > maxUsage) {
+    if (tablet.GetLeader().IsBackup && Hive.GetBackupBootPacingEnabled()) {
+        // This is a hard per-node limit. A full node is skipped, not the rest
+        // of the candidate search, regardless of the tablet's queue age.
+        if (GetBackupTabletsStarting() >= Hive.GetMaxBackupTabletsStartingPerNode()) {
+            Hive.CountBackupEvent(COUNTER_BACKUP_BOOT_PER_NODE_LIMIT);
             if (debugState) {
                 debugState->NodesWithoutResources++;
             }

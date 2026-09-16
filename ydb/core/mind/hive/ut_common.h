@@ -35,12 +35,19 @@ public:
         return BootQueue;
     }
 
-    ui64 TestGetBackupBootBudget(TInstant now, double loadFactor) {
-        return GetBackupBootBudget(now, loadFactor);
+    ui64 TestGetBackupBootBudget(TInstant now) {
+        return GetBackupBootBudget(now);
     }
 
-    double TestGetBackupLoadFactor(TInstant now) {
-        return GetBackupLoadFactor(now);
+    using THive::RegisterDeleteInFlight;
+    using THive::CompleteDeleteInFlight;
+
+    i64 GetDeleteInFlight() const {
+        return DeleteTabletInProgress;
+    }
+
+    ui64 GetBackupDeleteInFlight() const {
+        return BackupTabletsDeleting;
     }
 
     void SetTabletsStarting(ui64 total, ui64 backup) {
@@ -51,6 +58,7 @@ public:
     void SetBackupBootTokens(double tokens, TInstant updatedAt) {
         BackupBootPacer.Tokens = tokens;
         BackupBootPacer.TokensUpdated = updatedAt;
+        BackupBootPacer.Initialized = true;
     }
 
     double GetBackupBootTokens() const {

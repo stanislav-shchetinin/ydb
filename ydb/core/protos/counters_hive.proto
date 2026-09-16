@@ -46,6 +46,7 @@ enum ESimpleCounters {
     COUNTER_BACKUP_DELETEQUEUE_SIZE = 36 [(CounterOpts) = {Name: "BackupDeleteQueueSize"}];
     COUNTER_BACKUP_TABLETS_DELETING = 37 [(CounterOpts) = {Name: "BackupTabletsDeleting"}];
     COUNTER_BACKUP_DELETE_DELAY_MS = 38 [(CounterOpts) = {Name: "BackupDeleteOldestDelayMs"}];
+    COUNTER_BACKUP_DEFERREDQUEUE_SIZE = 39 [(CounterOpts) = {Name: "BackupBootDeferredQueueSize"}];
 }
 
 enum ECumulativeCounters {
@@ -67,6 +68,20 @@ enum ECumulativeCounters {
     COUNTER_HISTORY_RESTORED = 15 [(CounterOpts) = {Name: "TabletHistoryRestored"}];
     COUNTER_REASSIGN_EXECUTED = 16 [(CounterOpts) = {Name: "ReassignExecuted"}];
     COUNTER_BACKUP_TABLETS_STARTED = 17 [(CounterOpts) = {Name: "BackupTabletsStarted"}];
+    COUNTER_BACKUP_BOOT_ATTEMPTS = 18 [(CounterOpts) = {Name: "BackupBootAttempts"}];
+    COUNTER_BACKUP_BOOT_FAILED = 19 [(CounterOpts) = {Name: "BackupBootPlacementFailed"}];
+    COUNTER_BACKUP_BOOT_STALE = 20 [(CounterOpts) = {Name: "BackupBootStaleRecords"}];
+    COUNTER_BACKUP_BOOT_DEFERRED = 21 [(CounterOpts) = {Name: "BackupBootDeferred"}];
+    COUNTER_BACKUP_BOOT_WAIT = 22 [(CounterOpts) = {Name: "BackupBootWaitingForNode"}];
+    COUNTER_BACKUP_BOOT_FOREGROUND_LIMIT = 23 [(CounterOpts) = {Name: "BackupBootForegroundLimit"}];
+    COUNTER_BACKUP_BOOT_RATE_LIMIT = 24 [(CounterOpts) = {Name: "BackupBootRateLimit"}];
+    COUNTER_BACKUP_BOOT_GLOBAL_LIMIT = 25 [(CounterOpts) = {Name: "BackupBootGlobalLimit"}];
+    COUNTER_BACKUP_BOOT_PER_NODE_LIMIT = 26 [(CounterOpts) = {Name: "BackupBootPerNodeLimit"}];
+    COUNTER_BACKUP_BOOT_TOTAL_LIMIT = 27 [(CounterOpts) = {Name: "BackupBootTotalLimit"}];
+    COUNTER_BACKUP_DELETE_ATTEMPTS = 28 [(CounterOpts) = {Name: "BackupDeleteAttempts"}];
+    COUNTER_BACKUP_DELETE_COMPLETED = 29 [(CounterOpts) = {Name: "BackupDeleteCompleted"}];
+    COUNTER_BACKUP_DELETE_RETRIED = 30 [(CounterOpts) = {Name: "BackupDeleteRetried"}];
+    COUNTER_DELETE_UNKNOWN_COMPLETIONS = 31 [(CounterOpts) = {Name: "DeleteUnknownCompletions"}];
 }
 
 enum EPercentileCounters {

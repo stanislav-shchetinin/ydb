@@ -2702,47 +2702,31 @@ message THiveConfig {
     optional uint64 DataCenterChangeReactionPeriod = 91 [default = 300]; // seconds
     repeated THiveTabletAllowedMetrics DefaultTabletAllowedMetrics = 92;
 
-    // Backup tablets (tablets of backup tables created by export/backup operations) are booted
-    // through a separate rate-limited queue, so that a massive backup does not create a boot storm
-    // that hurts latency of user requests. All of it is a no-op unless BackupBootPacingEnabled.
+    // Static pacing of backup tablet boots; all limits remain hard under load.
     optional bool BackupBootPacingEnabled = 93 [default = false];
-    optional double BackupBootRate = 94 [default = 10.0]; // backup tablet starts per second at zero load
-    optional double BackupBootBurst = 95 [default = 10.0]; // max accumulated starts, controls pack size
-    optional uint64 MaxBackupTabletsStarting = 96 [default = 16]; // max backup tablets in STARTING state
-    optional double BackupStartUserWeight = 97 [default = 2.0]; // how many backup slots one user start costs
-    optional double BackupBootFullSpeedUsage = 98 [default = 0.5]; // node usage below which we boot at full rate
-    optional double BackupBootStopUsage = 99 [default = 0.8]; // node usage at which we stop booting backups
-    optional uint64 BackupBootMaxDelay = 100 [default = 300000]; // milliseconds, after that a backup tablet
-                                                                // is booted regardless of load and inflight
-    optional double BackupBootMinRate = 101 [default = 1.0]; // starts per second when escalated by BackupBootMaxDelay
-    optional double BackupBootUsageQuantile = 102 [default = 0.9]; // quantile of node usage used as the load signal
-
-    // Multiplier applied to the balancer weight of a backup tablet, making it a preferred victim
-    // when the balancer moves tablets off an overloaded node: shedding a backup tablet costs the
-    // backup a restart, while shedding a user tablet costs user requests a latency spike.
-    // The weight still matters, so a much heavier user tablet is still moved first - that is why
-    // this is a multiplier and not a hard partition. 1.0 means no preference.
-    optional double BackupTabletBalancerWeight = 103 [default = 1.0];
-
-    // Dropping a backup table at the end of an export deletes thousands of tablets at once, which
-    // blocks and deletes their storage groups in a burst. Without pacing that burst also takes over
-    // the whole MaxDeleteTabletInProgress window, so a user DROP TABLE has to wait behind it.
-    // Note: this does not cover the borrowed parts compaction the source tables have to do when the
-    // loans are returned - that work lives in DataShard and cannot be paced from here.
+    optional double BackupBootRate = 94 [default = 10.0]; // attempts per second
+    optional double BackupBootBurst = 95 [default = 10.0]; // maximum token budget
+    optional uint64 MaxBackupTabletsStarting = 96 [default = 16];
     optional bool BackupDeletePacingEnabled = 104 [default = false];
-    optional double BackupDeleteRate = 105 [default = 10.0]; // deletions per second at zero load
+    optional double BackupDeleteRate = 105 [default = 10.0]; // logical deletions per second
     optional double BackupDeleteBurst = 106 [default = 10.0];
+    // Backup deletions occupy a subset of MaxDeleteTabletInProgress, not an extra window.
     optional uint64 MaxBackupDeleteInProgress = 107 [default = 16];
-    optional double BackupDeleteUserWeight = 108 [default = 2.0]; // own slots one user deletion costs
-    optional uint64 BackupDeleteMaxDelay = 109 [default = 300000]; // milliseconds
-    optional double BackupDeleteMinRate = 110 [default = 1.0];
+    optional uint64 MaxBackupTabletsStartingPerNode = 111 [default = 2];
 
-    // Placement restrictions for backup tablets, on top of the global boot pacing. Both are off by
-    // default, and both are lifted for a tablet that has waited longer than BackupBootMaxDelay -
-    // otherwise a uniformly loaded cluster would never place a backup tablet at all, stalling the
-    // copy operation that is waiting for it.
-    optional uint64 MaxBackupTabletsStartingPerNode = 111 [default = 0]; // 0 - no limit
-    optional double BackupMaxNodeUsageToPlace = 112 [default = 0]; // 0 - no limit
+    // Experimental adaptive/aging/balancer knobs are retained only so existing
+    // test-cluster configurations can still be parsed. They have no effect.
+    optional double BackupStartUserWeight = 97 [deprecated = true];
+    optional double BackupBootFullSpeedUsage = 98 [deprecated = true];
+    optional double BackupBootStopUsage = 99 [deprecated = true];
+    optional uint64 BackupBootMaxDelay = 100 [deprecated = true];
+    optional double BackupBootMinRate = 101 [deprecated = true];
+    optional double BackupBootUsageQuantile = 102 [deprecated = true];
+    optional double BackupTabletBalancerWeight = 103 [deprecated = true];
+    optional double BackupDeleteUserWeight = 108 [deprecated = true];
+    optional uint64 BackupDeleteMaxDelay = 109 [deprecated = true];
+    optional double BackupDeleteMinRate = 110 [deprecated = true];
+    optional double BackupMaxNodeUsageToPlace = 112 [deprecated = true];
 }
 
 message THealthCheckConfig {

@@ -4,6 +4,8 @@
 #include "tablet_info.h"
 
 #include <deque>
+#include <map>
+#include <set>
 
 namespace NKikimr {
 namespace NHive {
@@ -24,9 +26,7 @@ struct TBootQueue {
 
     static_assert(sizeof(TBootQueueRecord) <= 24);
 
-    // Backup tablets are not prioritized between themselves - they are booted in FIFO order,
-    // so there is no priority queue here and we can afford to remember the enqueue time,
-    // which is needed to guarantee progress (see THive::GetBackupBootBudget).
+    // Enqueue time is for observability only, never for bypassing admission limits.
     struct TBackupBootRecord {
         TBootQueueRecord Record;
         TInstant EnqueueTime;
@@ -40,7 +40,13 @@ struct TBootQueue {
     TQueue WaitQueue; // tablets from BootQueue waiting for new nodes
     TBackupQueue BackupBootQueue; // backup tablets, booted at a limited rate
     TBackupQueue BackupWaitQueue; // backup tablets from BackupBootQueue waiting for new nodes
+    std::multimap<TInstant, TBootQueueRecord> DeferredQueue;
+    std::multimap<TInstant, TBackupBootRecord> BackupDeferredQueue;
 private:
+    TQueue BlockedQueue; // e.g. foreground followers waiting for their leader
+    TQueue BlockedRetryQueue; // snapshot being reconsidered in bounded batches
+    bool RetryBlockedRequested = false;
+    std::multiset<TInstant> BackupEnqueueTimes;
     bool ProcessWaitQueue = false;
     bool NextFromWaitQueue = false;
     bool PaceBackupTablets = false;
@@ -53,6 +59,13 @@ public:
     void UpdateTabletBootQueuePriorities(const NKikimrConfig::THiveConfig& hiveConfig);
     TBootQueueRecord PopFromBootQueue();
     void AddToWaitQueue(TBootQueueRecord record);
+    void Defer(TBootQueueRecord record, TInstant readyAt);
+    void PromoteDeferred(TInstant now, size_t limit);
+    bool HasReadyMainQueue(TInstant now) const;
+    void Block(TBootQueueRecord record);
+    void IncludeBlockedQueue();
+    void PromoteBlocked(size_t limit);
+    bool HasBlockedRecords() const;
     void IncludeWaitQueue();
     void ExcludeWaitQueue();
     bool Empty() const;
@@ -69,14 +82,20 @@ public:
     bool BackupQueueEmpty() const;
     size_t BackupQueueSize() const;
     TBackupBootRecord PopFromBackupQueue();
+    void AddToBackupQueue(TBackupBootRecord record);
     void ReturnToBackupQueueFront(TBackupBootRecord record);
     void AddToBackupWaitQueue(TBackupBootRecord record);
-    void IncludeBackupWaitQueue();
+    void IncludeBackupWaitQueue(size_t limit);
+    void DeferBackup(TBackupBootRecord record, TInstant readyAt);
+    void PromoteBackupDeferred(TInstant now, size_t limit);
+    void HandOverBackupQueues(size_t limit);
+    std::optional<TInstant> GetNextDeferredWakeup(TInstant now) const;
     std::optional<TInstant> GetOldestBackupEnqueueTime() const;
 
 private:
     TQueue& GetCurrentQueue();
     double GetBootPriority(const TTabletInfo& tablet) const;
+    void RemoveBackupEnqueueTime(TInstant time);
 };
 
 }

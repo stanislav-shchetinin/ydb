@@ -1,64 +1,57 @@
 #include "backup_pacer.h"
 
+#include <cmath>
+
 namespace NKikimr {
 namespace NHive {
 
-bool TBackupPacer::IsEscalated(TInstant now,
-                               const TSettings& settings,
-                               std::optional<TInstant> oldestEnqueueTime) const {
-    return oldestEnqueueTime.has_value() && *oldestEnqueueTime + settings.MaxDelay <= now;
+bool TBackupPacer::TSettings::IsValid() const {
+    // Bound conversions to ui64 and timer durations as well as rejecting NaN/inf.
+    return std::isfinite(Rate) && Rate >= 1e-6 && Rate <= 1e9
+        && std::isfinite(Burst) && Burst >= 1 && Burst <= 1e9
+        && WindowLimit > 0;
 }
 
 void TBackupPacer::Refill(TInstant now, double rate, double burst) {
-    if (!TokensUpdated) {
-        // An idle bucket is a full bucket
-        Tokens = burst;
+    if (!Initialized) {
+        // Recovery must not replenish a full burst on every Hive restart.
+        Tokens = std::min(burst, 1.0);
+        TokensUpdated = now;
+        Initialized = true;
     } else if (now > TokensUpdated) {
         Tokens = std::min(burst, Tokens + rate * (now - TokensUpdated).SecondsFloat());
+        TokensUpdated = now;
+    } else {
+        Tokens = std::min(burst, Tokens);
     }
-    TokensUpdated = now;
 }
 
-ui64 TBackupPacer::GetBudget(TInstant now,
-                             const TSettings& settings,
-                             double loadFactor,
-                             i64 ownInflight,
-                             i64 userInflight,
-                             std::optional<TInstant> oldestEnqueueTime) {
-    bool escalated = IsEscalated(now, settings, oldestEnqueueTime);
-
-    double rate = settings.Rate * loadFactor;
-    if (escalated) {
-        rate = std::max(rate, settings.MinRate);
-    }
-    Refill(now, rate, std::max(settings.Burst, 1.0));
-
-    i64 windowBudget = static_cast<i64>(settings.WindowLimit * loadFactor)
-        - ownInflight
-        - static_cast<i64>(settings.UserWeight * std::max<i64>(0, userInflight));
-    if (escalated) {
-        windowBudget = std::max<i64>(windowBudget, 1);
-    }
-    if (windowBudget <= 0) {
+ui64 TBackupPacer::GetBudget(TInstant now, const TSettings& settings, ui64 ownInflight) {
+    if (!settings.IsValid()) {
         return 0;
     }
-    return std::min<ui64>(static_cast<ui64>(Tokens + TOKEN_EPSILON), static_cast<ui64>(windowBudget));
+    Refill(now, settings.Rate, settings.Burst);
+    if (ownInflight >= settings.WindowLimit) {
+        return 0;
+    }
+    return std::min(static_cast<ui64>(Tokens + TOKEN_EPSILON), settings.WindowLimit - ownInflight);
 }
 
 void TBackupPacer::Spend(ui64 count) {
     Tokens = std::max(0.0, Tokens - static_cast<double>(count));
 }
 
-std::optional<TDuration> TBackupPacer::GetTimeToNextToken(const TSettings& settings, double loadFactor) const {
-    if (Tokens + TOKEN_EPSILON >= 1) {
+std::optional<TDuration> TBackupPacer::GetTimeToNextToken(const TSettings& settings) const {
+    if (!settings.IsValid() || Tokens + TOKEN_EPSILON >= 1) {
         return std::nullopt;
     }
-    double rate = settings.Rate * loadFactor;
-    if (rate <= 0) {
-        return std::nullopt;
-    }
-    double seconds = (1.0 - Tokens) / rate;
-    return std::max(MIN_WAKEUP, TDuration::MicroSeconds(static_cast<ui64>(seconds * 1000000)));
+    // Coalesce high rates into batches without waiting longer than it takes to
+    // fill the bucket. A small burst intentionally limits the possible batch.
+    double batch = std::min(settings.Burst,
+        std::max(1.0, settings.Rate * BATCH_PERIOD.SecondsFloat()));
+    double seconds = (batch - Tokens) / settings.Rate;
+    return std::max(MIN_WAKEUP,
+        TDuration::MicroSeconds(static_cast<ui64>(std::ceil(seconds * 1000000))));
 }
 
 } // NHive

@@ -23,6 +23,13 @@ public:
 
     bool Execute(TTransactionContext& txc, const TActorContext&) override {
         SideEffects.Reset(Self->SelfId());
+        Success = false;
+        if (!Self->DeleteTabletsInFlight.contains(TabletId)) {
+            Self->CountBackupEvent(COUNTER_DELETE_UNKNOWN_COMPLETIONS);
+            // Duplicate/unknown results must not delete a different tablet or
+            // release a slot from another operation.
+            return true;
+        }
         Success = true;
         TEvTabletBase::TEvDeleteTabletResult* msg = Result->Get();
         YDB_LOG_DEBUG("THive::TTxDeleteTabletResult::Execute processing delete tablet result",
@@ -89,17 +96,11 @@ public:
             {"logPrefix", GetLogPrefix()},
             {"tabletId", TabletId},
             {"sideEffects", SideEffects});
-        if (Success) {
-            // Which window this tablet occupied is decided by membership in BackupDeleteInFlight,
-            // not by IsBackup: by now the tablet is gone from Tablets, and this result can even
-            // arrive for a tablet that was never in flight
-            if (Self->BackupDeleteInFlight.erase(TabletId) != 0) {
-                Self->UpdateCounterBackupDeleteQueueSize();
-                Self->ExecuteProcessBackupDeleteQueue(SideEffects);
-            } else {
-                --Self->DeleteTabletInProgress;
-                Self->DrainDeleteTabletQueue(SideEffects);
-            }
+        if (Success && Self->CompleteDeleteInFlight(TabletId)) {
+            Self->UpdateCounterBackupDeleteQueueSize();
+            Self->UpdateCounterTabletsDeleting();
+            // The shared slot is offered to foreground deletions first.
+            Self->ExecuteProcessBackupDeleteQueue(SideEffects);
         }
         SideEffects.Complete(ctx);
     }

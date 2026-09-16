@@ -20,7 +20,7 @@ void TBootQueue::AddToBootQueue(const TTabletInfo &tablet, TNodeId node, TInstan
     double priority = GetBootPriority(tablet);
     // IsBackup is only set on the leader, followers keep the default value
     if (PaceBackupTablets && tablet.GetLeader().IsBackup) {
-        BackupBootQueue.push_back({.Record = TBootQueueRecord(tablet, priority, node), .EnqueueTime = now});
+        AddToBackupQueue({.Record = TBootQueueRecord(tablet, priority, node), .EnqueueTime = now});
         return;
     }
     BootQueue.emplace(tablet, priority, node);
@@ -66,11 +66,13 @@ void TBootQueue::ExcludeWaitQueue() {
 }
 
 bool TBootQueue::Empty() const {
-    return MainQueueEmpty() && BackupQueueEmpty();
+    return MainQueueEmpty() && DeferredQueue.empty() && !HasBlockedRecords()
+        && BackupQueueEmpty() && BackupDeferredQueue.empty();
 }
 
 size_t TBootQueue::Size() const {
-    return MainQueueSize() + BackupQueueSize();
+    return MainQueueSize() + DeferredQueue.size() + BackupQueueSize()
+        + BlockedQueue.size() + BlockedRetryQueue.size();
 }
 
 bool TBootQueue::MainQueueEmpty() const {
@@ -102,36 +104,139 @@ bool TBootQueue::BackupQueueEmpty() const {
 }
 
 size_t TBootQueue::BackupQueueSize() const {
-    return BackupBootQueue.size();
+    return BackupBootQueue.size() + BackupDeferredQueue.size();
 }
 
 TBootQueue::TBackupBootRecord TBootQueue::PopFromBackupQueue() {
     TBackupBootRecord record = BackupBootQueue.front();
     BackupBootQueue.pop_front();
+    RemoveBackupEnqueueTime(record.EnqueueTime);
     return record;
 }
 
+void TBootQueue::AddToBackupQueue(TBackupBootRecord record) {
+    BackupEnqueueTimes.insert(record.EnqueueTime);
+    BackupBootQueue.push_back(record);
+}
+
 void TBootQueue::ReturnToBackupQueueFront(TBackupBootRecord record) {
+    BackupEnqueueTimes.insert(record.EnqueueTime);
     BackupBootQueue.push_front(record);
 }
 
 void TBootQueue::AddToBackupWaitQueue(TBackupBootRecord record) {
+    BackupEnqueueTimes.insert(record.EnqueueTime);
     BackupWaitQueue.push_back(record);
 }
 
-void TBootQueue::IncludeBackupWaitQueue() {
-    // Waiting tablets are older than anything in the boot queue, so they go to the front
-    while (!BackupWaitQueue.empty()) {
-        BackupBootQueue.push_front(BackupWaitQueue.back());
-        BackupWaitQueue.pop_back();
+void TBootQueue::IncludeBackupWaitQueue(size_t limit) {
+    while (limit-- && !BackupWaitQueue.empty()) {
+        BackupBootQueue.push_back(BackupWaitQueue.front());
+        BackupWaitQueue.pop_front();
     }
 }
 
 std::optional<TInstant> TBootQueue::GetOldestBackupEnqueueTime() const {
-    if (BackupBootQueue.empty()) {
+    if (BackupEnqueueTimes.empty()) {
         return std::nullopt;
     }
-    return BackupBootQueue.front().EnqueueTime;
+    return *BackupEnqueueTimes.begin();
+}
+
+void TBootQueue::RemoveBackupEnqueueTime(TInstant time) {
+    auto it = BackupEnqueueTimes.find(time);
+    Y_ABORT_UNLESS(it != BackupEnqueueTimes.end());
+    BackupEnqueueTimes.erase(it);
+}
+
+void TBootQueue::Defer(TBootQueueRecord record, TInstant readyAt) {
+    DeferredQueue.emplace(readyAt, record);
+}
+
+void TBootQueue::PromoteDeferred(TInstant now, size_t limit) {
+    while (limit-- && !DeferredQueue.empty() && DeferredQueue.begin()->first <= now) {
+        BootQueue.push(DeferredQueue.begin()->second);
+        DeferredQueue.erase(DeferredQueue.begin());
+    }
+}
+
+bool TBootQueue::HasReadyMainQueue(TInstant now) const {
+    return !MainQueueEmpty() || !BlockedRetryQueue.empty()
+        || (RetryBlockedRequested && !BlockedQueue.empty())
+        || (!DeferredQueue.empty() && DeferredQueue.begin()->first <= now);
+}
+
+void TBootQueue::Block(TBootQueueRecord record) {
+    BlockedQueue.push(record);
+}
+
+void TBootQueue::IncludeBlockedQueue() {
+    RetryBlockedRequested = true;
+}
+
+void TBootQueue::PromoteBlocked(size_t limit) {
+    if (BlockedRetryQueue.empty() && RetryBlockedRequested) {
+        // Do not reconsider newly blocked records in the same retry round.
+        // Swapping snapshots is O(1), including for a large follower backlog.
+        BlockedRetryQueue.swap(BlockedQueue);
+        RetryBlockedRequested = false;
+    }
+    while (limit && !BlockedRetryQueue.empty()) {
+        BootQueue.push(BlockedRetryQueue.top());
+        BlockedRetryQueue.pop();
+        --limit;
+    }
+}
+
+bool TBootQueue::HasBlockedRecords() const {
+    return !BlockedQueue.empty() || !BlockedRetryQueue.empty();
+}
+
+void TBootQueue::DeferBackup(TBackupBootRecord record, TInstant readyAt) {
+    BackupEnqueueTimes.insert(record.EnqueueTime);
+    BackupDeferredQueue.emplace(readyAt, record);
+}
+
+void TBootQueue::PromoteBackupDeferred(TInstant now, size_t limit) {
+    while (limit-- && !BackupDeferredQueue.empty() && BackupDeferredQueue.begin()->first <= now) {
+        BackupBootQueue.push_back(BackupDeferredQueue.begin()->second);
+        BackupDeferredQueue.erase(BackupDeferredQueue.begin());
+    }
+}
+
+void TBootQueue::HandOverBackupQueues(size_t limit) {
+    while (limit && !BackupQueueEmpty()) {
+        AddToBootQueue(PopFromBackupQueue().Record);
+        --limit;
+    }
+    while (limit && !BackupDeferredQueue.empty()) {
+        auto it = BackupDeferredQueue.begin();
+        Defer(it->second.Record, it->first);
+        RemoveBackupEnqueueTime(it->second.EnqueueTime);
+        BackupDeferredQueue.erase(it);
+        --limit;
+    }
+    while (limit && !BackupWaitQueue.empty()) {
+        auto record = BackupWaitQueue.front();
+        BackupWaitQueue.pop_front();
+        RemoveBackupEnqueueTime(record.EnqueueTime);
+        AddToWaitQueue(record.Record);
+        --limit;
+    }
+}
+
+std::optional<TInstant> TBootQueue::GetNextDeferredWakeup(TInstant now) const {
+    // Due records are handled by bounded continuations or admission wakeups.
+    // They must not hide a future foreground deadline or cause a timer spin.
+    std::optional<TInstant> next;
+    if (auto it = DeferredQueue.upper_bound(now); it != DeferredQueue.end()) {
+        next = it->first;
+    }
+    if (auto it = BackupDeferredQueue.upper_bound(now); it != BackupDeferredQueue.end()) {
+        auto backupNext = it->first;
+        next = next ? std::min(*next, backupNext) : backupNext;
+    }
+    return next;
 }
 
 TBootQueue::TQueue& TBootQueue::GetCurrentQueue() {

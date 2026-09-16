@@ -199,6 +199,9 @@ public:
             }
             tablet->GetLeader().TryToBoot();
         }
+        if (FollowerId == 0 && Status == TEvLocal::TEvTabletStatus::StatusOk) {
+            Self->BootQueue.IncludeBlockedQueue();
+        }
         Self->ProcessBootQueue(); // it's required to start followers on successful leader start
         return true;
     }

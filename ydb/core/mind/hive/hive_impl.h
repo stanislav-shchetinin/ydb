@@ -402,10 +402,8 @@ protected:
     ui64 TabletsStarting = 0;
     ui64 BackupTabletsStarting = 0;
     TBackupPacer BackupBootPacer;
-    // Load factor is shared by everything that paces backup work - the signal is the same
-    double BackupLoadFactor = 1;
-    TInstant BackupLoadFactorUpdated;
-    bool BackupPlacementRestricted = false;
+    TInstant MainBlockedQueueRetryAt;
+    TInstant BackupWaitQueueRetryAt;
     TInstant LastConnect;
     TInstant ProcessBootQueuePostponedUntil;
     TDuration MaxTimeBetweenConnects;
@@ -475,12 +473,11 @@ protected:
     i64 DeleteTabletInProgress = 0;
     std::queue<TTabletId> DeleteTabletQueue;
 
-    // Deletion of backup tablets is paced separately, so that it neither takes over the
-    // DeleteTabletInProgress window from user deletions nor deletes storage in a burst
-    std::deque<std::pair<TTabletId, TInstant>> BackupDeleteQueue; // tablet id and enqueue time
-    // A set rather than a counter: TTxDeleteTabletResult can arrive for a tablet that is already
-    // gone, and erasing from a set makes the bookkeeping robust against that
-    std::unordered_set<TTabletId> BackupDeleteInFlight;
+    // Both classes occupy DeleteTabletInProgress. One slot covers the complete
+    // logical deletion, including retries, until a known completion releases it.
+    std::deque<std::pair<TTabletId, TInstant>> BackupDeleteQueue;
+    std::unordered_map<TTabletId, bool> DeleteTabletsInFlight; // true = paced backup
+    ui64 BackupTabletsDeleting = 0;
     TBackupPacer BackupDeletePacer;
     bool ProcessBackupDeleteQueueScheduled = false;
     bool ProcessBackupDeleteQueuePostponed = false;
@@ -738,6 +735,7 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     void UpdateCounterTabletsStarting(i64 tabletsStartingDiff);
     void UpdateTabletsStarting(const TTabletInfo& tablet, i64 diff);
     void UpdateCounterBackupBootQueueSize();
+    void CountBackupEvent(ECumulativeCounters counter, ui64 value = 1);
     void UpdateCounterBackupDeleteQueueSize();
     void UpdateCounterPingQueueSize();
     void UpdateCounterTabletChannelHistorySize();
@@ -795,13 +793,14 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
     TBootPassResult ProcessMainBootQueue(TInstant now, TSideEffects& sideEffects);
     void ProcessBackupBootQueue(TInstant now, TSideEffects& sideEffects);
     void ScheduleNextBootQueuePass(TInstant now, const TBootPassResult& mainPass);
-    double GetBackupLoadFactor(TInstant now);
     TBackupPacer::TSettings GetBackupBootPacerSettings() const;
-    ui64 GetBackupBootBudget(TInstant now, double loadFactor);
+    ui64 GetBackupBootBudget(TInstant now);
     TBackupPacer::TSettings GetBackupDeletePacerSettings() const;
     void ExecuteProcessBackupDeleteQueue(TSideEffects& sideEffects);
     void HandOverBackupDeleteQueue(TSideEffects& sideEffects);
     void DrainDeleteTabletQueue(TSideEffects& sideEffects);
+    bool RegisterDeleteInFlight(TTabletId tabletId, bool backup);
+    bool CompleteDeleteInFlight(TTabletId tabletId);
 
     void CreateTabletFollowers(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db, TSideEffects& sideEffects);
     TDuration GetBalancerCooldown(EBalancerType balancerType) const;
@@ -898,51 +897,12 @@ TTabletInfo* FindTabletEvenInDeleting(TTabletId tabletId, TFollowerId followerId
         return CurrentConfig.GetMaxBackupTabletsStarting();
     }
 
-    double GetBackupStartUserWeight() const {
-        return CurrentConfig.GetBackupStartUserWeight();
-    }
-
-    double GetBackupBootFullSpeedUsage() const {
-        return CurrentConfig.GetBackupBootFullSpeedUsage();
-    }
-
-    double GetBackupBootStopUsage() const {
-        return CurrentConfig.GetBackupBootStopUsage();
-    }
-
-    TDuration GetBackupBootMaxDelay() const {
-        return TDuration::MilliSeconds(CurrentConfig.GetBackupBootMaxDelay());
-    }
-
-    double GetBackupBootMinRate() const {
-        return CurrentConfig.GetBackupBootMinRate();
-    }
-
-    double GetBackupBootUsageQuantile() const {
-        return CurrentConfig.GetBackupBootUsageQuantile();
-    }
-
-    double GetBackupTabletBalancerWeight() const {
-        return CurrentConfig.GetBackupTabletBalancerWeight();
-    }
-
     bool GetBackupDeletePacingEnabled() const {
         return CurrentConfig.GetBackupDeletePacingEnabled();
     }
 
     ui64 GetMaxBackupTabletsStartingPerNode() const {
         return CurrentConfig.GetMaxBackupTabletsStartingPerNode();
-    }
-
-    double GetBackupMaxNodeUsageToPlace() const {
-        return CurrentConfig.GetBackupMaxNodeUsageToPlace();
-    }
-
-    // Placement restrictions are lifted while the oldest queued backup tablet has aged past
-    // BackupBootMaxDelay, so that they can never stall the queue permanently. Recomputed once per
-    // backup boot pass rather than per candidate node.
-    bool IsBackupPlacementRestricted() const {
-        return BackupPlacementRestricted;
     }
 
     TResourceNormalizedValues GetMinScatterToBalance() const {

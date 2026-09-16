@@ -8663,16 +8663,234 @@ Y_UNIT_TEST_SUITE(THiveTest) {
       UNIT_ASSERT_VALUES_EQUAL(0, getTabletsStartingCounter());
     }
 
+    Y_UNIT_TEST(TestBackupBootForegroundPriorityAcrossBatches) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupBootPacingEnabled(true);
+            app.HiveConfig.SetBackupBootRate(1000);
+            app.HiveConfig.SetMaxBootBatchSize(1);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+        MakeSureTabletIsUp(runtime, hiveTablet, 0);
+        const auto hiveActor = GetHiveActor(runtime, hiveTablet);
+        TBlockEvents<NHive::TEvPrivate::TEvProcessBootQueue> blockBoot(runtime,
+            [&](const auto& ev) { return ev->GetRecipientRewrite() == hiveActor; });
+        std::unordered_set<ui64> foreground;
+        for (ui64 i = 0; i < 5; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(owner, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            foreground.insert(SendCreateTestTablet(runtime, hiveTablet, owner, std::move(ev), 0, false));
+        }
+        auto backup = MakeHolder<TEvHive::TEvCreateTablet>(owner, 100, TTabletTypes::Dummy, BINDED_CHANNELS);
+        backup->Record.SetIsBackup(true);
+        ui64 backupId = SendCreateTestTablet(runtime, hiveTablet, owner, std::move(backup), 0, false);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BOOTQUEUE_SIZE), 5);
+        ui64 foregroundBoots = 0;
+        bool backupBooted = false;
+        auto observer = runtime.AddObserver<TEvLocal::TEvBootTablet>([&](auto&& ev) {
+            ui64 id = ev->Get()->Record.GetInfo().GetTabletID();
+            if (foreground.erase(id)) {
+                ++foregroundBoots;
+            } else if (id == backupId) {
+                UNIT_ASSERT_VALUES_EQUAL(foregroundBoots, 5);
+                backupBooted = true;
+            }
+        });
+        blockBoot.Stop().Unblock();
+        runtime.WaitFor("backup boots after every ready foreground tablet",
+            [&] { return backupBooted; }, TDuration::Seconds(10));
+    }
+
+    Y_UNIT_TEST(TestBackupBootDynamicEnableReclassifiesBacklog) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true);
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+        MakeSureTabletIsUp(runtime, hiveTablet, 0);
+        const auto hiveActor = GetHiveActor(runtime, hiveTablet);
+        const auto sender = runtime.AllocateEdgeActor();
+        TBlockEvents<NHive::TEvPrivate::TEvProcessBootQueue> blockBoot(runtime,
+            [&](const auto& ev) { return ev->GetRecipientRewrite() == hiveActor; });
+        TBlockEvents<TEvLocal::TEvTabletStatus> blockStatus(runtime);
+        for (ui64 i = 0; i < 6; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(owner, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            SendCreateTestTablet(runtime, hiveTablet, owner, std::move(ev), 0, false);
+        }
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BOOTQUEUE_SIZE), 6);
+
+        auto configure = [&](bool enabled) {
+            auto ev = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
+            auto* config = ev->Record.MutableConfig()->MutableHiveConfig();
+            config->SetBackupBootPacingEnabled(enabled);
+            config->SetBackupBootRate(0.01);
+            config->SetBackupBootBurst(1);
+            config->SetMaxBootBatchSize(2);
+            config->SetMaxBackupTabletsStartingPerNode(16);
+            runtime.Send(new IEventHandle(hiveActor, sender, ev.Release()), 0, true);
+            TAutoPtr<IEventHandle> response;
+            runtime.GrabEdgeEventRethrow<NConsole::TEvConsole::TEvConfigNotificationResponse>(response);
+        };
+        configure(true);
+        blockBoot.Stop().Unblock();
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_STARTING), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 5);
+        configure(false);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_STARTING), 6);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
+        blockStatus.Stop().Unblock();
+    }
+
+    Y_UNIT_TEST(TestBackupBootRestartPreservesClassification) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupBootPacingEnabled(true);
+            app.HiveConfig.SetBackupBootRate(0.01);
+            app.HiveConfig.SetBackupBootBurst(10);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+        for (ui64 i = 0; i < 6; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(owner, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(true);
+            SendCreateTestTablet(runtime, hiveTablet, owner, std::move(ev), 0, i == 0);
+        }
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 5);
+        RebootTablet(runtime, hiveTablet, runtime.AllocateEdgeActor());
+        MakeSureTabletIsUp(runtime, hiveTablet, 0);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        // Persisted IsBackup routes the remaining tablets back through pacing.
+        // Restart must not replenish all ten burst tokens and drain the backlog.
+        UNIT_ASSERT(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE) >= 4);
+    }
+
+    Y_UNIT_TEST(TestBackupDeleteSharedWindowAndUnknownCompletion) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupDeletePacingEnabled(true);
+            app.HiveConfig.SetBackupDeleteRate(1000);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(3);
+            app.HiveConfig.SetMaxBackupDeleteInProgress(2);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+        MakeSureTabletIsUp(runtime, hiveTablet, 0);
+        const auto hiveActor = GetHiveActor(runtime, hiveTablet);
+        const auto sender = runtime.AllocateEdgeActor();
+        std::vector<ui64> tabletIds;
+        for (ui64 i = 0; i < 7; ++i) {
+            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(owner, i, TTabletTypes::Dummy, BINDED_CHANNELS);
+            ev->Record.SetIsBackup(i < 6);
+            tabletIds.push_back(SendCreateTestTablet(runtime, hiveTablet, owner, std::move(ev), 0, true));
+        }
+        TBlockEvents<TEvTabletBase::TEvDeleteTabletResult> blockResults(runtime,
+            [](const auto& ev) { return ev->Get()->TabletId != 999; });
+        for (ui64 i = 0; i < 6; ++i) {
+            SendDeleteTestTablet(runtime, hiveTablet, MakeHolder<TEvHive::TEvDeleteTablet>(owner, i, 0),
+                0, std::nullopt);
+        }
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 2);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING), 2);
+        SendDeleteTestTablet(runtime, hiveTablet, MakeHolder<TEvHive::TEvDeleteTablet>(owner, 6, 0),
+            0, std::nullopt);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 3);
+        runtime.Send(new IEventHandle(hiveActor, sender,
+            new TEvTabletBase::TEvDeleteTabletResult(NKikimrProto::OK, 999)), 0, true);
+        runtime.SimulateSleep(TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 3);
+        blockResults.Stop().Unblock();
+        // Counter requests dispatch events themselves and must not be issued
+        // recursively from WaitFor's CustomFinalCondition.
+        for (ui32 retry = 0; retry < 100; ++retry) {
+            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+            if (GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING) == 0
+                    && GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE) == 0) {
+                break;
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
+        runtime.Send(new IEventHandle(hiveActor, sender,
+            new TEvTabletBase::TEvDeleteTabletResult(NKikimrProto::OK, tabletIds.front())), 0, true);
+        runtime.SimulateSleep(TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 0);
+    }
+
+    Y_UNIT_TEST(TestBackupDeleteBlockRetryKeepsSharedSlot) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetBackupDeletePacingEnabled(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(1);
+            app.HiveConfig.SetMaxBackupDeleteInProgress(1);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        auto bootstrapper = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(bootstrapper);
+        auto ev = MakeHolder<TEvHive::TEvCreateTablet>(owner, 0, TTabletTypes::Dummy, BINDED_CHANNELS);
+        ev->Record.SetIsBackup(true);
+        SendCreateTestTablet(runtime, hiveTablet, owner, std::move(ev), 0, true);
+        bool failed = false;
+        auto failFirst = runtime.AddObserver<TEvBlobStorage::TEvBlockResult>([&](auto&& result) {
+            if (!failed) {
+                result->Get()->Status = NKikimrProto::ERROR;
+                failed = true;
+            }
+        });
+        const auto hiveActor = GetHiveActor(runtime, hiveTablet);
+        TEvHive::TEvInitiateBlockStorage::TPtr blockedRetry;
+        // Scheduled events have no sender; TBlockEvents' diagnostic logging
+        // requires a sender with a node id, so hold this event directly.
+        auto blockRetry = runtime.AddObserver<TEvHive::TEvInitiateBlockStorage>([&](auto& retry) {
+            if (retry->GetRecipientRewrite() == hiveActor) {
+                blockedRetry = std::move(retry);
+            }
+        });
+        SendDeleteTestTablet(runtime, hiveTablet, MakeHolder<TEvHive::TEvDeleteTablet>(owner, 0, 0),
+            0, std::nullopt);
+        runtime.WaitFor("storage retry is scheduled", [&] { return bool(blockedRetry); }, TDuration::Seconds(10));
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING), 1);
+        blockRetry.Remove();
+        runtime.Send(blockedRetry.Release(), 0, true);
+        for (ui32 retry = 0; retry < 100; ++retry) {
+            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+            if (GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING) == 0) {
+                break;
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_TABLETS_DELETING), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING), 0);
+    }
+
     Y_UNIT_TEST(TestBackupBootPacingLimitsInflight) {
         TTestBasicRuntime runtime(1, false);
         Setup(runtime, true, 1, [](TAppPrepare& app) {
             app.HiveConfig.SetBackupBootPacingEnabled(true);
-            // Isolate the inflight gate: the rate limiter and aging must not interfere
+            // Isolate the inflight gate: the rate limiter must not interfere
             app.HiveConfig.SetBackupBootRate(1000);
             app.HiveConfig.SetBackupBootBurst(1000);
-            app.HiveConfig.SetBackupBootMaxDelay(3600000);
             app.HiveConfig.SetMaxBackupTabletsStarting(2);
-            app.HiveConfig.SetBackupStartUserWeight(0);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8716,12 +8934,11 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         TTestBasicRuntime runtime(1, false);
         Setup(runtime, true, 1, [](TAppPrepare& app) {
             app.HiveConfig.SetBackupBootPacingEnabled(true);
-            // Isolate the rate limiter: the inflight window and aging must not interfere
+            // Isolate the rate limiter: the inflight windows must not interfere
             app.HiveConfig.SetBackupBootRate(2);
             app.HiveConfig.SetBackupBootBurst(1);
             app.HiveConfig.SetMaxBackupTabletsStarting(1000);
-            app.HiveConfig.SetBackupStartUserWeight(0);
-            app.HiveConfig.SetBackupBootMaxDelay(3600000);
+            app.HiveConfig.SetMaxBackupTabletsStartingPerNode(1000);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8760,7 +8977,6 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             app.HiveConfig.SetBackupBootRate(0.01);
             app.HiveConfig.SetBackupBootBurst(1);
             app.HiveConfig.SetMaxBackupTabletsStarting(1);
-            app.HiveConfig.SetBackupBootMaxDelay(3600000);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8813,8 +9029,6 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             app.HiveConfig.SetMaxBackupTabletsStarting(100);
             app.HiveConfig.SetBackupBootRate(1000);
             app.HiveConfig.SetBackupBootBurst(1000);
-            app.HiveConfig.SetBackupStartUserWeight(0);
-            app.HiveConfig.SetBackupBootMaxDelay(3600000);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8839,72 +9053,11 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         // One per node, and both nodes are used: a global-only limit would have allowed 4, and a gate
         // that aborted the node search instead of skipping the node would have allowed only 1
         UNIT_ASSERT_VALUES_EQUAL(maxStarting, 2);
-        UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
+        UNIT_ASSERT_VALUES_UNEQUAL(
+            GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE)
+                + GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_WAITQUEUE_SIZE), 0);
 
         blockStatus.Stop().Unblock();
-        for (ui64 tabletId : tabletIds) {
-            MakeSureTabletIsUp(runtime, tabletId, 0);
-        }
-        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
-    }
-
-    Y_UNIT_TEST(TestBackupBootPacingAvoidsHotNodes) {
-        static constexpr ui64 NUM_BACKUP_TABLETS = 3;
-        static constexpr ui64 USER_TABLET_OWNER_IDX = 100;
-        // 0.78 of the default MaxResourceMemory - above BackupMaxNodeUsageToPlace, below
-        // MaxNodeUsageToKick, so the emergency balancer stays out of the way
-        static constexpr ui64 HOT_NODE_MEMORY = 400'000'000'000ull;
-        TTestBasicRuntime runtime(1, false);
-        Setup(runtime, true, 1, [](TAppPrepare& app) {
-            app.HiveConfig.SetBackupBootPacingEnabled(true);
-            app.HiveConfig.SetBackupMaxNodeUsageToPlace(0.5);
-            // Keep the rate and the load factor out of the picture, so only placement can block
-            app.HiveConfig.SetBackupBootRate(1000);
-            app.HiveConfig.SetBackupBootBurst(1000);
-            app.HiveConfig.SetBackupStartUserWeight(0);
-            app.HiveConfig.SetBackupBootFullSpeedUsage(5);
-            app.HiveConfig.SetBackupBootStopUsage(10);
-            app.HiveConfig.SetBackupBootMaxDelay(3600000);
-        });
-        const ui64 hiveTablet = MakeDefaultHiveID();
-        const ui64 testerTablet = MakeTabletID(false, 1);
-        const TActorId hiveActor = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
-        runtime.EnableScheduleForActor(hiveActor);
-        MakeSureTabletIsUp(runtime, hiveTablet, 0);
-        TActorId sender = runtime.AllocateEdgeActor(0);
-
-        auto userEv = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, USER_TABLET_OWNER_IDX,
-                                                          TTabletTypes::Dummy, BINDED_CHANNELS);
-        ui64 userTabletId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(userEv), 0, true);
-        MakeSureTabletIsUp(runtime, userTabletId, 0);
-
-        auto setUserTabletMemory = [&](ui64 memory) {
-            THolder<TEvHive::TEvTabletMetrics> metrics = MakeHolder<TEvHive::TEvTabletMetrics>();
-            NKikimrHive::TTabletMetrics* metric = metrics->Record.AddTabletMetrics();
-            metric->SetTabletID(userTabletId);
-            metric->MutableResourceUsage()->SetMemory(memory);
-            runtime.SendToPipe(hiveTablet, sender, metrics.Release());
-            TAutoPtr<IEventHandle> handle;
-            runtime.GrabEdgeEventRethrow<TEvLocal::TEvTabletMetricsAck>(handle);
-        };
-
-        setUserTabletMemory(HOT_NODE_MEMORY);
-
-        std::vector<ui64> tabletIds;
-        for (ui64 i = 0; i < NUM_BACKUP_TABLETS; ++i) {
-            auto ev = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, i, TTabletTypes::Dummy, BINDED_CHANNELS);
-            ev->Record.SetIsBackup(true);
-            tabletIds.push_back(SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, false));
-        }
-
-        // The only node is too hot to accept backup tablets
-        runtime.SimulateSleep(TDuration::Seconds(2));
-        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_STARTING), 0);
-        UNIT_ASSERT_VALUES_UNEQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_BOOTQUEUE_SIZE), 0);
-
-        // Once it cools down they must proceed - they have to stay in the boot queue rather than
-        // being parked in the wait queue, which is only revisited when nodes change state
-        setUserTabletMemory(0);
         for (ui64 tabletId : tabletIds) {
             MakeSureTabletIsUp(runtime, tabletId, 0);
         }
@@ -8916,12 +9069,10 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         TTestBasicRuntime runtime(1, false);
         Setup(runtime, true, 1, [](TAppPrepare& app) {
             app.HiveConfig.SetBackupDeletePacingEnabled(true);
-            // Isolate the rate limiter: the window and aging must not interfere
+            // Isolate the rate limiter: the window must not interfere
             app.HiveConfig.SetBackupDeleteRate(2);
             app.HiveConfig.SetBackupDeleteBurst(1);
             app.HiveConfig.SetMaxBackupDeleteInProgress(1000);
-            app.HiveConfig.SetBackupDeleteUserWeight(0);
-            app.HiveConfig.SetBackupDeleteMaxDelay(3600000);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8950,6 +9101,12 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         // ... but the queue does drain over time
         runtime.WaitFor("all backup tablets deleted", [&] { return deleteCount >= NUM_TABLETS; }, TDuration::Minutes(1));
+        // Receipt precedes the delete transaction's durable completion, which
+        // is the point where the logical in-flight slot is released.
+        for (ui32 retry = 0; retry < 100
+                && GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING) != 0; ++retry) {
+            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+        }
         UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_DELETEQUEUE_SIZE), 0);
         UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_BACKUP_TABLETS_DELETING), 0);
     }
@@ -8964,7 +9121,6 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             app.HiveConfig.SetBackupDeleteRate(0.01);
             app.HiveConfig.SetBackupDeleteBurst(1);
             app.HiveConfig.SetMaxBackupDeleteInProgress(1);
-            app.HiveConfig.SetBackupDeleteMaxDelay(3600000);
         });
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);

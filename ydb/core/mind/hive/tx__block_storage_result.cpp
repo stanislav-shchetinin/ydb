@@ -28,6 +28,9 @@ public:
             {"replyStatus", NKikimrProto::EReplyStatus_Name(msg->Status)});
         TLeaderTabletInfo* tablet = Self->FindTabletEvenInDeleting(TabletId);
         if (tablet != nullptr) {
+            if (tablet->IsDeleting() && !Self->DeleteTabletsInFlight.contains(TabletId)) {
+                return true;
+            }
             NIceDb::TNiceDb db(txc.DB);
             if (msg->Status == NKikimrProto::OK
                     || msg->Status == NKikimrProto::ALREADY
@@ -61,10 +64,8 @@ public:
                     {"tabletId", TabletId},
                     {"replyStatus", NKikimrProto::EReplyStatus_Name(msg->Status)},
                     {"errorReason", msg->ErrorReason});
-                if (tablet->IsDeleting()) {
-                    --Self->DeleteTabletInProgress;
-                    Self->UpdateCounterTabletsDeleting();
-                }
+                // A storage retry retains the logical deletion's shared slot.
+                // Only a known final completion releases it.
                 SideEffects.Schedule(TDuration::MilliSeconds(1000), new TEvHive::TEvInitiateBlockStorage(tablet->Id));
             }
         }
