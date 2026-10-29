@@ -60,6 +60,9 @@ namespace TEvPrivate {
         EvPeriodicTableStatsParsed,
         EvRevisitSplitMerge,
         EvExportCompletionUploadResult,
+        EvExportKesusTimeout,
+        EvImportKesusResourcesResult,
+        EvImportRetryKesusParent,
         EvEnd
     };
 
@@ -144,6 +147,30 @@ namespace TEvPrivate {
         {}
     };
 
+    struct TEvImportKesusResourcesResult: public TEventLocal<TEvImportKesusResourcesResult, EvImportKesusResourcesResult> {
+        const ui64 ImportId;
+        const ui32 ItemIdx;
+        const bool Success;
+        const TString Error;
+
+        TEvImportKesusResourcesResult(ui64 id, ui32 itemIdx, bool success, const TString& error)
+            : ImportId(id)
+            , ItemIdx(itemIdx)
+            , Success(success)
+            , Error(error)
+        {}
+    };
+
+    struct TEvImportRetryKesusParent: public TEventLocal<TEvImportRetryKesusParent, EvImportRetryKesusParent> {
+        const ui64 ImportId;
+        const ui32 ItemIdx;
+
+        TEvImportRetryKesusParent(ui64 id, ui32 itemIdx)
+            : ImportId(id)
+            , ItemIdx(itemIdx)
+        {}
+    };
+
     struct TEvImportSchemeQueryResult: public TEventLocal<TEvImportSchemeQueryResult, EvImportSchemeQueryResult> {
         const ui64 ImportId;
         const ui32 ItemIdx;
@@ -180,6 +207,8 @@ namespace TEvPrivate {
             , Error(error)
         {}
     };
+
+    struct TEvExportKesusTimeout: public TEventLocal<TEvExportKesusTimeout, EvExportKesusTimeout> {};
 
     struct TEvExportUploadMetadataResult: public TEventLocal<TEvExportUploadMetadataResult, EvExportUploadMetadataResult> {
         const ui64 ExportId;

@@ -29,6 +29,12 @@ NActors::IActor* CreateSchemeUploader(NActors::TActorId schemeShard, ui64 export
 );
 
 template <typename TSettings>
+NActors::IActor* CreateKesusSchemeUploader(NActors::TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const TSettings& settings, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template <typename TSettings>
 NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui64 exportId,
     const TSettings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
     bool enableChecksums

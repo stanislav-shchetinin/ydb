@@ -74,6 +74,15 @@ IActor* CreateSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, 
     return new TSchemeUploaderFallback<TSettings>(schemeShard, exportId, itemIdx);
 }
 
+template <typename TSettings>
+IActor* CreateKesusSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const TSettings& settings, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+) {
+    Y_UNUSED(sourcePathId, settings, metadata, enablePermissions, enableChecksums, iv);
+    return new TSchemeUploaderFallback<TSettings>(schemeShard, exportId, itemIdx);
+}
+
 class TExportCompletionUploaderFallback: public TActorBootstrapped<TExportCompletionUploaderFallback> {
 public:
     TExportCompletionUploaderFallback(TActorId schemeShard, ui64 exportId, ui32 itemIdx)
@@ -134,6 +143,18 @@ template IActor* CreateSchemeUploader<Ydb::Export::ExportToS3Settings>(
 template IActor* CreateSchemeUploader<Ydb::Export::ExportToFsSettings>(
     TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
     const Ydb::Export::ExportToFsSettings& settings, const TString& databaseRoot, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template IActor* CreateKesusSchemeUploader<Ydb::Export::ExportToS3Settings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToS3Settings& settings, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template IActor* CreateKesusSchemeUploader<Ydb::Export::ExportToFsSettings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToFsSettings& settings, const TString& metadata,
     bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
 );
 

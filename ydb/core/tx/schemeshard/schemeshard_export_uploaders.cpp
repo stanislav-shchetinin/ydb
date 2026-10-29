@@ -4,6 +4,7 @@
 #include "schemeshard_xxport__helpers.h"
 
 #include <ydb/public/api/protos/ydb_export.pb.h>
+#include <ydb/public/api/protos/ydb_rate_limiter.pb.h>
 #include <ydb/public/lib/ydb_cli/dump/files/files.h>
 
 #include <ydb/core/backup/common/checksum.h>
@@ -12,6 +13,8 @@
 #include <ydb/core/backup/common/metadata.h>
 #include <ydb/core/base/appdata_fwd.h>
 #include <ydb/core/base/path.h>
+#include <ydb/core/base/tablet_pipe.h>
+#include <ydb/core/kesus/tablet/events.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/tx/datashard/export_common.h>
 #include <ydb/core/tx/schemeshard/schemeshard_export_helpers.h>
@@ -21,6 +24,7 @@
 #include <ydb/core/wrappers/retry_policy.h>
 #include <ydb/core/wrappers/s3_storage_config.h>
 #include <ydb/core/wrappers/s3_wrapper.h>
+#include <ydb/core/ydb_convert/kesus_description.h>
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/hfunc.h>
@@ -30,11 +34,37 @@
 
 #include <util/string/cast.h>
 
+#include <algorithm>
 #include <type_traits>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::EXPORT
 
 namespace NKikimr::NSchemeShard {
+
+namespace {
+
+template <typename TSettings>
+TString GetSchemeDestinationPrefix(const TSettings& settings, ui32 itemIdx) {
+    if (itemIdx < ui32(settings.items_size())) {
+        const TString itemDest = NBackup::NFieldsWrappers::GetItemDestination(settings.items(itemIdx));
+        if constexpr (std::is_same_v<TSettings, Ydb::Export::ExportToFsSettings>) {
+            return CanonizePath(TStringBuilder() << settings.base_path() << "/" << itemDest);
+        }
+        return itemDest;
+    }
+    return NBackup::NFieldsWrappers::GetCommonDestination(settings);
+}
+
+TMaybe<NBackup::TEncryptionIV> MakeSchemeFileIV(
+    const TMaybe<NBackup::TEncryptionIV>& itemIV, NBackup::EBackupFileType fileType)
+{
+    if (itemIV) {
+        return NBackup::TEncryptionIV::Combine(*itemIV, fileType, 0 /* backupItemNumber: already combined */, 0 /* shardNumber */);
+    }
+    return Nothing();
+}
+
+} // anonymous namespace
 
 template <class TDerived, class TSettings>
 class TExportFilesUploader: public TActorBootstrapped<TDerived> {
@@ -364,11 +394,7 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
     }
 
     TMaybe<NBackup::TEncryptionIV> MakeIV(NBackup::EBackupFileType fileType) {
-        TMaybe<NBackup::TEncryptionIV> iv;
-        if (IV) {
-            iv = NBackup::TEncryptionIV::Combine(*IV, fileType, 0 /* backupItemNumber: already combined */, 0 /* shardNumber */);
-        }
-        return iv;
+        return MakeSchemeFileIV(IV, fileType);
     }
 
     void Finish(bool success = true, const TString& error = TString()) {
@@ -386,17 +412,6 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
         Finish(success, error);
     }
 
-    static TString GetDestinationPrefix(const TSettings& settings, ui32 itemIdx) {
-        if (itemIdx < ui32(settings.items_size())) {
-            const TString itemDest = NBackup::NFieldsWrappers::GetItemDestination(settings.items(itemIdx));
-            if constexpr (std::is_same_v<TSettings, Ydb::Export::ExportToFsSettings>) {
-                return CanonizePath(TStringBuilder() << settings.base_path() << "/" << itemDest);
-            }
-            return itemDest;
-        }
-        return NBackup::NFieldsWrappers::GetCommonDestination(settings);
-    }
-
 public:
     TSchemeUploader(
         TActorId schemeShard,
@@ -410,7 +425,7 @@ public:
         bool enableChecksums,
         const TMaybe<NBackup::TEncryptionIV>& iv
     )
-        : TExportFilesUploader<TSchemeUploader, TSettings>(settings, GetDestinationPrefix(settings, itemIdx))
+        : TExportFilesUploader<TSchemeUploader, TSettings>(settings, GetSchemeDestinationPrefix(settings, itemIdx))
         , SchemeShard(schemeShard)
         , ExportId(exportId)
         , ItemIdx(itemIdx)
@@ -453,6 +468,214 @@ private:
     TString Permissions;
     TString Metadata;
 }; // TSchemeUploader
+
+template <typename TSettings>
+class TKesusSchemeUploader: public TExportFilesUploader<TKesusSchemeUploader<TSettings>, TSettings> {
+    using TThis = TKesusSchemeUploader;
+    using TBase = TExportFilesUploader<TThis, TSettings>;
+
+public:
+    TKesusSchemeUploader(
+        TActorId schemeShard,
+        ui64 exportId,
+        ui32 itemIdx,
+        TPathId sourcePathId,
+        const TSettings& settings,
+        const TString& metadata,
+        bool enablePermissions,
+        bool enableChecksums,
+        const TMaybe<NBackup::TEncryptionIV>& iv
+    )
+        : TBase(settings, GetSchemeDestinationPrefix(settings, itemIdx))
+        , SchemeShard(schemeShard)
+        , ExportId(exportId)
+        , ItemIdx(itemIdx)
+        , SourcePathId(sourcePathId)
+        , Metadata(metadata)
+        , EnablePermissions(enablePermissions)
+        , EnableChecksums(enableChecksums)
+        , IV(iv)
+    {}
+
+    void Bootstrap() {
+        this->Become(&TThis::StateDescribe);
+        this->Send(SchemeShard, new TEvSchemeShard::TEvDescribeScheme(SourcePathId));
+    }
+
+private:
+    void HandleSchemeDescription(TEvSchemeShard::TEvDescribeSchemeResult::TPtr& ev) {
+        const auto& describeResult = ev->Get()->GetRecord();
+        if (describeResult.GetStatus() != TEvSchemeShard::EStatus::StatusSuccess) {
+            return Finish(false, describeResult.GetReason());
+        }
+
+        TString error;
+        if (!BuildCoordinationNodeScheme(describeResult, Scheme, error)) {
+            return Finish(false, error);
+        }
+
+        const auto& pathDescription = describeResult.GetPathDescription();
+        KesusTabletId = pathDescription.GetKesus().GetKesusTabletId();
+        if (!KesusTabletId) {
+            return Finish(false, "Coordination node tablet id is missing");
+        }
+
+        if (EnablePermissions) {
+            auto permissions = NDataShard::GenYdbPermissions(pathDescription);
+            if (!permissions || !NYdb::NBackup::PrintProto(*permissions, Permissions)) {
+                return Finish(false, "Cannot infer coordination node permissions");
+            }
+        }
+
+        NTabletPipe::TClientConfig pipeConfig;
+        pipeConfig.RetryPolicy = {.RetryLimitCount = 3};
+        KesusPipe = this->Register(NTabletPipe::CreateClient(this->SelfId(), KesusTabletId, pipeConfig));
+
+        // An empty path/id filter with Recursive=true describes the entire resource tree
+        // in one Kesus transaction, including children and their original properties.
+        auto request = MakeHolder<NKesus::TEvKesus::TEvDescribeQuoterResources>();
+        request->Record.SetRecursive(true);
+        this->Become(&TThis::StateDescribeResources);
+        NTabletPipe::SendData(this->SelfId(), KesusPipe, request.Release());
+        this->Schedule(TDuration::Minutes(1), new TEvPrivate::TEvExportKesusTimeout());
+    }
+
+    void HandleResources(NKesus::TEvKesus::TEvDescribeQuoterResourcesResult::TPtr& ev) {
+        ClosePipe();
+
+        const auto& record = ev->Get()->Record;
+        if (record.GetError().GetStatus() != Ydb::StatusIds::SUCCESS) {
+            return Finish(false, TStringBuilder() << "Cannot describe coordination node resources: "
+                << record.GetError().ShortDebugString());
+        }
+
+        Ydb::RateLimiter::Resources resources;
+        for (const auto& resource : record.GetResources()) {
+            FillRateLimiterDescription(*resources.add_resources(), resource);
+        }
+
+        auto& items = *resources.mutable_resources();
+        // A parent path is a proper prefix of its children, so it sorts before them.
+        std::sort(items.begin(), items.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.resource_path() < rhs.resource_path();
+        });
+
+        TString content;
+        if (items.empty()) {
+            // PrintProto omits empty repeated fields. Keep a nonempty, valid textproto
+            // so a retry also overwrites a previously exported nonempty resource set.
+            content = "resources: []\n";
+        } else if (!NYdb::NBackup::PrintProto(resources, content)) {
+            return Finish(false, "Cannot serialize coordination node resources");
+        }
+
+        StartUploadFiles(content);
+    }
+
+    bool AddFileWithChecksum(const TString& name, const TString& content, NBackup::EBackupFileType fileType) {
+        return this->AddFile(name, content, MakeSchemeFileIV(IV, fileType))
+            && (!EnableChecksums || this->AddFile(NBackup::ChecksumKey(name), NBackup::ComputeChecksum(content)));
+    }
+
+    void StartUploadFiles(const TString& resources) {
+        if (!Metadata) {
+            return Finish(false, "Empty coordination node export metadata");
+        }
+
+        if (!AddFileWithChecksum(NYdb::NDump::NFiles::CreateCoordinationNode().FileName, Scheme,
+                NBackup::EBackupFileType::CoordinationNodeCreate)
+            || !AddFileWithChecksum(KesusResourcesFileName, resources,
+                NBackup::EBackupFileType::CoordinationNodeCreateRateLimiter))
+        {
+            return;
+        }
+
+        if (EnablePermissions && !AddFileWithChecksum("permissions.pb", Permissions, NBackup::EBackupFileType::Permissions)) {
+            return;
+        }
+
+        if (!AddFileWithChecksum("metadata.json", Metadata, NBackup::EBackupFileType::Metadata)) {
+            return;
+        }
+
+        // UploadStateFunc ignores the distinct Kesus timeout event if it arrives late.
+        this->UploadFiles();
+    }
+
+    void HandleConnected(TEvTabletPipe::TEvClientConnected::TPtr& ev) {
+        if (ev->Get()->ClientId == KesusPipe && ev->Get()->Status != NKikimrProto::OK) {
+            Finish(false, "Failed to connect to coordination node");
+        }
+    }
+
+    void HandleDestroyed(TEvTabletPipe::TEvClientDestroyed::TPtr& ev) {
+        if (ev->Get()->ClientId == KesusPipe) {
+            Finish(false, "Connection to coordination node was lost");
+        }
+    }
+
+    void HandleTimeout() {
+        Finish(false, "Timed out waiting for coordination node resources");
+    }
+
+    void ClosePipe() {
+        if (KesusPipe) {
+            NTabletPipe::CloseClient(this->SelfId(), KesusPipe);
+            KesusPipe = {};
+        }
+    }
+
+    void PassAway() override {
+        ClosePipe();
+        TBase::PassAway();
+    }
+
+    void Finish(bool success, const TString& error) {
+        YDB_LOG_INFO("Finish coordination node export",
+            {"self", this->SelfId()},
+            {"kesusTabletId", KesusTabletId},
+            {"success", success},
+            {"error", error},
+        );
+        this->Send(SchemeShard, new TEvPrivate::TEvExportSchemeUploadResult(ExportId, ItemIdx, success, error));
+        PassAway();
+    }
+
+    void OnFilesUploaded(bool success, const TString& error) override {
+        Finish(success, error);
+    }
+
+    STATEFN(StateDescribe) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvSchemeShard::TEvDescribeSchemeResult, HandleSchemeDescription);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+    STATEFN(StateDescribeResources) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(NKesus::TEvKesus::TEvDescribeQuoterResourcesResult, HandleResources);
+            hFunc(TEvTabletPipe::TEvClientConnected, HandleConnected);
+            hFunc(TEvTabletPipe::TEvClientDestroyed, HandleDestroyed);
+            sFunc(TEvPrivate::TEvExportKesusTimeout, HandleTimeout);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+    const TActorId SchemeShard;
+    const ui64 ExportId;
+    const ui32 ItemIdx;
+    const TPathId SourcePathId;
+    const TString Metadata;
+    const bool EnablePermissions;
+    const bool EnableChecksums;
+    const TMaybe<NBackup::TEncryptionIV> IV;
+
+    ui64 KesusTabletId = 0;
+    TActorId KesusPipe;
+    TString Scheme;
+    TString Permissions;
+}; // TKesusSchemeUploader
 
 template <typename TSettings>
 class TExportMetadataUploader: public TExportFilesUploader<TExportMetadataUploader<TSettings>, TSettings> {
@@ -577,6 +800,15 @@ IActor* CreateSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, 
 }
 
 template <typename TSettings>
+IActor* CreateKesusSchemeUploader(TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const TSettings& settings, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+) {
+    return new TKesusSchemeUploader(schemeShard, exportId, itemIdx, sourcePathId, settings,
+        metadata, enablePermissions, enableChecksums, iv);
+}
+
+template <typename TSettings>
 NActors::IActor* CreateExportMetadataUploader(NActors::TActorId schemeShard, ui64 exportId,
     const TSettings& settings, const NKikimrSchemeOp::TExportMetadata& exportMetadata,
     bool enableChecksums
@@ -593,6 +825,18 @@ template IActor* CreateSchemeUploader<Ydb::Export::ExportToS3Settings>(
 template IActor* CreateSchemeUploader<Ydb::Export::ExportToFsSettings>(
     TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
     const Ydb::Export::ExportToFsSettings& settings, const TString& databaseRoot, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template IActor* CreateKesusSchemeUploader<Ydb::Export::ExportToS3Settings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToS3Settings& settings, const TString& metadata,
+    bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
+);
+
+template IActor* CreateKesusSchemeUploader<Ydb::Export::ExportToFsSettings>(
+    TActorId schemeShard, ui64 exportId, ui32 itemIdx, TPathId sourcePathId,
+    const Ydb::Export::ExportToFsSettings& settings, const TString& metadata,
     bool enablePermissions, bool enableChecksums, const TMaybe<NBackup::TEncryptionIV>& iv
 );
 
