@@ -276,6 +276,11 @@ void TSchemeShard::PersistNewImportItem(NIceDb::TNiceDb& db, const TImportInfo& 
         NIceDb::TUpdate<Schema::ImportItems::SrcPath>(item.SrcPath),
         NIceDb::TUpdate<Schema::ImportItems::ParentIndex>(item.ParentIdx)
     );
+    if (item.ExportItemIV) {
+        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
+            NIceDb::TUpdate<Schema::ImportItems::EncryptionIV>(item.ExportItemIV->GetBinaryString())
+        );
+    }
 }
 
 void TSchemeShard::PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemsSizeBefore) {
@@ -291,7 +296,8 @@ void TSchemeShard::PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const T
             NIceDb::TUpdate<Schema::ImportItems::DstPathName>(item.DstPathName),
             NIceDb::TUpdate<Schema::ImportItems::State>(static_cast<ui8>(item.State)),
             NIceDb::TUpdate<Schema::ImportItems::SrcPrefix>(item.SrcPrefix),
-            NIceDb::TUpdate<Schema::ImportItems::SrcPath>(item.SrcPath)
+            NIceDb::TUpdate<Schema::ImportItems::SrcPath>(item.SrcPath),
+            NIceDb::TUpdate<Schema::ImportItems::IndexEncryption>(item.ExportIndexEncryption)
         );
         if (item.ExportItemIV) {
             db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(

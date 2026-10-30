@@ -1473,6 +1473,7 @@ private:
             childItem.State = EState::Waiting;
             childItem.ParentIdx = msg.ItemIdx;
             childItem.Table = std::move(scheme);
+            childItem.ExportItemIV = indexMetadata.IV;
 
             Self->PersistNewImportItem(db, *importInfo, childIdx);
             Self->PersistImportItemScheme(db, *importInfo, childIdx);
