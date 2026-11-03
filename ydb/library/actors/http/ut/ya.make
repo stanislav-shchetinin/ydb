@@ -14,6 +14,7 @@ PEERDIR(
 
 IF (NOT OS_WINDOWS)
 SRCS(
+    http_client_tls_ut.cpp
     http_cache_ut.cpp
     http_obfuscation_ut.cpp
     http_tls_init_ut.cpp

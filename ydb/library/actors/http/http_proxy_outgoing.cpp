@@ -57,9 +57,13 @@ public:
     };
     std::unique_ptr<THttp2State> H2;
 
-    TOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event)
+    TOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event,
+            const TClientTlsOptions& tlsOptions)
         : Owner(owner)
     {
+        if constexpr (std::is_same_v<TSocketImpl, TSecureSocketImpl>) {
+            TSocketImpl::CaFile = tlsOptions.CaFile;
+        }
         InitiateRequest(event);
     }
 
@@ -367,8 +371,8 @@ protected:
     int DoConnect(bool& read, bool& write) {
         if constexpr (std::is_same_v<TSocketImpl, TSecureSocketImpl>) {
             if (UseHttp2) {
-                if (!TSocketImpl::Ssl) {
-                    TSocketImpl::InitClientSslWithAlpn();
+                if (!TSocketImpl::Ssl && !TSocketImpl::InitClientSsl(true)) {
+                    return -EPROTO;
                 }
                 ERR_clear_error();
                 return TSocketImpl::ProcessSslResult(SSL_connect(TSocketImpl::Ssl.Get()), read, write);
@@ -386,6 +390,12 @@ protected:
                 }
                 return;
             } else {
+                if constexpr (std::is_same_v<TSocketImpl, TSecureSocketImpl>) {
+                    if (TSocketImpl::Ssl && SSL_get_verify_result(TSocketImpl::Ssl.Get()) != X509_V_OK) {
+                        return ReplyErrorAndPassAway(TStringBuilder() << "TLS certificate verification failed: "
+                            << X509_verify_cert_error_string(SSL_get_verify_result(TSocketImpl::Ssl.Get())));
+                    }
+                }
                 return ReplyErrorAndPassAway(strerror(-res));
             }
         }
@@ -779,11 +789,12 @@ protected:
     }
 };
 
-NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event) {
+NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event,
+        const TClientTlsOptions& tlsOptions) {
     if (event->Get()->Request->Secure) {
-        return new TOutgoingConnectionActor<TSecureSocketImpl>(owner, event);
+        return new TOutgoingConnectionActor<TSecureSocketImpl>(owner, event, tlsOptions);
     } else {
-        return new TOutgoingConnectionActor<TPlainSocketImpl>(owner, event);
+        return new TOutgoingConnectionActor<TPlainSocketImpl>(owner, event, tlsOptions);
     }
 }
 

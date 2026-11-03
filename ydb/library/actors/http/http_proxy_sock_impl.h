@@ -163,6 +163,7 @@ struct TSecureSocketImpl : TPlainSocketImpl, TSslHelpers {
     TSslHolder<BIO> Bio;
     TSslHolder<SSL_CTX> Ctx;
     TSslHolder<SSL> Ssl;
+    TString CaFile;
 
     TSecureSocketImpl() = default;
 
@@ -170,35 +171,42 @@ struct TSecureSocketImpl : TPlainSocketImpl, TSslHelpers {
         : TPlainSocketImpl(std::move(socket))
     {}
 
-    void InitClientSsl() {
+    bool InitClientSsl(bool useHttp2 = false) {
+        Ctx = CreateClientContext(CaFile);
+        if (!Ctx) {
+            return false;
+        }
+        if (useHttp2) {
+            TSslHelpers::SetClientAlpn(Ctx.Get());
+        }
         Bio.Reset(BIO_new(IoMethod()));
+        if (!Bio) {
+            return false;
+        }
         BIO_set_data(Bio.Get(), this);
         BIO_set_nbio(Bio.Get(), 1);
-        Ctx = CreateClientContext();
-        Ssl = ConstructSsl(Ctx.Get(), Bio.Get());
-        SSL_set_mode(Ssl.Get(), SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-        if (!Host.empty()) {
-            TVector<TString> items;
-            Split(Host, ":", items);
-            SSL_set_tlsext_host_name(Ssl.Get(), items[0].c_str());
+        auto ssl = ConstructSsl(Ctx.Get(), Bio.Get());
+        if (!ssl) {
+            return false;
         }
-        SSL_set_connect_state(Ssl.Get());
-    }
-
-    void InitClientSslWithAlpn() {
-        Bio.Reset(BIO_new(IoMethod()));
-        BIO_set_data(Bio.Get(), this);
-        BIO_set_nbio(Bio.Get(), 1);
-        Ctx = CreateClientContext();
-        TSslHelpers::SetClientAlpn(Ctx.Get());
-        Ssl = ConstructSsl(Ctx.Get(), Bio.Get());
-        SSL_set_mode(Ssl.Get(), SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-        if (!Host.empty()) {
-            TVector<TString> items;
-            Split(Host, ":", items);
-            SSL_set_tlsext_host_name(Ssl.Get(), items[0].c_str());
+        TString host;
+        TIpPort port = 0;
+        CrackAddress(Host, host, port);
+        if (host.empty()) {
+            return false;
         }
-        SSL_set_connect_state(Ssl.Get());
+        if (IsIPv4(host) || IsIPv6(host)) {
+            if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl.Get()), host.c_str()) != 1) {
+                return false;
+            }
+        } else if (SSL_set1_host(ssl.Get(), host.c_str()) != 1
+                || SSL_set_tlsext_host_name(ssl.Get(), host.c_str()) != 1) {
+            return false;
+        }
+        SSL_set_mode(ssl.Get(), SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_set_connect_state(ssl.Get());
+        Ssl = std::move(ssl);
+        return true;
     }
 
     void InitServerSsl(SSL_CTX* ctx) {
@@ -243,8 +251,8 @@ struct TSecureSocketImpl : TPlainSocketImpl, TSslHelpers {
     }
 
     int OnConnect(bool& read, bool& write) {
-        if (!Ssl) {
-            InitClientSsl();
+        if (!Ssl && !InitClientSsl()) {
+            return -EPROTO;
         }
         ERR_clear_error();
         return ProcessSslResult(SSL_connect(Ssl.Get()), read, write);

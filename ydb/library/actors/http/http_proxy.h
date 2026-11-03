@@ -380,10 +380,18 @@ struct TUrlHandler {
     TActorId GetHandler(const TString& url) const;
 };
 
-NActors::IActor* CreateHttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry = NMonitoring::TMetricRegistry::SharedInstance());
+struct TClientTlsOptions {
+    // Empty uses the default CA store, including SSL_CERT_FILE / SSL_CERT_DIR.
+    // An explicit file replaces that store for all outgoing connections of this proxy.
+    TString CaFile;
+};
+
+NActors::IActor* CreateHttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry = NMonitoring::TMetricRegistry::SharedInstance(),
+    const TClientTlsOptions& tlsOptions = {});
 NActors::IActor* CreateHttpAcceptorActor(const TActorId& owner);
 TIntrusivePtr<TSocketDescriptor> TryBindListeningSocket(const TString& address, TIpPort port);
-NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event);
+NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event,
+    const TClientTlsOptions& tlsOptions = {});
 NActors::IActor* CreateIncomingConnectionActor(
         std::shared_ptr<TPrivateEndpointInfo> endpoint,
         TIntrusivePtr<TSocketDescriptor> socket,

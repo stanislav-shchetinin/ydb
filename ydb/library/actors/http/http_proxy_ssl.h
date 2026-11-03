@@ -1,5 +1,7 @@
 #pragma once
 
+#include <library/cpp/openssl/io/stream.h>
+
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -48,8 +50,22 @@ struct TSslHelpers {
         return ctx;
     }
 
-    static TSslHolder<SSL_CTX> CreateClientContext() {
-        return CreateSslCtx(SSLv23_client_method());
+    static TSslHolder<SSL_CTX> CreateClientContext(const TString& caFile = {}) {
+        auto ctx = CreateSslCtx(SSLv23_client_method());
+        if (!ctx) {
+            return nullptr;
+        }
+        if (caFile.empty()) {
+            try {
+                SSL_CTX_set_cert_store(ctx.Get(), GetDefaultOpenSslX509Store().Release());
+            } catch (const std::exception&) {
+                return nullptr;
+            }
+        } else if (SSL_CTX_load_verify_locations(ctx.Get(), caFile.c_str(), nullptr) != 1) {
+            return nullptr;
+        }
+        SSL_CTX_set_verify(ctx.Get(), SSL_VERIFY_PEER, nullptr);
+        return ctx;
     }
 
     static bool ConfigureClientCertificateVerification(

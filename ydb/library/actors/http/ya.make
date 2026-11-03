@@ -30,6 +30,7 @@ PEERDIR(
     ydb/library/actors/core
     ydb/library/actors/interconnect
     library/cpp/monlib/metrics
+    library/cpp/openssl/io
     library/cpp/string_utils/quote
 )
 

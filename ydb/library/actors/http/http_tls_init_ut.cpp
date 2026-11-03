@@ -1,6 +1,7 @@
 #include "http.h"
 #include "http_proxy.h"
 #include "http_proxy_sock64.h"
+#include "ut/tls_test_server.h"
 
 #include <ydb/core/security/certificate_check/test_utils/test_cert_auth_utils.h>
 #include <ydb/library/actors/testlib/test_runtime.h>
@@ -32,11 +33,6 @@ NKikimr::NCertTestUtils::TCertAndKey GenerateServerCertAndKey() {
     using namespace NKikimr::NCertTestUtils;
     TCertAndKey ca = GenerateCA(TProps::AsCA());
     return GenerateSignedCert(ca, TProps::AsServer());
-}
-
-TString GenerateServerPem() {
-    NKikimr::NCertTestUtils::TCertAndKey server = GenerateServerCertAndKey();
-    return TString(server.Certificate) + TString(server.PrivateKey);
 }
 
 int PemCertificateKeyType(const TString& pem) {
@@ -250,10 +246,11 @@ Y_UNIT_TEST_SUITE(HttpProxyTlsInitialization) {
         TIpPort port = portManager.GetTcpPort();
         runtime.Initialize();
 
-        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy());
+        NHttp::NTest::TTlsCertificates certificates;
+        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy({}, {certificates.CaFile.Name()}));
         THolder<NHttp::TEvHttpProxy::TEvAddListeningPort> add = MakeHolder<NHttp::TEvHttpProxy::TEvAddListeningPort>(port);
         add->Secure = true;
-        add->SslCertificatePem = GenerateServerPem();
+        add->SslCertificatePem = certificates.ServerPem();
         runtime.Send(new NActors::IEventHandle(proxyId, runtime.AllocateEdgeActor(), add.Release()), 0, true);
 
         TAutoPtr<NActors::IEventHandle> handle;
@@ -297,10 +294,11 @@ Y_UNIT_TEST_SUITE(HttpProxyTlsInitialization) {
         NActors::TTestActorRuntimeBase runtime(1, true);
         runtime.Initialize();
 
-        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy());
+        NHttp::NTest::TTlsCertificates certificates;
+        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy({}, {certificates.CaFile.Name()}));
         THolder<NHttp::TEvHttpProxy::TEvAddListeningPort> add = MakeHolder<NHttp::TEvHttpProxy::TEvAddListeningPort>(port);
         add->Secure = true;
-        add->SslCertificatePem = GenerateServerPem();
+        add->SslCertificatePem = certificates.ServerPem();
         runtime.Send(new NActors::IEventHandle(proxyId, runtime.AllocateEdgeActor(), add.Release()), 0, true);
 
         // Leave the port occupied across the one-second retry interval.
