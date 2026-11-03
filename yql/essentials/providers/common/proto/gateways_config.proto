@@ -78,8 +78,6 @@ message THttpGatewayConfig {
     optional uint64 LowSpeedBytesLimit = 9;
     optional TDnsResolverConfig DnsResolverConfig = 10;
     optional uint64 MaxRetries = 11;
-    // Trusted CA bundle for outgoing HTTPS; empty uses libcurl's default trust store.
-    optional string CaFile = 12;
 }
 
 /////////////////////////////// YT ///////////////////////////////
