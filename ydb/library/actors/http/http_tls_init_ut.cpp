@@ -241,13 +241,13 @@ Y_UNIT_TEST_SUITE(HttpProxyTlsInitialization) {
     }
 
     Y_UNIT_TEST(ValidInlinePemServesHttps) {
+        NHttp::NTest::TTlsCertificates certificates;
         NActors::TTestActorRuntimeBase runtime(1, true);
         TPortManager portManager;
         TIpPort port = portManager.GetTcpPort();
         runtime.Initialize();
 
-        NHttp::NTest::TTlsCertificates certificates;
-        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy({}, {certificates.CaFile.Name()}));
+        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy());
         THolder<NHttp::TEvHttpProxy::TEvAddListeningPort> add = MakeHolder<NHttp::TEvHttpProxy::TEvAddListeningPort>(port);
         add->Secure = true;
         add->SslCertificatePem = certificates.ServerPem();
@@ -283,6 +283,7 @@ Y_UNIT_TEST_SUITE(HttpProxyTlsInitialization) {
     }
 
     Y_UNIT_TEST(BindFailureRetriesWithValidTls) {
+        NHttp::NTest::TTlsCertificates certificates;
         TPortManager portManager;
         TIpPort port = portManager.GetTcpPort();
 
@@ -294,8 +295,7 @@ Y_UNIT_TEST_SUITE(HttpProxyTlsInitialization) {
         NActors::TTestActorRuntimeBase runtime(1, true);
         runtime.Initialize();
 
-        NHttp::NTest::TTlsCertificates certificates;
-        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy({}, {certificates.CaFile.Name()}));
+        NActors::TActorId proxyId = runtime.Register(NHttp::CreateHttpProxy());
         THolder<NHttp::TEvHttpProxy::TEvAddListeningPort> add = MakeHolder<NHttp::TEvHttpProxy::TEvAddListeningPort>(port);
         add->Secure = true;
         add->SslCertificatePem = certificates.ServerPem();

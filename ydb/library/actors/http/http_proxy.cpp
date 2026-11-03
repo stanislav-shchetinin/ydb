@@ -21,7 +21,7 @@ public:
     }
 
     IActor* AddOutgoingConnection(TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event) {
-        IActor* connectionSocket = CreateOutgoingConnectionActor(SelfId(), event, TlsOptions);
+        IActor* connectionSocket = CreateOutgoingConnectionActor(SelfId(), event);
         TActorId connectionId = Register(connectionSocket);
         YDB_LOG_DEBUG("Connection created",
             {"connectionId", connectionId});
@@ -33,9 +33,8 @@ public:
         Become(&THttpProxy::StateWork);
     }
 
-    THttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry, const TClientTlsOptions& tlsOptions)
+    THttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry)
         : Registry(std::move(registry))
-        , TlsOptions(tlsOptions)
     {}
 
     static constexpr char ActorName[] = "HTTP_PROXY_ACTOR";
@@ -296,7 +295,6 @@ protected:
     THashSet<TActorId> Connections; // outgoing
     std::unordered_multimap<TString, TActorId> AvailableConnections;
     std::weak_ptr<NMonitoring::IMetricFactory> Registry;
-    const TClientTlsOptions TlsOptions;
 };
 
 TEvHttpProxy::TEvReportSensors* BuildOutgoingRequestSensors(const THttpOutgoingRequestPtr& request, const THttpIncomingResponsePtr& response) {
@@ -323,8 +321,8 @@ TEvHttpProxy::TEvReportSensors* BuildIncomingRequestSensors(const THttpIncomingR
     );
 }
 
-NActors::IActor* CreateHttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry, const TClientTlsOptions& tlsOptions) {
-    return new THttpProxy(std::move(registry), tlsOptions);
+NActors::IActor* CreateHttpProxy(std::weak_ptr<NMonitoring::IMetricFactory> registry) {
+    return new THttpProxy(std::move(registry));
 }
 
 void TUrlHandler::RegisterHandler(const TString& url, const TActorId& handler) {

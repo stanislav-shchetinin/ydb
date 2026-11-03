@@ -57,13 +57,9 @@ public:
     };
     std::unique_ptr<THttp2State> H2;
 
-    TOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event,
-            const TClientTlsOptions& tlsOptions)
+    TOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event)
         : Owner(owner)
     {
-        if constexpr (std::is_same_v<TSocketImpl, TSecureSocketImpl>) {
-            TSocketImpl::CaFile = tlsOptions.CaFile;
-        }
         InitiateRequest(event);
     }
 
@@ -789,12 +785,11 @@ protected:
     }
 };
 
-NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event,
-        const TClientTlsOptions& tlsOptions) {
+NActors::IActor* CreateOutgoingConnectionActor(const TActorId& owner, TEvHttpProxy::TEvHttpOutgoingRequest::TPtr& event) {
     if (event->Get()->Request->Secure) {
-        return new TOutgoingConnectionActor<TSecureSocketImpl>(owner, event, tlsOptions);
+        return new TOutgoingConnectionActor<TSecureSocketImpl>(owner, event);
     } else {
-        return new TOutgoingConnectionActor<TPlainSocketImpl>(owner, event, tlsOptions);
+        return new TOutgoingConnectionActor<TPlainSocketImpl>(owner, event);
     }
 }
 

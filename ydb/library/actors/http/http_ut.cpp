@@ -1005,20 +1005,20 @@ Y_UNIT_TEST_SUITE(HttpProxy) {
     }
 
     Y_UNIT_TEST(TlsRunning) {
+        NHttp::NTest::TTlsCertificates certificates;
         NActors::TTestActorRuntimeBase actorSystem(1, true);
         TPortManager portManager;
         TIpPort port = portManager.GetTcpPort();
         TAutoPtr<NActors::IEventHandle> handle;
         actorSystem.Initialize();
 
-        NHttp::NTest::TTlsCertificates certificates;
         const TString certificateContent = certificates.ServerPem();
 
         TTempFileHandle certificateFile;
 
         certificateFile.Write(certificateContent.data(), certificateContent.size());
 
-        NActors::IActor* proxy = NHttp::CreateHttpProxy({}, {certificates.CaFile.Name()});
+        NActors::IActor* proxy = NHttp::CreateHttpProxy();
         NActors::TActorId proxyId = actorSystem.Register(proxy);
 
         THolder<NHttp::TEvHttpProxy::TEvAddListeningPort> add = MakeHolder<NHttp::TEvHttpProxy::TEvAddListeningPort>(port);

@@ -163,7 +163,6 @@ struct TSecureSocketImpl : TPlainSocketImpl, TSslHelpers {
     TSslHolder<BIO> Bio;
     TSslHolder<SSL_CTX> Ctx;
     TSslHolder<SSL> Ssl;
-    TString CaFile;
 
     TSecureSocketImpl() = default;
 
@@ -172,7 +171,7 @@ struct TSecureSocketImpl : TPlainSocketImpl, TSslHelpers {
     {}
 
     bool InitClientSsl(bool useHttp2 = false) {
-        Ctx = CreateClientContext(CaFile);
+        Ctx = CreateClientContext();
         if (!Ctx) {
             return false;
         }
