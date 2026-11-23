@@ -2545,6 +2545,16 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         UNIT_ASSERT_VALUES_EQUAL(sparse->Get()->Reply.ResultsSize(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sparse->Get()->Reply.GetResults(0).GetOwnerIdx(), 101);
         const auto& tablets = Env().GetHiveState()->Tablets;
+        auto wrongId = Runtime().AddObserver<TEvHive::TEvResponseHiveInfo>([](auto& ev) {
+            auto& reply = ev->Get()->Record;
+            if (reply.TabletsSize() == 1) {
+                reply.MutableTablets(0)->SetTabletID(1);
+            }
+        });
+        Runtime().Register(NExportPrepare::CreateTabletCleanupRequest(edge, hive, {
+            .ShardOwner = range.GetOwner(), .OwnerIdx = 100, .ObjectId = 23, .TabletId = 0, .CurrentHive = hive}));
+        UNIT_ASSERT(Runtime().GrabEdgeEventRethrow<TResult>(edge)->Get()->Status == TResult::EStatus::Retry);
+        wrongId.Remove();
         for (const ui64 objectId : {24, 23}) {
             Runtime().Register(NExportPrepare::CreateTabletCleanupRequest(edge, hive, {
                 .ShardOwner = range.GetOwner(), .OwnerIdx = 100, .ObjectId = objectId, .TabletId = 0, .CurrentHive = hive}));

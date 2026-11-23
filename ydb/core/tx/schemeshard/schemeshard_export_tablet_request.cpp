@@ -18,7 +18,9 @@ class TWorker : public TActorBootstrapped<TWorker> {
     const ui64 ShardOwner;
     const ui64 ObjectId;
     const ui64 CurrentHive;
-    bool ResolvingCleanup = false;
+    enum class EStep { Create, Lookup, Inspect, Delete };
+    EStep Step = EStep::Create;
+    ui64 LookupTabletId = 0;
     THashSet<ui64> Expected;
     THolder<IEventBase> Request;
     TActorId Pipe;
@@ -48,7 +50,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
 
     void Handle(TEvHive::TEvCreateTabletReply::TPtr& ev) {
         auto& record = ev->Get()->Record;
-        if (ResolvingCleanup) {
+        if (Step == EStep::Lookup) {
             if (record.GetOwner() != ShardOwner || !Expected.contains(record.GetOwnerIdx())) {
                 return Fail(TResult::EStatus::Retry, "Unexpected lookup reply during backup cleanup");
             }
@@ -58,8 +60,13 @@ class TWorker : public TActorBootstrapped<TWorker> {
             if (record.GetStatus() != NKikimrProto::OK || !record.GetTabletID()) {
                 return Fail(TResult::EStatus::Retry, "Cannot resolve reserved backup tablet");
             }
+            Step = EStep::Inspect;
+            LookupTabletId = record.GetTabletID();
             NTabletPipe::SendData(TActivationContext::AsActorContext(), Pipe,
-                new TEvHive::TEvRequestHiveInfo(record.GetTabletID(), false));
+                new TEvHive::TEvRequestHiveInfo(LookupTabletId, false));
+            return;
+        }
+        if (Step != EStep::Create) {
             return;
         }
         if (!record.HasStatus() || record.GetStatus() != NKikimrProto::OK) {
@@ -84,7 +91,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
 
     void Handle(TEvHive::TEvResponseHiveInfo::TPtr& ev) {
         const auto& info = ev->Get()->Record;
-        if (!ResolvingCleanup) {
+        if (Step != EStep::Inspect) {
             return;
         }
         if (ui64 redirect = info.GetForwardRequest().GetHiveTabletId()) {
@@ -94,18 +101,24 @@ class TWorker : public TActorBootstrapped<TWorker> {
             return CleanupTargetMissing(CurrentHive);
         }
         const auto& tablet = info.GetTablets(0);
-        if (info.TabletsSize() != 1 || tablet.GetTabletOwner().GetOwner() != ShardOwner
+        if (info.TabletsSize() != 1 || tablet.GetTabletID() != LookupTabletId) {
+            return Fail(TResult::EStatus::Retry, "Unexpected tablet in Hive lookup");
+        }
+        if (tablet.GetTabletOwner().GetOwner() != ShardOwner
                 || !Expected.contains(tablet.GetTabletOwner().GetOwnerIdx())
                 || !tablet.GetIsBackup() || tablet.GetObjectId() != ObjectId || tablet.GetTabletType() != TTabletTypes::DataShard) {
             // A lost create reply can hide a parameter conflict. Never delete that tablet.
             return CleanupTargetMissing();
         }
-        ResolvingCleanup = false;
+        Step = EStep::Delete;
         NTabletPipe::SendData(TActivationContext::AsActorContext(), Pipe,
             new TEvHive::TEvDeleteTablet(ShardOwner, tablet.GetTabletOwner().GetOwnerIdx(), tablet.GetTabletID(), 0));
     }
 
     void Handle(TEvHive::TEvDeleteTabletReply::TPtr& ev) {
+        if (Step != EStep::Delete) {
+            return;
+        }
         auto& record = ev->Get()->Record;
         if (!record.HasStatus() || record.GetOrigin() != Hive || record.GetShardOwnerId() != ShardOwner
                 || record.ShardLocalIdxSize() != 1 || !Expected.contains(record.GetShardLocalIdx(0))) {
@@ -169,10 +182,11 @@ public:
     {
         Expected.insert(target.OwnerIdx);
         if (target.TabletId) {
+            Step = EStep::Delete;
             Request = MakeHolder<TEvHive::TEvDeleteTablet>(ShardOwner, target.OwnerIdx, target.TabletId, 0);
         } else {
             // Verify ownership when the create reply was lost before the export persisted it.
-            ResolvingCleanup = true;
+            Step = EStep::Lookup;
             Request = MakeHolder<TEvHive::TEvLookupTablet>(ShardOwner, target.OwnerIdx);
         }
     }
