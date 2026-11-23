@@ -63,6 +63,10 @@ public:
             tablet.Owner = owner;
             tablet.NeedToReleaseFromParent = true;
             tablet.BootMode = protoTabletInfo.GetTabletBootMode();
+            if (firstImport) {
+                // After transfer, only the child can confirm the first boot.
+                tablet.InitialBootPending = protoTabletInfo.GetInitialBootPending();
+            }
             // A repeated transfer from an older Hive carries none of the placement settings.
             if (protoTabletInfo.HasBalancerPolicy()) {
                 tablet.BalancerPolicy = protoTabletInfo.GetBalancerPolicy();
@@ -153,6 +157,7 @@ public:
                         NIceDb::TUpdate<Schema::Tablet::LockedReconnectTimeout>(protoTabletInfo.GetLockedReconnectTimeout()),
                         NIceDb::TUpdate<Schema::Tablet::ObjectDomain>(protoTabletInfo.GetObjectDomain()),
                         NIceDb::TUpdate<Schema::Tablet::IsBackup>(tablet.IsBackup),
+                        NIceDb::TUpdate<Schema::Tablet::InitialBootPending>(tablet.InitialBootPending),
                         NIceDb::TUpdate<Schema::Tablet::NeedToReleaseFromParent>(true));
 
             TVector<TTabletChannelInfo>& tabletChannels = tablet.TabletStorageInfo->Channels;

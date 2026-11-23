@@ -1,11 +1,15 @@
 #pragma once
 
+#include <optional>
+
 #include "hive.h"
 #include "metrics.h"
 #include "event_history.h"
 
 namespace NKikimr {
 namespace NHive {
+
+enum EBootClass : ui8 { RestartBootClass, InitialBootClass, BackupBootClass, BootClassCount };
 
 struct TNodeInfo;
 struct TLeaderTabletInfo;
@@ -105,6 +109,7 @@ public:
 
 protected:
     EVolatileState VolatileState;
+    std::optional<EBootClass> StartingClass;
     ETabletRole TabletRole;
     TInstant VolatileStateChangeTime;
     TInstant LastBalancerDecisionTime;

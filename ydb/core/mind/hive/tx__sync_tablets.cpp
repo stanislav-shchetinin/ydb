@@ -155,6 +155,9 @@ public:
                                         NIceDb::TUpdate<Schema::TabletFollowerTablet::FollowerNode>(tablet->NodeId));
                         }
                     }
+                    if (tablet->IsLeader()) {
+                        Self->ConfirmInitialBoot(tablet->AsLeader(), db);
+                    }
                     foundTablet(tablet, "running");
                     continue;
                 }

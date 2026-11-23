@@ -595,6 +595,7 @@ public:
         tablet.Statistics.SetLastAliveTimestamp(now.MilliSeconds());
         tablet.BalancerPolicy = BalancerPolicy;
         tablet.IsBackup = IsBackup;
+        tablet.InitialBootPending = AppData()->FeatureFlags.GetEnablePacedBackupExport();
         Self->RecordTabletEvent(tablet, EHiveEventType::Created, EHiveEventReason::OwnerRequest,
             TStringBuilder() << "type=" << TTabletTypes::TypeToStr(tablet.Type) << " channels=" << BoundChannels.size());
 
@@ -621,6 +622,7 @@ public:
                                                         NIceDb::TUpdate<Schema::Tablet::Statistics>(tablet.Statistics),
                                                         NIceDb::TUpdate<Schema::Tablet::BalancerPolicy>(tablet.BalancerPolicy),
                                                         NIceDb::TUpdate<Schema::Tablet::StoppedByTenant>(tablet.StoppedByTenant),
+                                                        NIceDb::TUpdate<Schema::Tablet::InitialBootPending>(tablet.InitialBootPending),
                                                         NIceDb::TUpdate<Schema::Tablet::IsBackup>(tablet.IsBackup),
                                                         NIceDb::TUpdate<Schema::Tablet::ConfirmedStorageVersion>(tablet.ConfirmedStorageVersion));
 

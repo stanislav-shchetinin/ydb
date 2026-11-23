@@ -191,6 +191,30 @@ void TTabletInfo::ChangeVolatileState(EVolatileState state) {
         }
     }
     if (Node != nullptr) {
+        if (StartingClass && state != EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+            --Hive.StartingByClass[*StartingClass];
+            --Node->StartingByClass[*StartingClass];
+            if (Node->Counters) {
+                Node->Counters->BootInFlight[*StartingClass]->Set(Node->StartingByClass[*StartingClass]);
+            }
+            if (*StartingClass == RestartBootClass && state == EVolatileState::TABLET_VOLATILE_STATE_RUNNING
+                    && !GetLeader().IsLockedToActor() && !GetLeader().InitialBootPending && Hive.TabletCounters) {
+                Hive.TabletCounters->Cumulative()[COUNTER_BOOT_RESTART_READY].Increment(1);
+            }
+            StartingClass.reset();
+            if (!Hive.BootQueuesEmpty()) {
+                Hive.ProcessBootQueue();
+            }
+        }
+        if (!StartingClass && state == EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+            StartingClass = Hive.BootClass(*this);
+            ++Hive.StartingByClass[*StartingClass];
+            ++Node->StartingByClass[*StartingClass];
+            if (Node->Counters) {
+                Node->Counters->BootInFlight[*StartingClass]->Set(Node->StartingByClass[*StartingClass]);
+                Node->Counters->BootStarted[*StartingClass]->Inc();
+            }
+        }
         Node->OnTabletChangeVolatileState(this, state);
     }
     VolatileState = state;

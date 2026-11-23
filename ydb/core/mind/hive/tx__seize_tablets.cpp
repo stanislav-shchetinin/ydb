@@ -84,6 +84,7 @@ public:
                 tabletInfo.SetTabletStorageVersion(tablet.TabletStorageInfo->Version);
                 tabletInfo.SetConfirmedStorageVersion(tablet.ConfirmedStorageVersion);
                 tabletInfo.SetTabletBootMode(tablet.BootMode);
+                tabletInfo.SetInitialBootPending(tablet.InitialBootPending);
                 tabletInfo.SetBalancerPolicy(tablet.BalancerPolicy);
                 for (auto node : tablet.NodeFilter.AllowedNodes) {
                     tabletInfo.AddAllowedNodes(node);
