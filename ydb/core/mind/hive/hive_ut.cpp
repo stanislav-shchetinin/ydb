@@ -13241,10 +13241,18 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         RebootTablet(runtime, hive, edge);
         MakeSureTabletIsUp(runtime, hive, 0);
         runtime.GetAppData().FeatureFlags.SetEnablePacedBackupExport(false);
-        const auto committed = read({{42, pending}});
-        UNIT_ASSERT_VALUES_EQUAL(committed.ResultsSize(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(committed.GetResults(0).GetStatus(), NKikimrProto::OK);
-        UNIT_ASSERT(!committed.GetResults(0).GetInitialBootPending());
+        auto config = runtime.GetAppData().HiveConfig;
+        config.SetMaxCreateTabletBatchSize(0);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        const auto committed = read({{41, ready}, {42, pending}});
+        UNIT_ASSERT_VALUES_EQUAL(committed.ResultsSize(), 2);
+        for (const auto& entry : committed.GetResults()) {
+            UNIT_ASSERT_VALUES_EQUAL(entry.GetStatus(), NKikimrProto::OK);
+            UNIT_ASSERT(entry.HasInitialBootPending() && !entry.GetInitialBootPending());
+        }
+        const auto oversized = read(TVector<std::pair<ui64, ui64>>(TEvHive::TEvLookupTablet::MaxBootKeys + 1, {42, pending}));
+        UNIT_ASSERT_VALUES_EQUAL(oversized.GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(oversized.ResultsSize(), 0);
     }
 
     Y_UNIT_TEST(TestPacedInitialBootRateAndBurst) {

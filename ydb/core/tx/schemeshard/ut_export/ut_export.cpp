@@ -395,16 +395,16 @@ namespace {
             return {};
         }
 
-        ui64 StartCompletionMarkerExport(bool autoDropping = true) {
+        ui64 StartCompletionMarkerExport(bool autoDropping = true, ui32 partitions = 2) {
             Env();
             Runtime().GetAppData().FeatureFlags.SetEnableExportAutoDropping(autoDropping);
-            TestCreateTable(Runtime(), 100, "/MyRoot", R"(
+            TestCreateTable(Runtime(), 100, "/MyRoot", Sprintf(R"(
                 Name: "Table"
                 Columns { Name: "key" Type: "Uint32" }
                 Columns { Name: "value" Type: "Utf8" }
                 KeyColumnNames: ["key"]
-                UniformPartitionsCount: 2
-            )");
+                UniformPartitionsCount: %u
+            )", partitions));
             Env().TestWaitNotification(Runtime(), 100);
             TestExport(Runtime(), 101, "/MyRoot", Sprintf(R"(
                 ExportToS3Settings {
@@ -2565,6 +2565,69 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         }
     }
 
+    Y_UNIT_TEST(PacedCopySplitsLargeReadinessChecks) {
+        Env();
+        constexpr ui32 maxKeys = TEvHive::TEvLookupTablet::MaxBootKeys;
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().HiveConfig.SetMaxCreateTabletBatchSize(maxKeys + 1);
+        TVector<ui32> sizes;
+        auto checks = Runtime().AddObserver<TEvHive::TEvLookupTablet>([&](const auto& ev) {
+            if (ui32 size = ev->Get()->Record.BootKeysSize()) {
+                sizes.push_back(size);
+            }
+        });
+        const auto id = StartCompletionMarkerExport(true, maxKeys + 1);
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_VALUES_EQUAL(sizes.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sizes[0], maxKeys);
+        UNIT_ASSERT_VALUES_EQUAL(sizes[1], 1);
+    }
+
+    Y_UNIT_TEST(PacedCopySharesReadinessRetryBudgetBetweenExports) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().HiveConfig.SetMaxCreateTabletBatchSize(1);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupCreateBatchesInFlightPerHive(1);
+
+        THashSet<ui64> checked;
+        TVector<ui64> reads;
+        auto lookups = Runtime().AddObserver<TEvHive::TEvLookupTablet>([&](const auto& ev) {
+            const auto& request = ev->Get()->Record;
+            if (request.BootKeysSize() == 1) {
+                ui64 id = request.GetBootKeys(0).GetTabletID();
+                checked.insert(id);
+                reads.push_back(id);
+            }
+        });
+        auto pending = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([](auto& ev) {
+            auto& record = ev->Get()->Record;
+            for (auto& item : *record.MutableResults()) {
+                if (item.HasInitialBootPending()) {
+                    item.SetInitialBootPending(true);
+                }
+            }
+        });
+        const auto first = StartCompletionMarkerExport();
+        TestExport(Runtime(), 102, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+                endpoint: "localhost:%d" scheme: HTTP
+                items { source_path: "/MyRoot/Table" destination_prefix: "second" }
+            }
+        )", S3Port()));
+        Runtime().WaitFor("both exports' four tablets reach their first readiness check", [&] { return checked.size() == 4; });
+        reads.clear();
+        Runtime().SimulateSleep(TDuration::Seconds(2));
+        UNIT_ASSERT_C(reads.size() <= 9, "One shared slot may retry at most once every 250ms, saw " << reads.size());
+        THashSet<ui64> revisited(reads.begin(), reads.end());
+        UNIT_ASSERT_VALUES_EQUAL(revisited.size(), 4);
+        pending.Remove();
+        for (ui64 id : {first, ui64(102)}) {
+            Env().TestWaitNotification(Runtime(), id);
+            TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        }
+    }
+
     Y_UNIT_TEST(PacedCopyWaitsForDurableInitialBootAfterRestart) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
@@ -2598,6 +2661,8 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         UNIT_ASSERT_VALUES_EQUAL(remaining.GetBootKeys(0).GetTabletID(), range.GetBootKeys(1).GetTabletID());
         UNIT_ASSERT(!copying);
         checks.clear(); // Lost call; start a new SchemeShard using the persisted ready subset.
+        Runtime().GetAppData().HiveConfig.SetMaxCreateTabletBatchSize(0);
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(false);
         RebootTablet(Runtime(), TTestTxConfig::SchemeShard, Runtime().AllocateEdgeActor());
         Runtime().WaitFor("Reconstruct remaining boot", [&] { return !checks.empty(); });
         UNIT_ASSERT_VALUES_EQUAL(remaining.SerializeAsString(), checks.front()->Get()->Record.SerializeAsString());
@@ -2747,6 +2812,41 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         const auto& tablets = Env().GetHiveState()->Tablets;
         UNIT_ASSERT_VALUES_EQUAL(tablets.at({range.GetOwner(), range.GetOwnerIdx()}).TabletId, original.GetTabletID());
         UNIT_ASSERT(!tablets.contains({range.GetOwner(), range.GetOwnerIdx() + 1}));
+    }
+
+    Y_UNIT_TEST(PacedCancellationDrainsPendingReadinessChecks) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        using TRetry = NKikimr::NSchemeShard::TEvPrivate::TEvRetryPreparedBootChecks;
+        TRetry::TPtr timer;
+        auto holdTimer = Runtime().AddObserver<TRetry>([&](TRetry::TPtr& ev) {
+            UNIT_ASSERT(!timer);
+            timer = std::move(ev);
+        });
+        TVector<std::pair<ui64, ui64>> keys;
+        auto pending = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([&](auto& ev) {
+            auto& reply = ev->Get()->Record;
+            for (auto& entry : *reply.MutableResults()) {
+                if (entry.HasInitialBootPending()) {
+                    keys.emplace_back(reply.GetOwner(), entry.GetOwnerIdx());
+                    entry.SetInitialBootPending(true);
+                }
+            }
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("SchemeShard has deferred the next readiness check", [&] { return bool(timer); });
+        UNIT_ASSERT_VALUES_EQUAL(keys.size(), 2);
+        TestCancelExport(Runtime(), 102, "/MyRoot", id);
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        holdTimer.Remove();
+        const ui32 node = timer->GetRecipientRewrite().NodeId() - Runtime().GetFirstNodeId();
+        Runtime().Send(timer.Release(), node, true);
+        Runtime().SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(keys.size(), 2);
+        for (const auto& key : keys) {
+            UNIT_ASSERT(!Env().GetHiveState()->Tablets.contains(key));
+        }
     }
 
     Y_UNIT_TEST(PacedCopyCancellationCleansCommittedBatch) {

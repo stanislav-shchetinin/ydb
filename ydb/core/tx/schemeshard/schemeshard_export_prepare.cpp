@@ -158,9 +158,11 @@ static TMaybe<TWork> NextWork(TSchemeShard& ss, const TKey& key) {
     }
     const auto& batch = (*info)->Items.at(itemIdx).PreparedTablets.at(batchIdx);
     const bool cleanup = (*info)->State != TExportInfo::EState::PrepareCopyTables;
-    const ui32 limit = cleanup ? 1u : Max(1u, AppData()->HiveConfig.GetMaxCreateTabletBatchSize());
     const bool checkBoot = !cleanup && std::none_of(batch.GetTablets().begin(), batch.GetTablets().end(),
         [](const auto& slot) { return slot.GetState() == TBatch::Pending; });
+    const ui32 limit = cleanup ? 1u
+        : checkBoot ? TEvHive::TEvLookupTablet::MaxBootKeys
+        : Max(1u, AppData()->HiveConfig.GetMaxCreateTabletBatchSize());
     TWork work{id, itemIdx, batchIdx, 0, {}, cleanup, checkBoot, {}};
     for (ui32 offset : xrange(batch.TabletsSize())) {
         const auto& slot = batch.GetTablets(offset);
@@ -285,6 +287,36 @@ const TWork* TDispatcher::Find(const TActorId& actor) const {
     return Workers.FindPtr(actor);
 }
 
+static constexpr auto RetryDelay = TDuration::MilliSeconds(250);
+
+void TDispatcher::ReleaseBootRetries(TSchemeShard& ss, TDeque<TKey>& waiting, ui32 limit, const TActorContext& ctx) {
+    while (limit && !waiting.empty()) {
+        const auto [id, item, batch] = waiting.front();
+        waiting.pop_front();
+        const auto* remaining = Remaining.FindPtr(id);
+        const auto* info = ss.Exports.FindPtr(id);
+        if (remaining && remaining->contains(std::pair{item, batch}) && info &&
+            (*info)->State == TExportInfo::EState::PrepareCopyTables) {
+            ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
+            --limit;
+        }
+    }
+}
+
+void TDispatcher::RetryBootChecks(TSchemeShard& ss, ui64 hive, const TActorContext& ctx) {
+    auto* waiting = WaitingBootRetries.FindPtr(hive);
+    if (!waiting) {
+        return;
+    }
+    const ui32 limit = Max(1u, AppData()->SchemeShardConfig.GetMaxBackupCreateBatchesInFlightPerHive());
+    ReleaseBootRetries(ss, *waiting, limit, ctx);
+    if (waiting->empty()) {
+        WaitingBootRetries.erase(hive);
+    } else {
+        ctx.Schedule(RetryDelay, new TEvPrivate::TEvRetryPreparedBootChecks(hive));
+    }
+}
+
 void TDispatcher::Finished(TSchemeShard& ss, const TActorId& actor, bool retry, const TActorContext& ctx) {
     const auto* work = Find(actor);
     if (!work) {
@@ -298,13 +330,25 @@ void TDispatcher::Finished(TSchemeShard& ss, const TActorId& actor, bool retry, 
         ss.TabletCounters->Simple()[COUNTER_BACKUP_CREATE_BATCHES_IN_FLIGHT].Sub(1);
         ss.TabletCounters->Percentile()[COUNTER_BACKUP_CREATE_ATTEMPT_TIME_US].IncrementFor((ctx.Now() - work->SentAt).MicroSeconds());
     }
+    const ui64 hive = work->Hive;
+    const bool checkBoot = work->CheckBoot;
     Workers.erase(actor);
     QueuedOrRunning.erase({id, item, batch});
-    auto* next = new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch);
-    if (retry) {
-        ctx.Schedule(TDuration::MilliSeconds(250), next);
+    const auto* info = ss.Exports.FindPtr(id);
+    if (!retry) {
+        ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
+        if (auto* waiting = checkBoot ? WaitingBootRetries.FindPtr(hive) : nullptr) {
+            // Drain already-booted leaders at the speed of their replies.
+            ReleaseBootRetries(ss, *waiting, 1, ctx);
+        }
+    } else if (checkBoot && info && (*info)->State == TExportInfo::EState::PrepareCopyTables) {
+        auto [it, inserted] = WaitingBootRetries.try_emplace(hive);
+        it->second.emplace_back(id, item, batch);
+        if (inserted) {
+            ctx.Schedule(RetryDelay, new TEvPrivate::TEvRetryPreparedBootChecks(hive));
+        }
     } else {
-        ctx.Send(ss.SelfId(), next);
+        ctx.Schedule(RetryDelay, new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
     }
     Pump(ss, ctx);
 }
@@ -323,6 +367,10 @@ void TDispatcher::Shutdown(const TActorContext& ctx) {
 } // namespace NKikimr::NSchemeShard::NExportPrepare
 
 namespace NKikimr::NSchemeShard {
+
+void TSchemeShard::Handle(TEvPrivate::TEvRetryPreparedBootChecks::TPtr& ev, const TActorContext& ctx) {
+    PreparedTabletDispatcher.RetryBootChecks(*this, ev->Get()->Hive, ctx);
+}
 
 void TSchemeShard::Handle(TEvPrivate::TEvDispatchPreparedTablets::TPtr& ev, const TActorContext& ctx) {
     const auto& msg = *ev->Get();

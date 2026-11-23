@@ -3092,7 +3092,7 @@ void THive::Handle(TEvHive::TEvRequestHiveStorageStats::TPtr& ev) {
 void THive::Handle(TEvHive::TEvLookupTablet::TPtr& ev) {
     const auto& request(ev->Get()->Record);
     if (request.BootKeysSize()) {
-        if (!request.HasOwner() || request.HasOwnerIdx() || request.BootKeysSize() > CurrentConfig.GetMaxCreateTabletBatchSize()) {
+        if (!request.HasOwner() || request.HasOwnerIdx() || request.BootKeysSize() > TEvHive::TEvLookupTablet::MaxBootKeys) {
             Send(ev->Sender, new TEvHive::TEvCreateTabletReply(NKikimrProto::ERROR, request.GetOwner(), 0, 0, TabletID()), 0, ev->Cookie);
             return;
         }

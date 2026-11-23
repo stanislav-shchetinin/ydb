@@ -69,6 +69,7 @@ namespace TEvPrivate {
         EvImportKesusResult,
         EvPreparedTabletsResult,
         EvDispatchPreparedTablets,
+        EvRetryPreparedBootChecks,
         EvEnd
     };
 
@@ -80,6 +81,12 @@ namespace TEvPrivate {
         const ui32 Batch;
         explicit TEvDispatchPreparedTablets(ui64 id, ui32 item = Max<ui32>(), ui32 batch = 0)
             : ExportId(id), Item(item), Batch(batch) {}
+    };
+
+    struct TEvRetryPreparedBootChecks : TEventLocal<TEvRetryPreparedBootChecks, EvRetryPreparedBootChecks> {
+        const ui64 Hive;
+        explicit TEvRetryPreparedBootChecks(ui64 hive)
+            : Hive(hive) {}
     };
 
     struct TEvPreparedTabletsResult : TEventLocal<TEvPreparedTabletsResult, EvPreparedTabletsResult> {

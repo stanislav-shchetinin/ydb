@@ -6241,6 +6241,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvPrivate::TEvExportUploadMetadataResult, Handle);
         HFuncTraced(TEvPrivate::TEvExportCompletionUploadResult, Handle);
         HFuncTraced(TEvPrivate::TEvDispatchPreparedTablets, Handle);
+        HFuncTraced(TEvPrivate::TEvRetryPreparedBootChecks, Handle);
         HFuncTraced(TEvPrivate::TEvPreparedTabletsResult, Handle);
 
         // namespace NImport {

@@ -38,12 +38,15 @@ using TKey = std::tuple<ui64, ui32, ui32>; // export, item, batch
 
 class TDispatcher {
     THashMap<ui64, TDeque<TKey>> Queue;
+    // A Hive has a single retry timer even when several exports wait for their leaders.
+    THashMap<ui64, TDeque<TKey>> WaitingBootRetries;
     THashMap<ui64, ui32> InFlight;
     THashMap<TActorId, TWork> Workers;
     THashSet<TKey> QueuedOrRunning;
     THashMap<ui64, THashSet<std::pair<ui32, ui32>>> Remaining;
     THashSet<ui64> Finishing;
 
+    void ReleaseBootRetries(TSchemeShard& ss, TDeque<TKey>& waiting, ui32 limit, const TActorContext& ctx);
     void QueueBatch(TSchemeShard& ss, const TKey& key, const TActorContext& ctx);
     void Pump(TSchemeShard& ss, const TActorContext& ctx);
 
@@ -52,6 +55,7 @@ public:
     void ResumeBatch(TSchemeShard& ss, const TKey& key, const TActorContext& ctx);
     const TWork* Find(const TActorId& worker) const;
     void Finished(TSchemeShard& ss, const TActorId& worker, bool retry, const TActorContext& ctx);
+    void RetryBootChecks(TSchemeShard& ss, ui64 hive, const TActorContext& ctx);
     bool IsDrained(ui64 exportId) const;
     bool MarkFinishing(ui64 exportId) { return Finishing.insert(exportId).second; }
     void Forget(ui64 exportId) {
