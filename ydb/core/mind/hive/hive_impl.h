@@ -314,6 +314,7 @@ protected:
     TTabletInfo* FindStartingBootAttempt(ui64 bootAttemptId);
     ITransaction* CreateInitScheme();
     ITransaction* CreateAdoptTablet(NKikimrHive::TEvAdoptTablet &rec, const TActorId &sender, const ui64 cookie);
+    ITransaction* CreateReadInitialBoot(TEvHive::TEvLookupTablet::TPtr& ev);
     ITransaction* CreateCreateTablet(NKikimrHive::TEvCreateTablet rec, const TActorId& sender, const ui64 cookie);
     ITransaction* CreateLoadEverything();
     ITransaction* CreateRegisterNode(const TActorId& local, NKikimrLocal::TEvRegisterNode rec);

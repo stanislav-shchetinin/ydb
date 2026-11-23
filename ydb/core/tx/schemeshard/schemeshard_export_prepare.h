@@ -30,6 +30,7 @@ struct TWork {
     ui64 Hive;
     TVector<ui32> Offsets;
     bool Delete;
+    bool CheckBoot;
     TInstant SentAt;
 };
 

@@ -119,6 +119,7 @@ JOIN_SRCS(
     balancer.cpp
     tx__block_storage_result.cpp
     boot_queue.cpp
+    tx__read_initial_boot.cpp
     tx__create_tablet.cpp
     tx__cut_tablet_history.cpp
     tx__disconnect_node.cpp

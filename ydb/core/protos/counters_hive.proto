@@ -254,4 +254,5 @@ enum ETxTypes {
     TXTYPE_MON_NODE_INFO = 76                             [(TxTypeOpts) = {Name: "TxMonNodeInfo"}];
     TXTYPE_REASSIGN_TABLETS = 77                          [(TxTypeOpts) = {Name: "TxReassignTablets"}];
     TXTYPE_CREATE_TABLET_BATCH = 78                       [(TxTypeOpts) = {Name: "TxCreateTabletBatch"}];
+    TXTYPE_READ_INITIAL_BOOT = 79                         [(TxTypeOpts) = {Name: "TxReadInitialBoot"}];
 }

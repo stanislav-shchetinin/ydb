@@ -18,10 +18,11 @@ class TWorker : public TActorBootstrapped<TWorker> {
     const ui64 ShardOwner;
     const ui64 ObjectId;
     const ui64 CurrentHive;
-    enum class EStep { Create, Lookup, Inspect, Delete };
+    enum class EStep { Create, BootCheck, Lookup, Inspect, Delete };
     EStep Step = EStep::Create;
     ui64 LookupTabletId = 0;
     THashSet<ui64> Expected;
+    THashMap<ui64, ui64> ExpectedBootIds;
     THolder<IEventBase> Request;
     const TActorId PipeCache = MakePipePerNodeCacheID(EPipePerNodeCache::Leader);
 
@@ -69,7 +70,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
             SendToHive(new TEvHive::TEvRequestHiveInfo(LookupTabletId, false));
             return;
         }
-        if (Step != EStep::Create) {
+        if (Step != EStep::Create && Step != EStep::BootCheck) {
             return;
         }
         if (!record.HasStatus() || record.GetStatus() != NKikimrProto::OK) {
@@ -81,6 +82,12 @@ class TWorker : public TActorBootstrapped<TWorker> {
         }
         THashSet<ui64> tablets;
         for (const auto& entry : record.GetResults()) {
+            if (Step == EStep::BootCheck && entry.GetStatus() == NKikimrProto::OK) {
+                const auto* expected = ExpectedBootIds.FindPtr(entry.GetOwnerIdx());
+                if (!expected || *expected != entry.GetTabletID() || !entry.HasInitialBootPending()) {
+                    return Fail(TResult::EStatus::Error, "Invalid boot confirmation for reserved tablet");
+                }
+            }
             if (!entry.HasOwnerIdx() || !Expected.erase(entry.GetOwnerIdx()) || !entry.HasStatus()
                     || (entry.GetStatus() == NKikimrProto::OK && (!entry.GetTabletID() || !tablets.insert(entry.GetTabletID()).second))
                     || (entry.GetStatus() == NKikimrProto::INVALID_OWNER && !entry.GetForwardRequest().GetHiveTabletId())) {
@@ -168,6 +175,26 @@ public:
         Request = std::move(request);
     }
 
+    TWorker(TActorId owner, ui64 hive, ui64 shardOwner, TArrayRef<const std::pair<ui64, ui64>> tablets)
+        : Owner(owner)
+        , Hive(hive)
+        , ShardOwner(shardOwner)
+        , ObjectId(0)
+        , CurrentHive(0)
+        , Step(EStep::BootCheck)
+    {
+        auto request = MakeHolder<TEvHive::TEvLookupTablet>();
+        request->Record.SetOwner(ShardOwner);
+        for (const auto& [index, id] : tablets) {
+            Expected.insert(index);
+            ExpectedBootIds.emplace(index, id);
+            auto* key = request->Record.AddBootKeys();
+            key->SetOwnerIdx(index);
+            key->SetTabletID(id);
+        }
+        Request = std::move(request);
+    }
+
     TWorker(TActorId owner, ui64 hive, const TCleanupTarget& target)
         : Owner(owner)
         , Hive(hive)
@@ -203,6 +230,10 @@ public:
 IActor* CreateTabletBatchRequest(TActorId owner, ui64 hive, const NKikimrHive::TEvCreateTablet& range,
         TArrayRef<const ui32> offsets, bool sparse) {
     return new TWorker(owner, hive, range, offsets, sparse);
+}
+
+IActor* CreateTabletBootCheck(TActorId owner, ui64 hive, ui64 shardOwner, TArrayRef<const std::pair<ui64, ui64>> tablets) {
+    return new TWorker(owner, hive, shardOwner, tablets);
 }
 
 IActor* CreateTabletCleanupRequest(TActorId owner, ui64 hive, const TCleanupTarget& target) {

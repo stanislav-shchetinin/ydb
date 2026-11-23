@@ -3954,6 +3954,7 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
     THashMultiMap<TPathId, ui32> PreparedItemsBySource;
     THashSet<ui64> PreparedTabletIds;
     TInstant PrepareStarted;
+    ui64 WaitingForBoot = 0;
     ui64 PendingCreateCount = 0; // Reconstructed from the batch rows on restart.
 
     NKikimrSchemeOp::TExportMetadata ExportMetadata;

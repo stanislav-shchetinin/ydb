@@ -2565,6 +2565,51 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         }
     }
 
+    Y_UNIT_TEST(PacedCopyWaitsForDurableInitialBootAfterRestart) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        bool copying = false;
+        auto snapshots = Runtime().AddObserver<TEvDataShard::TEvProposeTransaction>([&](const auto& ev) {
+            const auto& record = ev->Get()->Record;
+            if (record.GetTxKind() == NKikimrTxDataShard::TX_KIND_SCHEME) {
+                NKikimrTxDataShard::TFlatSchemeTransaction tx;
+                UNIT_ASSERT(tx.ParseFromString(record.GetTxBody()));
+                copying |= tx.HasReceiveSnapshot();
+            }
+        });
+        TBlockEvents<TEvHive::TEvLookupTablet> checks(Runtime(), [](const auto& ev) {
+            return ev->Get()->Record.BootKeysSize() > 0;
+        });
+        auto pending = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([](auto& ev) {
+            auto& reply = ev->Get()->Record;
+            if (reply.ResultsSize() == 2 && reply.GetResults(1).HasInitialBootPending()) {
+                reply.MutableResults(1)->SetInitialBootPending(true);
+            }
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("First boot check", [&] { return !checks.empty(); });
+        const auto range = checks.front()->Get()->Record;
+        UNIT_ASSERT_VALUES_EQUAL(range.BootKeysSize(), 2);
+        UNIT_ASSERT(!copying);
+        checks.Unblock(1);
+        Runtime().WaitFor("Recheck the remaining boot", [&] { return !checks.empty(); });
+        const auto remaining = checks.front()->Get()->Record;
+        UNIT_ASSERT_VALUES_EQUAL(remaining.BootKeysSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(remaining.GetBootKeys(0).GetTabletID(), range.GetBootKeys(1).GetTabletID());
+        UNIT_ASSERT(!copying);
+        checks.clear(); // Lost call; start a new SchemeShard using the persisted ready subset.
+        RebootTablet(Runtime(), TTestTxConfig::SchemeShard, Runtime().AllocateEdgeActor());
+        Runtime().WaitFor("Reconstruct remaining boot", [&] { return !checks.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(remaining.SerializeAsString(), checks.front()->Get()->Record.SerializeAsString());
+        UNIT_ASSERT(!copying);
+        pending.Remove();
+        checks.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(id);
+        UNIT_ASSERT(copying);
+    }
+
     Y_UNIT_TEST(PacedCopyRetriesFailedIndicesAndReusesTablets) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);

@@ -110,6 +110,7 @@ struct TSchemeShard::TExport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
                 }
             }
             exportInfo->State = TExportInfo::EState::CleaningPreparedTablets;
+            Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_WAITING_BOOT].Sub(std::exchange(exportInfo->WaitingForBoot, 0));
             Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Sub(std::exchange(exportInfo->PendingCreateCount, 0));
             Self->PreparedTabletDispatcher.Forget(exportInfo->Id);
             if (exportInfo->WaitTxId != InvalidTxId) {

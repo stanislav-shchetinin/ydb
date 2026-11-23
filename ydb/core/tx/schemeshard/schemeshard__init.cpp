@@ -5227,13 +5227,17 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 Y_ABORT_UNLESS(item.PreparedTablets.size() == rows.GetValue<TPrepared::BatchIdx>());
                 auto& batch = item.PreparedTablets.emplace_back(rows.GetValue<TPrepared::Batch>());
                 ui32 pending = 0;
+                ui32 waiting = 0;
                 for (const auto& slot : batch.GetTablets()) {
                     if (slot.GetTabletId()) {
                         info.PreparedTabletIds.insert(slot.GetTabletId());
                     }
                     pending += slot.GetState() == NExportPrepare::TBatch::Pending;
+                    waiting += slot.GetState() == NExportPrepare::TBatch::Created;
                 }
                 if (info.State == TExportInfo::EState::PrepareCopyTables) {
+                    info.WaitingForBoot += waiting;
+                    Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_WAITING_BOOT].Add(waiting);
                     info.PendingCreateCount += pending;
                     Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Add(pending);
                 }

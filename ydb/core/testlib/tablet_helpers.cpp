@@ -876,6 +876,26 @@ namespace NKikimr {
 
         void Handle(TEvHive::TEvLookupTablet::TPtr& ev, const TActorContext& ctx) {
             const auto& record = ev->Get()->Record;
+            if (record.BootKeysSize()) {
+                auto reply = MakeHolder<TEvHive::TEvCreateTabletReply>();
+                reply->Record.SetStatus(NKikimrProto::OK);
+                reply->Record.SetOwner(record.GetOwner());
+                reply->Record.SetOrigin(TabletID());
+                for (const auto& key : record.GetBootKeys()) {
+                    auto* result = reply->Record.AddResults();
+                    result->SetOwnerIdx(key.GetOwnerIdx());
+                    const auto* tablet = State->Tablets.FindPtr(std::pair{record.GetOwner(), key.GetOwnerIdx()});
+                    if (!tablet || tablet->TabletId != key.GetTabletID()) {
+                        result->SetStatus(NKikimrProto::NODATA);
+                    } else {
+                        result->SetStatus(NKikimrProto::OK);
+                        result->SetTabletID(tablet->TabletId);
+                        result->SetInitialBootPending(false);
+                    }
+                }
+                ctx.Send(ev->Sender, reply.Release(), 0, ev->Cookie);
+                return;
+            }
             const auto* tablet = State->Tablets.FindPtr(std::pair{record.GetOwner(), record.GetOwnerIdx()});
             ctx.Send(ev->Sender, new TEvHive::TEvCreateTabletReply(tablet ? NKikimrProto::OK : NKikimrProto::NODATA,
                 record.GetOwner(), record.GetOwnerIdx(), tablet ? tablet->TabletId : 0, TabletID()), 0, ev->Cookie);
