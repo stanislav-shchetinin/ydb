@@ -10,6 +10,33 @@ class TTxSeizeTabletsReply : public TTransactionBase<THive> {
     THolder<TEvHive::TEvSeizeTabletsReply::THandle> Request;
     TVector<TTabletId> TabletIds;
 
+    void ImportFollowers(TLeaderTabletInfo& tablet, const NKikimrHive::TTabletInfo& protoTabletInfo, NIceDb::TNiceDb& db) {
+        for (const auto& protoFollowerGroup : protoTabletInfo.GetFollowerGroups()) {
+            TFollowerGroup& followerGroup = tablet.AddFollowerGroup();
+            followerGroup = protoFollowerGroup;
+
+            db.Table<Schema::TabletFollowerGroup>().Key(tablet.Id, followerGroup.Id).Update(
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::FollowerCount>(followerGroup.GetRawFollowerCount()),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowLeaderPromotion>(followerGroup.AllowLeaderPromotion),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowClientRead>(followerGroup.AllowClientRead),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowedNodes>(followerGroup.NodeFilter.AllowedNodes),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::NewAllowedDataCenterIds>(followerGroup.NodeFilter.AllowedDataCenters),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireAllDataCenters>(followerGroup.RequireAllDataCenters),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::LocalNodeOnly>(followerGroup.LocalNodeOnly),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireDifferentNodes>(followerGroup.RequireDifferentNodes),
+                        NIceDb::TUpdate<Schema::TabletFollowerGroup::FollowerCountPerDataCenter>(followerGroup.FollowerCountPerDataCenter));
+
+            for (ui32 i = 0; i < followerGroup.GetComputedFollowerCount(Self->GetDataCenters()); ++i) {
+                TFollowerTabletInfo& follower = tablet.AddFollower(followerGroup);
+                db.Table<Schema::TabletFollowerTablet>().Key(tablet.Id, follower.Id).Update(
+                            NIceDb::TUpdate<Schema::TabletFollowerTablet::GroupID>(follower.FollowerGroup.Id),
+                            NIceDb::TUpdate<Schema::TabletFollowerTablet::FollowerNode>(0));
+                follower.InitTabletMetrics();
+                follower.BecomeStopped(EHiveEventReason::InitialState);
+            }
+        }
+    }
+
 public:
     TTxSeizeTabletsReply(THolder<TEvHive::TEvSeizeTabletsReply::THandle> event, THive *hive)
         : TBase(hive)
@@ -27,22 +54,32 @@ public:
             TTabletId tabletId = protoTabletInfo.GetTabletID();
             std::pair<ui64, ui64> owner(protoTabletInfo.GetTabletOwner().GetOwner(), protoTabletInfo.GetTabletOwner().GetOwnerIdx());
             TLeaderTabletInfo& tablet = Self->GetTablet(tabletId);
+            const bool firstImport = Self->OwnerToTablet.emplace(owner, tabletId).second;
             // A repeated import must remove the previous resources before replacing tablet data.
             tablet.BecomeStopped(EHiveEventReason::Seized);
             tablet.SetType(protoTabletInfo.GetTabletType());
             tablet.KnownGeneration = protoTabletInfo.GetGeneration();
             tablet.State = static_cast<ETabletState>(protoTabletInfo.GetState());
             tablet.Owner = owner;
+            tablet.NeedToReleaseFromParent = true;
             tablet.BootMode = protoTabletInfo.GetTabletBootMode();
-            tablet.BalancerPolicy = protoTabletInfo.GetBalancerPolicy();
-            tablet.NodeFilter.AllowedNodes.assign(protoTabletInfo.GetAllowedNodes().begin(), protoTabletInfo.GetAllowedNodes().end());
-            tablet.NodeFilter.AllowedDataCenters = protoTabletInfo.GetAllowedDataCenters();
-            tablet.DataCentersPreference = protoTabletInfo.GetDataCentersPreference();
-            if (tablet.Category) {
-                tablet.Category->Tablets.erase(&tablet);
-                tablet.Category = nullptr;
+            // A repeated transfer from an older Hive carries none of the placement settings.
+            if (protoTabletInfo.HasBalancerPolicy()) {
+                tablet.BalancerPolicy = protoTabletInfo.GetBalancerPolicy();
+            }
+            if (protoTabletInfo.AllowedNodesSize()) {
+                tablet.NodeFilter.AllowedNodes.assign(protoTabletInfo.GetAllowedNodes().begin(), protoTabletInfo.GetAllowedNodes().end());
+            }
+            if (protoTabletInfo.HasAllowedDataCenters()) {
+                tablet.NodeFilter.AllowedDataCenters = protoTabletInfo.GetAllowedDataCenters();
+            }
+            if (protoTabletInfo.HasDataCentersPreference()) {
+                tablet.DataCentersPreference = protoTabletInfo.GetDataCentersPreference();
             }
             if (protoTabletInfo.HasPlacementCategory()) {
+                if (tablet.Category) {
+                    tablet.Category->Tablets.erase(&tablet);
+                }
                 const auto& settings = protoTabletInfo.GetPlacementCategory();
                 auto [it, inserted] = Self->TabletCategories.try_emplace(settings.GetTabletCategoryID(), settings.GetTabletCategoryID());
                 auto& category = it->second;
@@ -63,8 +100,13 @@ public:
             tablet.ObjectId = {owner.first, protoTabletInfo.GetObjectId()};
 
             TVector<TSubDomainKey> allowedDomains;
-            for (const auto& allowedDomain : protoTabletInfo.GetAllowedDomains()) {
-                allowedDomains.emplace_back(allowedDomain);
+            if (!firstImport && !protoTabletInfo.HasBalancerPolicy()) {
+                // Older parents omitted the object domain from the allowlist. Keep the installed list on replay.
+                allowedDomains = tablet.NodeFilter.AllowedDomains;
+            } else {
+                for (const auto& allowedDomain : protoTabletInfo.GetAllowedDomains()) {
+                    allowedDomains.emplace_back(allowedDomain);
+                }
             }
 
             TSubDomainKey objectDomain(protoTabletInfo.GetObjectDomain());
@@ -153,31 +195,6 @@ public:
 
             tablet.AcquireAllocationUnits();
 
-            for (const auto& protoFollowerGroup : protoTabletInfo.GetFollowerGroups()) {
-                TFollowerGroup& followerGroup = tablet.AddFollowerGroup();
-                followerGroup = protoFollowerGroup;
-
-                db.Table<Schema::TabletFollowerGroup>().Key(tabletId, followerGroup.Id).Update(
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::FollowerCount>(followerGroup.GetRawFollowerCount()),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowLeaderPromotion>(followerGroup.AllowLeaderPromotion),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowClientRead>(followerGroup.AllowClientRead),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowedNodes>(followerGroup.NodeFilter.AllowedNodes),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::NewAllowedDataCenterIds>(followerGroup.NodeFilter.AllowedDataCenters),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireAllDataCenters>(followerGroup.RequireAllDataCenters),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::LocalNodeOnly>(followerGroup.LocalNodeOnly),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireDifferentNodes>(followerGroup.RequireDifferentNodes),
-                            NIceDb::TUpdate<Schema::TabletFollowerGroup::FollowerCountPerDataCenter>(followerGroup.FollowerCountPerDataCenter));
-
-                for (ui32 i = 0; i < followerGroup.GetComputedFollowerCount(Self->GetDataCenters()); ++i) {
-                    TFollowerTabletInfo& follower = tablet.AddFollower(followerGroup);
-                    db.Table<Schema::TabletFollowerTablet>().Key(tabletId, follower.Id).Update(
-                                NIceDb::TUpdate<Schema::TabletFollowerTablet::GroupID>(follower.FollowerGroup.Id),
-                                NIceDb::TUpdate<Schema::TabletFollowerTablet::FollowerNode>(0));
-                    follower.InitTabletMetrics();
-                    follower.BecomeStopped(EHiveEventReason::InitialState);
-                }
-            }
-
             ui64 uniqPart = UniqPartFromTabletID(tabletId);
             TOwnershipKeeper::TOwnerType newOwnerId = Self->TabletID();
             TSequencer::TSequence pointSeq(uniqPart);
@@ -185,7 +202,9 @@ public:
             db.Table<Schema::TabletOwners>().Key(pointSeq.Begin, pointSeq.End).Update<Schema::TabletOwners::OwnerId>(newOwnerId);
             Self->Keeper.AddOwnedSequence(newOwnerId, pointSeq);
 
-            if (Self->OwnerToTablet.emplace(owner, tabletId).second) {
+            if (firstImport) {
+                // A replay of this transfer must retain follower identities already installed by the first import.
+                ImportFollowers(tablet, protoTabletInfo, db);
                 Self->ObjectToTabletMetrics[tablet.ObjectId].IncreaseCount();
                 Self->TabletTypeToTabletMetrics[tablet.Type].IncreaseCount();
             }
