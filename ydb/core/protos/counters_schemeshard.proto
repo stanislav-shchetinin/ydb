@@ -319,6 +319,8 @@ enum ESimpleCounters {
     COUNTER_TABLES_WITH_DEFERRED_SPLIT_MERGE = 245 [(CounterOpts) = {Name: "TablesWithDeferredSplitMerge"}];
 
     COUNTER_CDC_AGGREGATOR_COUNT = 246 [(CounterOpts) = {Name: "CdcAggregators"}];
+    COUNTER_PREPARE_COPY_PENDING_METADATA = 247 [(CounterOpts) = {Name: "PrepareCopyTable/PendingMetadata"}];
+    COUNTER_BACKUP_CREATE_BATCHES_IN_FLIGHT = 248 [(CounterOpts) = {Name: "BackupCreate/RequestsInFlight"}];
 
 }
 
@@ -537,6 +539,10 @@ enum ECumulativeCounters {
     // The deferral is direction-aware in the demand-tracking state, but this counter is
     // intentionally unified across directions and reasons.
     COUNTER_SPLIT_MERGE_DEFERRALS = 154 [(CounterOpts) = {Name: "SplitMergeDeferrals"}];
+    COUNTER_PREPARE_COPY_CREATED = 155 [(CounterOpts) = {Name: "PrepareCopyTable/Created"}];
+    COUNTER_BACKUP_CREATE_BATCHES = 156 [(CounterOpts) = {Name: "BackupCreate/RequestsSent"}];
+    COUNTER_BACKUP_CREATE_ITEMS = 157 [(CounterOpts) = {Name: "BackupCreate/ItemsSent"}];
+    COUNTER_BACKUP_CREATE_SPARSE_BATCHES = 158 [(CounterOpts) = {Name: "BackupCreate/SparseRequests"}];
 }
 
 enum EPercentileCounters {
@@ -697,6 +703,21 @@ enum EPercentileCounters {
         Ranges: { Value: 65536    Name: "65536"  }
         Ranges: { Value: 131072   Name: "131072" }
     }];
+    COUNTER_PREPARE_COPY_DURATION_MS = 9 [(CounterOpts) = {
+        Name: "PrepareCopyTable/DurationMs"
+        Ranges: { Value: 1       Name: "1 ms" }
+        Ranges: { Value: 4       Name: "4 ms" }
+        Ranges: { Value: 16      Name: "16 ms" }
+        Ranges: { Value: 64      Name: "64 ms" }
+        Ranges: { Value: 250     Name: "250 ms" }
+        Ranges: { Value: 1000    Name: "1 s" }
+        Ranges: { Value: 4000    Name: "4 s" }
+        Ranges: { Value: 16000   Name: "16 s" }
+        Ranges: { Value: 64000   Name: "64 s" }
+        Ranges: { Value: 256000  Name: "256 s" }
+        Ranges: { Value: 1024000 Name: "1024 s" }
+    }];
+    COUNTER_BACKUP_CREATE_ATTEMPT_TIME_US = 10 [(CounterOpts) = {Name: "BackupCreate/AttemptTimeUs"}];
 }
 
 enum ETxTypes {

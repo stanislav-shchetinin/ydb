@@ -782,6 +782,7 @@ void TSchemeShard::Clear() {
     ShardInfos.clear();
     AdoptedShards.clear();
     TabletIdToShardIdx.clear();
+    PreparedBackupPaths.clear();
 
     PartitionMetricsMap.clear();
 
@@ -5886,6 +5887,7 @@ void TSchemeShard::Die(const TActorContext &ctx) {
     if (IndexShadowDataRepairerId) {
         ctx.Send(IndexShadowDataRepairerId, new TEvents::TEvPoisonPill());
     }
+    PreparedTabletDispatcher.Shutdown(ctx);
     for (TActorId schemeUploader : RunningExportSchemeUploaders) {
         ctx.Send(schemeUploader, new TEvents::TEvPoisonPill());
     }
@@ -6238,6 +6240,8 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvPrivate::TEvExportSchemeUploadResult, Handle);
         HFuncTraced(TEvPrivate::TEvExportUploadMetadataResult, Handle);
         HFuncTraced(TEvPrivate::TEvExportCompletionUploadResult, Handle);
+        HFuncTraced(TEvPrivate::TEvDispatchPreparedTablets, Handle);
+        HFuncTraced(TEvPrivate::TEvPreparedTabletsResult, Handle);
 
         // namespace NImport {
         HFuncTraced(TEvImport::TEvCreateImportRequest, Handle);

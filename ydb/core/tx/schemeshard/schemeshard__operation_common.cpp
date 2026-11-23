@@ -18,9 +18,38 @@
 #include <ydb/core/tx/replication/controller/public_events.h>
 #include <ydb/core/tx/sequenceshard/public/events.h>
 
+#include <algorithm>
 
 namespace NKikimr {
 namespace NSchemeShard {
+
+void SetCreateTabletDomains(NKikimrHive::TEvCreateTablet& record, TPathId domainId, TSchemeShard* ss) {
+    TPathElement::TPtr domainEl = ss->PathsById.at(domainId);
+    auto objectDomain = record.MutableObjectDomain();
+    if (domainEl->IsRoot()) {
+        objectDomain->SetSchemeShard(ss->ParentDomainId.OwnerId);
+        objectDomain->SetPathId(ss->ParentDomainId.LocalPathId);
+    } else {
+        objectDomain->SetSchemeShard(domainId.OwnerId);
+        objectDomain->SetPathId(domainId.LocalPathId);
+    }
+
+    Y_ABORT_UNLESS(ss->SubDomains.contains(domainId));
+    TSubDomainInfo::TPtr subDomain = ss->SubDomains.at(domainId);
+
+    TPathId resourcesDomainId;
+    if (subDomain->GetResourcesDomainId()) {
+        resourcesDomainId = subDomain->GetResourcesDomainId();
+    } else if (subDomain->GetAlter() && subDomain->GetAlter()->GetResourcesDomainId()) {
+        resourcesDomainId = subDomain->GetAlter()->GetResourcesDomainId();
+    } else {
+        Y_ABORT("Cannot retrieve resources domain id");
+    }
+
+    auto allowedDomain = record.AddAllowedDomains();
+    allowedDomain->SetSchemeShard(resourcesDomainId.OwnerId);
+    allowedDomain->SetPathId(resourcesDomainId.LocalPathId);
+}
 
 THolder<TEvHive::TEvCreateTablet> CreateEvCreateTablet(TPathElement::TPtr targetPath, TShardIdx shardIdx, TSchemeShard* ss)
 {
@@ -42,33 +71,7 @@ THolder<TEvHive::TEvCreateTablet> CreateEvCreateTablet(TPathElement::TPtr target
 
     THolder<TEvHive::TEvCreateTablet> ev = MakeHolder<TEvHive::TEvCreateTablet>(ui64(shardIdx.GetOwnerId()), ui64(shardIdx.GetLocalId()), shard.TabletType, shard.BindedChannels);
 
-    TPathId domainId = ss->ResolvePathIdForDomain(targetPath);
-
-    TPathElement::TPtr domainEl = ss->PathsById.at(domainId);
-    auto objectDomain = ev->Record.MutableObjectDomain();
-    if (domainEl->IsRoot()) {
-        objectDomain->SetSchemeShard(ss->ParentDomainId.OwnerId);
-        objectDomain->SetPathId(ss->ParentDomainId.LocalPathId);
-    } else {
-        objectDomain->SetSchemeShard(domainId.OwnerId);
-        objectDomain->SetPathId(domainId.LocalPathId);
-    }
-
-    Y_ABORT_UNLESS(ss->SubDomains.contains(domainId));
-    TSubDomainInfo::TPtr subDomain = ss->SubDomains.at(domainId);
-
-    TPathId resourcesDomainId;
-    if (subDomain->GetResourcesDomainId()) {
-        resourcesDomainId = subDomain->GetResourcesDomainId();
-    } else if (subDomain->GetAlter() && subDomain->GetAlter()->GetResourcesDomainId()) {
-        resourcesDomainId = subDomain->GetAlter()->GetResourcesDomainId();
-    } else {
-        Y_ABORT("Cannot retrieve resources domain id");
-    }
-
-    auto allowedDomain = ev->Record.AddAllowedDomains();
-    allowedDomain->SetSchemeShard(resourcesDomainId.OwnerId);
-    allowedDomain->SetPathId(resourcesDomainId.LocalPathId);
+    SetCreateTabletDomains(ev->Record, ss->ResolvePathIdForDomain(targetPath), ss);
 
     if (tablePartitionConfig) {
         if (tablePartitionConfig->FollowerGroupsSize()) {
@@ -344,12 +347,29 @@ bool TCreateParts::ProgressState(TOperationContext& context) {
 
     txState->ClearShardsInProgress();
 
-    bool nothingToDo = true;
+    const auto* prepared = txState->TxType == TTxState::TxCopyTable
+        ? NExportPrepare::FindBatches(*context.SS, txState->TargetPathId) : nullptr;
+    NIceDb::TNiceDb db(context.GetDB());
     for (const auto& shard : txState->Shards) {
         if (shard.Operation != TTxState::CreateParts) {
             continue;
         }
-        nothingToDo = false;
+        if (prepared) {
+            const auto tablet = NExportPrepare::PreparedTablet(*prepared, shard.Idx);
+            if (tablet != InvalidTabletId) {
+                auto& mapping = context.SS->ShardInfos.at(shard.Idx);
+                Y_ABORT_UNLESS(mapping.TabletID == InvalidTabletId || mapping.TabletID == tablet);
+                if (mapping.TabletID == InvalidTabletId) {
+                    mapping.TabletID = tablet;
+                    context.SS->TabletIdToShardIdx[tablet] = shard.Idx;
+                    context.SS->TabletCounters->Simple()[COUNTER_TABLE_SHARD_ACTIVE_COUNT].Add(1);
+                    context.SS->PersistShardMapping(db, shard.Idx, tablet, mapping.PathId, OperationId.GetTxId(), mapping.TabletType);
+                }
+                context.OnComplete.ActivateShardCreated(shard.Idx, OperationId.GetTxId());
+                continue;
+            }
+        }
+        txState->ShardsInProgress.insert(shard.Idx);
 
         if (context.SS->AdoptedShards.contains(shard.Idx)) {
             auto ev = AdoptRequest(shard.Idx, context);
@@ -370,15 +390,13 @@ bool TCreateParts::ProgressState(TOperationContext& context) {
         context.OnComplete.RouteByShardIdx(OperationId, shard.Idx);
     }
 
-    if (nothingToDo) {
+    if (txState->ShardsInProgress.empty()) {
         YDB_LOG_DEBUG_CTX(context.Ctx, "no shards to create, do next state");
 
-        NIceDb::TNiceDb db(context.GetDB());
         context.SS->ChangeTxState(db, OperationId, TTxState::ConfigureParts);
         return true;
     }
 
-    txState->UpdateShardsInProgress(TTxState::CreateParts);
     return false;
 }
 
@@ -1030,6 +1048,18 @@ TVector<TTableShardInfo> ApplyPartitioningCopyTable(const TShardInfo &templateDa
 
     // Source table must not be altered or drop while we are performing copying. So we put it into a special state.
     ui64 count = dstPartitions.size();
+    const auto* prepared = NExportPrepare::FindBatches(*ss, txState.TargetPathId);
+    ui64 first = 0;
+    bool reuse = false;
+    if (prepared && !prepared->empty()) {
+        const auto& request = prepared->front().GetCreate();
+        const auto& last = prepared->back().GetCreate();
+        first = request.GetOwnerIdx();
+        const ui64 available = last.GetOwnerIdx() - first + last.GetCount();
+        reuse = count == available && std::ranges::equal(
+            templateDatashardInfo.BindedChannels, request.GetBindedChannels(),
+            [](const auto& left, const auto& right) { return left.SerializeAsString() == right.SerializeAsString(); });
+    }
     txState.Shards.reserve(count*2);
     for (ui64 i = 0; i < count; ++i) {
         // Source shards need to get "Send parts" transaction
@@ -1039,7 +1069,9 @@ TVector<TTableShardInfo> ApplyPartitioningCopyTable(const TShardInfo &templateDa
         Y_ABORT_UNLESS(srcTabletId != InvalidTabletId);
         txState.Shards.emplace_back(srcShardIdx, ETabletType::DataShard, TTxState::ConfigureParts);
         // Destination shards need to be created, configured and then they will receive parts
-        auto idx = ss->RegisterShardInfo(templateDatashardInfo);
+        auto idx = reuse
+            ? ss->RegisterShardInfo(TShardIdx(ss->TabletID(), TLocalShardIdx(first + i)), templateDatashardInfo)
+            : ss->RegisterShardInfo(templateDatashardInfo);
         txState.Shards.emplace_back(idx, ETabletType::DataShard, TTxState::CreateParts);
         // Properly set new shard idx
         dstPartitions[i].ShardIdx = idx;

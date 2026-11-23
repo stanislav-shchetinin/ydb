@@ -2,7 +2,7 @@
 #include "schemeshard_private.h"
 
 #include <ydb/core/base/hive.h>
-#include <ydb/core/base/tablet_pipe.h>
+#include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <util/generic/hash_set.h>
 
@@ -23,7 +23,11 @@ class TWorker : public TActorBootstrapped<TWorker> {
     ui64 LookupTabletId = 0;
     THashSet<ui64> Expected;
     THolder<IEventBase> Request;
-    TActorId Pipe;
+    const TActorId PipeCache = MakePipePerNodeCacheID(EPipePerNodeCache::Leader);
+
+    void SendToHive(IEventBase* event) {
+        Send(PipeCache, new TEvPipeCache::TEvForward(event, Hive, /* subscribe */ true));
+    }
 
     void Finish(THolder<TResult> result) {
         Send(Owner, result.Release());
@@ -62,8 +66,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
             }
             Step = EStep::Inspect;
             LookupTabletId = record.GetTabletID();
-            NTabletPipe::SendData(TActivationContext::AsActorContext(), Pipe,
-                new TEvHive::TEvRequestHiveInfo(LookupTabletId, false));
+            SendToHive(new TEvHive::TEvRequestHiveInfo(LookupTabletId, false));
             return;
         }
         if (Step != EStep::Create) {
@@ -111,8 +114,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
             return CleanupTargetMissing();
         }
         Step = EStep::Delete;
-        NTabletPipe::SendData(TActivationContext::AsActorContext(), Pipe,
-            new TEvHive::TEvDeleteTablet(ShardOwner, tablet.GetTabletOwner().GetOwnerIdx(), tablet.GetTabletID(), 0));
+        SendToHive(new TEvHive::TEvDeleteTablet(ShardOwner, tablet.GetTabletOwner().GetOwnerIdx(), tablet.GetTabletID(), 0));
     }
 
     void Handle(TEvHive::TEvDeleteTabletReply::TPtr& ev) {
@@ -129,18 +131,11 @@ class TWorker : public TActorBootstrapped<TWorker> {
         Finish(std::move(result));
     }
 
-    void Handle(TEvTabletPipe::TEvClientConnected::TPtr& ev) {
-        if (ev->Get()->Status != NKikimrProto::OK) {
-            Fail(TResult::EStatus::Retry, "Hive pipe connection failed");
-        }
-    }
-
     STRICT_STFUNC(StateWork,
         hFunc(TEvHive::TEvCreateTabletReply, Handle);
         hFunc(TEvHive::TEvResponseHiveInfo, Handle);
         hFunc(TEvHive::TEvDeleteTabletReply, Handle);
-        hFunc(TEvTabletPipe::TEvClientConnected, Handle);
-        case TEvTabletPipe::TEvClientDestroyed::EventType:
+        case TEvPipeCache::TEvDeliveryProblem::EventType:
         case TEvents::TEvWakeup::EventType:
             Fail(TResult::EStatus::Retry, "Hive pipe disconnected or timed out");
             break;
@@ -191,15 +186,14 @@ public:
         }
     }
 
-    void Bootstrap(const TActorContext& ctx) {
+    void Bootstrap() {
         Become(&TThis::StateWork);
-        Pipe = Register(NTabletPipe::CreateClient(SelfId(), Hive));
-        NTabletPipe::SendData(ctx, Pipe, Request.Release());
+        SendToHive(Request.Release());
         Schedule(TDuration::Seconds(30), new TEvents::TEvWakeup());
     }
 
     void PassAway() override {
-        NTabletPipe::CloseClient(TActivationContext::AsActorContext(), Pipe);
+        Send(PipeCache, new TEvPipeCache::TEvUnlink(Hive));
         TActorBootstrapped::PassAway();
     }
 };

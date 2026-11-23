@@ -775,7 +775,10 @@ public:
         }
 
         auto guard = context.DbGuard();
-        TPathId allocatedPathId = context.SS->AllocatePathId();
+        const auto reserved = isBackup
+            ? NExportPrepare::ReservedPath(*context.SS, OperationId.GetTxId(), srcPath.Base()->PathId, dstPath.PathString())
+            : TMaybe<TPathId>();
+        TPathId allocatedPathId = reserved ? *reserved : context.SS->AllocatePathId();
         context.MemChanges.GrabNewPath(context.SS, allocatedPathId);
         context.MemChanges.GrabPath(context.SS, parent.Base()->PathId);
         context.MemChanges.GrabPath(context.SS, srcPath.Base()->PathId);

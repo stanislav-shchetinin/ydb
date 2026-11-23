@@ -47,4 +47,7 @@ message TSchemeShardConfig {
 
     // maximum recent index build operations to maintain (older ones are removed)
     optional uint32 MaxStoredIndexBuilds = 11 [default = 1000];
+
+    // Shared by all paced exports from this SchemeShard to the same Hive.
+    optional uint32 MaxBackupCreateBatchesInFlightPerHive = 12 [default = 2];
 }

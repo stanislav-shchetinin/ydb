@@ -10,6 +10,7 @@
 #include <ydb/core/protos/tx_datashard.pb.h>
 #include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/tablet_flat/flat_cxx_database.h>
+#include <ydb/core/protos/prepared_backup_tablets.pb.h>
 
 #include <ydb/library/login/protos/login.pb.h>
 
@@ -1304,6 +1305,8 @@ struct Schema : NIceDb::Schema {
         struct EnableChecksums : Column<17, NScheme::NTypeIds::Bool> {};
         struct EnablePermissions : Column<18, NScheme::NTypeIds::Bool> {};
         struct IncludeIndexData : Column<21, NScheme::NTypeIds::Bool> {};
+        struct Paced : Column<22, NScheme::NTypeIds::Bool> {};
+        struct PrepareStartedMs : Column<23, NScheme::NTypeIds::Uint64> {};
 
         struct ExportMetadata : Column<19, NScheme::NTypeIds::String> { using Type = NKikimrSchemeOp::TExportMetadata; };
 
@@ -1329,7 +1332,9 @@ struct Schema : NIceDb::Schema {
             EnablePermissions,
             ExportMetadata,
             SanitizedToken,
-            IncludeIndexData
+            IncludeIndexData,
+            Paced,
+            PrepareStartedMs
         >;
     };
 
@@ -2755,7 +2760,17 @@ struct Schema : NIceDb::Schema {
         using TColumns = TableColumns<PathId, State>;
     };
 
+    struct ExportPreparedTabletBatches : Table<142> {
+        struct ExportId : Column<1, NScheme::NTypeIds::Uint64> {};
+        struct ItemIdx : Column<2, NScheme::NTypeIds::Uint32> {};
+        struct BatchIdx : Column<3, NScheme::NTypeIds::Uint32> {};
+        struct Batch : Column<4, NScheme::NTypeIds::String> { using Type = NKikimrSchemeShard::TPreparedBackupTabletBatch; };
+        using TKey = TableKey<ExportId, ItemIdx, BatchIdx>;
+        using TColumns = TableColumns<ExportId, ItemIdx, BatchIdx, Batch>;
+    };
+
     using TTables = SchemaTables<
+        ExportPreparedTabletBatches,
         DatabaseFreezes,
         Paths,
         TxInFlight,

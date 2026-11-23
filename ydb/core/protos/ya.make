@@ -99,6 +99,7 @@ SRCS(
     grpc_status_proxy.proto
     health.proto
     hive.proto
+    prepared_backup_tablets.proto
     http_config.proto
     import.proto
     index_builder.proto

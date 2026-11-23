@@ -68,10 +68,19 @@ namespace TEvPrivate {
         EvKesusSemaphoresDescribeResult,
         EvImportKesusResult,
         EvPreparedTabletsResult,
+        EvDispatchPreparedTablets,
         EvEnd
     };
 
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE), "expect EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE)");
+
+    struct TEvDispatchPreparedTablets : TEventLocal<TEvDispatchPreparedTablets, EvDispatchPreparedTablets> {
+        const ui64 ExportId;
+        const ui32 Item;
+        const ui32 Batch;
+        explicit TEvDispatchPreparedTablets(ui64 id, ui32 item = Max<ui32>(), ui32 batch = 0)
+            : ExportId(id), Item(item), Batch(batch) {}
+    };
 
     struct TEvPreparedTabletsResult : TEventLocal<TEvPreparedTabletsResult, EvPreparedTabletsResult> {
         enum class EStatus { Success, Retry, Error };

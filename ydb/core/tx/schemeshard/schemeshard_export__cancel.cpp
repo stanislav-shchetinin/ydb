@@ -61,7 +61,8 @@ struct TSchemeShard::TExport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
         const bool publishingCompletion = exportInfo->IsWorking() && allItemsDone;
         const bool committingS3Export = exportInfo->Kind == TExportInfo::EKind::S3
             && (exportInfo->IsAutoDropping() || publishingCompletion);
-        if (exportInfo->IsFinished() || exportInfo->IsDropping() || committingS3Export) {
+        if (exportInfo->IsFinished() || exportInfo->IsDropping() || committingS3Export
+                || exportInfo->State == TExportInfo::EState::CleaningPreparedTablets) {
             Send(Request->Sender, std::move(response), 0, Request->Cookie);
             return true;
         }
@@ -91,7 +92,33 @@ struct TSchemeShard::TExport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
             }
         }
 
-        if (exportInfo->State < TExportInfo::EState::Transferring) {
+        if (exportInfo->State == TExportInfo::EState::PrepareCopyTables ||
+                exportInfo->State == TExportInfo::EState::ReleasingUnusedTablets ||
+                (exportInfo->Paced && exportInfo->State == TExportInfo::EState::CopyTables)) {
+            if (exportInfo->State == TExportInfo::EState::CopyTables && exportInfo->WaitTxId == InvalidTxId) {
+                // A copy may already hold the reserved shards before its proposal reply arrives.
+                for (const auto& item : exportInfo->Items) {
+                    if (item.PreparedTablets.empty()) {
+                        continue;
+                    }
+                    const auto pathId = TPathId(Self->TabletID(), item.PreparedTablets.front().GetCreate().GetObjectId());
+                    const auto* path = Self->PathsById.FindPtr(pathId);
+                    if (path && (*path)->PathState == TPathElement::EPathState::EPathStateCreate) {
+                        exportInfo->WaitTxId = (*path)->CreateTxId;
+                        break;
+                    }
+                }
+            }
+            exportInfo->State = TExportInfo::EState::CleaningPreparedTablets;
+            Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Sub(std::exchange(exportInfo->PendingCreateCount, 0));
+            Self->PreparedTabletDispatcher.Forget(exportInfo->Id);
+            if (exportInfo->WaitTxId != InvalidTxId) {
+                Self->TxIdToExport[exportInfo->WaitTxId] = {exportInfo->Id, Max<ui32>()};
+                Send(Self->SelfId(), new TEvSchemeShard::TEvNotifyTxCompletion(ui64(exportInfo->WaitTxId)));
+            } else {
+                Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(exportInfo->Id));
+            }
+        } else if (exportInfo->State < TExportInfo::EState::Transferring) {
             exportInfo->State = TExportInfo::EState::Cancelled;
 
             Self->TxIdToExport.erase(exportInfo->WaitTxId);

@@ -5148,6 +5148,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     exportInfo->EnableChecksums = rowset.GetValueOrDefault<Schema::Exports::EnableChecksums>(false);
                     exportInfo->EnablePermissions = rowset.GetValueOrDefault<Schema::Exports::EnablePermissions>(false);
                     exportInfo->IncludeIndexData = rowset.GetValueOrDefault<Schema::Exports::IncludeIndexData>(false);
+                    exportInfo->Paced = rowset.GetValueOrDefault<Schema::Exports::Paced>(false);
+                    exportInfo->PrepareStarted = TInstant::MilliSeconds(rowset.GetValueOrDefault<Schema::Exports::PrepareStartedMs>());
 
                     if (rowset.HaveValue<Schema::Exports::ExportMetadata>()) {
                         exportInfo->ExportMetadata = rowset.GetValue<Schema::Exports::ExportMetadata>();
@@ -5209,6 +5211,39 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     if (!rowset.Next()) {
                         return false;
                     }
+                }
+            }
+        }
+
+        {
+            using TPrepared = Schema::ExportPreparedTabletBatches;
+            auto rows = db.Table<TPrepared>().Range().Select();
+            if (!rows.IsReady()) {
+                return false;
+            }
+            while (!rows.EndOfSet()) {
+                auto& info = *Self->Exports.at(rows.GetValue<TPrepared::ExportId>());
+                auto& item = info.Items.at(rows.GetValue<TPrepared::ItemIdx>());
+                Y_ABORT_UNLESS(item.PreparedTablets.size() == rows.GetValue<TPrepared::BatchIdx>());
+                auto& batch = item.PreparedTablets.emplace_back(rows.GetValue<TPrepared::Batch>());
+                ui32 pending = 0;
+                for (const auto& slot : batch.GetTablets()) {
+                    if (slot.GetTabletId()) {
+                        info.PreparedTabletIds.insert(slot.GetTabletId());
+                    }
+                    pending += slot.GetState() == NExportPrepare::TBatch::Pending;
+                }
+                if (info.State == TExportInfo::EState::PrepareCopyTables) {
+                    info.PendingCreateCount += pending;
+                    Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Add(pending);
+                }
+                if (rows.GetValue<TPrepared::BatchIdx>() == 0) {
+                    info.PreparedItemsBySource.emplace(item.SourcePathId, rows.GetValue<TPrepared::ItemIdx>());
+                    Self->PreparedBackupPaths.emplace(TPathId(Self->TabletID(), batch.GetCreate().GetObjectId()),
+                        std::make_pair(rows.GetValue<TPrepared::ExportId>(), rows.GetValue<TPrepared::ItemIdx>()));
+                }
+                if (!rows.Next()) {
+                    return false;
                 }
             }
         }
