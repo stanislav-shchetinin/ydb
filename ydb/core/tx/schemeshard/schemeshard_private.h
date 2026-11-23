@@ -6,6 +6,7 @@
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
 #include <ydb/core/protos/flat_scheme_op.pb.h>
+#include <ydb/core/protos/hive.pb.h>
 #include <ydb/core/protos/kesus.pb.h>
 #include <ydb/core/tx/datashard/datashard.h>
 
@@ -66,10 +67,19 @@ namespace TEvPrivate {
         EvKesusResourcesDescribeResult,
         EvKesusSemaphoresDescribeResult,
         EvImportKesusResult,
+        EvPreparedTabletsResult,
         EvEnd
     };
 
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE), "expect EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE)");
+
+    struct TEvPreparedTabletsResult : TEventLocal<TEvPreparedTabletsResult, EvPreparedTabletsResult> {
+        enum class EStatus { Success, Retry, Error };
+        EStatus Status = EStatus::Success;
+        TString Error;
+        NKikimrHive::TEvCreateTabletReply Reply;
+        NKikimrHive::TEvDeleteTabletReply DeleteReply;
+    };
 
     // This event is sent by a schemeshard to itself to signal that some tx state has changed
     // and it should run all the actions associated with this state

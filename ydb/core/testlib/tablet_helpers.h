@@ -102,6 +102,8 @@ namespace NKikimr {
         TMap<ui32, TActorId> FollowerLaunchers; // keyed by followerId
         ETabletState State = ETabletState::Unknown;
         TSubDomainKey ObjectDomain;  // what subdomain tablet belongs to
+        ui64 ObjectId = 0;
+        bool IsBackup = false;
 
         TChannelsBindings BoundChannels;
         ui32 ChannelsProfile;

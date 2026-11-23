@@ -23,6 +23,7 @@
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/schemeshard/schemeshard_billing_helpers.h>
 #include <ydb/core/tx/schemeshard/schemeshard_export_helpers.h>
+#include <ydb/core/tx/schemeshard/schemeshard_export_tablet_request.h>
 #include <ydb/core/tx/schemeshard/schemeshard_private.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/local_indexes.h>
@@ -2510,6 +2511,48 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         Env().TestWaitNotification(Runtime(), exportId);
         TestGetExport(Runtime(), exportId, "/MyRoot", Ydb::StatusIds::CANCELLED);
         CheckNoSuchS3Files({"/backup/table/data_complete.json", "/backup/table/export_complete.json"});
+    }
+
+    Y_UNIT_TEST(PacedBatchClientChecksResultsAndResolvesLostCreate) {
+        using namespace NKikimr::NSchemeShard;
+        Env();
+        const auto edge = Runtime().AllocateEdgeActor();
+        const ui64 hive = TTestTxConfig::Hive;
+        NKikimrHive::TEvCreateTablet range;
+        range.SetOwner(0x7aed0002);
+        range.SetOwnerIdx(100);
+        range.SetCount(2);
+        range.SetObjectId(23);
+        range.SetIsBackup(true);
+        range.SetTabletType(TTabletTypes::DataShard);
+        range.AddBindedChannels()->SetStoragePoolName("pool");
+        using TResult = NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult;
+        const TVector<ui32> offsets{0, 1};
+        auto create = [&](const TVector<ui32>& subset, bool sparse) {
+            Runtime().Register(NExportPrepare::CreateTabletBatchRequest(edge, hive, range, subset, sparse));
+            return Runtime().GrabEdgeEventRethrow<TResult>(edge);
+        };
+        auto corrupt = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([](auto& ev) {
+            auto& reply = ev->Get()->Record;
+            if (reply.ResultsSize() == 2) {
+                reply.MutableResults(1)->SetTabletID(reply.GetResults(0).GetTabletID());
+            }
+        });
+        UNIT_ASSERT(create(offsets, false)->Get()->Status == TResult::EStatus::Error);
+        corrupt.Remove();
+        const auto sparse = create({1}, true);
+        UNIT_ASSERT(sparse->Get()->Status == TResult::EStatus::Success);
+        UNIT_ASSERT_VALUES_EQUAL(sparse->Get()->Reply.ResultsSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sparse->Get()->Reply.GetResults(0).GetOwnerIdx(), 101);
+        const auto& tablets = Env().GetHiveState()->Tablets;
+        for (const ui64 objectId : {24, 23}) {
+            Runtime().Register(NExportPrepare::CreateTabletCleanupRequest(edge, hive, {
+                .ShardOwner = range.GetOwner(), .OwnerIdx = 100, .ObjectId = objectId, .TabletId = 0, .CurrentHive = hive}));
+            const auto cleanup = Runtime().GrabEdgeEventRethrow<TResult>(edge);
+            UNIT_ASSERT_VALUES_EQUAL(cleanup->Get()->DeleteReply.GetStatus(), NKikimrProto::OK);
+            UNIT_ASSERT_VALUES_EQUAL(tablets.contains(std::pair<ui64, ui64>{range.GetOwner(), 100}), objectId != 23);
+            UNIT_ASSERT(tablets.contains(std::pair<ui64, ui64>{range.GetOwner(), 101}));
+        }
     }
 
     Y_UNIT_TEST(ShouldSucceedOnSingleShardTable) {
