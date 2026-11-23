@@ -536,7 +536,7 @@ private:
         );
 
         Y_ABORT_UNLESS(exportInfo.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), CopyTablesPropose(Self, txId, exportInfo));
+        Send(Self->SelfId(), CopyTablesPropose(Self, txId, exportInfo), 0, exportInfo.Paced ? exportInfo.Id : 0);
     }
 
     void TransferData(TExportInfo& exportInfo, ui32 itemIdx, TTxId txId) {
@@ -1377,6 +1377,7 @@ private:
         ui32 itemIdx;
         std::tie(id, itemIdx) = Self->TxIdToExport.at(txId);
         if (!Self->Exports.contains(id)) {
+            Self->TxIdToExport.erase(txId);
             YDB_LOG_ERROR("TExport::TTxProgress: OnModifyResult received unknown id",
                 {"id", id},
             );
@@ -1384,6 +1385,11 @@ private:
         }
 
         TExportInfo::TPtr exportInfo = Self->Exports.at(id);
+        if (ModifyResult->Cookie == id && exportInfo->Paced && exportInfo->State != EState::CopyTables
+                && record.GetStatus() == NKikimrScheme::StatusPreconditionFailed) {
+            Self->TxIdToExport.erase(txId);
+            return;
+        }
         NIceDb::TNiceDb db(txc.DB);
 
         if (record.GetStatus() != NKikimrScheme::StatusAccepted) {

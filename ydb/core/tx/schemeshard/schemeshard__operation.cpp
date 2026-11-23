@@ -522,6 +522,18 @@ struct TSchemeShard::TTxOperationPropose: public NTabletFlatExecutor::TTransacti
         }
         PeerName = record.GetPeerName();
 
+        // Paced export uses its ID as the cookie of its local copy proposal.
+        // Cancellation can commit after this message was sent and before this transaction executes.
+        if (Request->Cookie && Request->Sender == Self->SelfId() && record.TransactionSize() == 1
+                && record.GetTransaction(0).GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateConsistentCopyTables) {
+            const auto* owner = Self->Exports.FindPtr(Request->Cookie);
+            if (!owner || (*owner)->State != TExportInfo::EState::CopyTables) {
+                Response = MakeHolder<TEvSchemeShard::TEvModifySchemeTransactionResult>(
+                    NKikimrScheme::StatusPreconditionFailed, ui64(txId), ui64(selfId), "Export no longer expects a consistent copy");
+                return true;
+            }
+        }
+
         TMemoryChanges memChanges;
         TStorageChanges dbChanges;
         TProposeContext context{Self, txc, ctx, OnComplete, memChanges, dbChanges, std::move(userToken)};

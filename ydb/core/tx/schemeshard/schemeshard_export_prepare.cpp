@@ -156,6 +156,7 @@ static TMaybe<TWork> NextWork(TSchemeShard& ss, const TKey& key) {
     }
     const auto& batch = (*info)->Items.at(itemIdx).PreparedTablets.at(batchIdx);
     const bool cleanup = (*info)->State != TExportInfo::EState::PrepareCopyTables;
+    const ui32 limit = cleanup ? 1u : Max(1u, AppData()->HiveConfig.GetMaxCreateTabletBatchSize());
     TWork work{id, itemIdx, batchIdx, 0, {}, cleanup, {}};
     for (ui32 offset : xrange(batch.TabletsSize())) {
         const auto& slot = batch.GetTablets(offset);
@@ -173,7 +174,7 @@ static TMaybe<TWork> NextWork(TSchemeShard& ss, const TKey& key) {
         }
         work.Hive = hive;
         work.Offsets.push_back(offset);
-        if (cleanup) {
+        if (work.Offsets.size() == limit) {
             break;
         }
     }
