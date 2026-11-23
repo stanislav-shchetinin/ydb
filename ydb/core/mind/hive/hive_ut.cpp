@@ -2508,6 +2508,16 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         if (objectDomain) {
             createTablet1->Record.MutableObjectDomain()->CopyFrom(objectDomain);
         }
+        createTablet1->Record.AddAllowedNodeIDs(runtime.GetNodeId(1));
+        createTablet1->Record.SetBalancerPolicy(NKikimrHive::POLICY_IGNORE);
+        auto* category = createTablet1->Record.MutableTabletCategory();
+        category->SetTabletCategoryID(491);
+        category->SetMaxDisconnectTimeout(31);
+        auto* follower = createTablet1->Record.AddFollowerGroups();
+        follower->SetLocalNodeOnly(true);
+        follower->AddAllowedNodeIDs(runtime.GetNodeId(1));
+        createTablet1->Record.MutableDataCentersPreference()->AddDataCentersGroups()->AddDataCenter("1");
+        auto retry = createTablet1->Record;
         ui64 tabletId1 = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createTablet1), 0, true);
 
         MakeSureTabletIsUp(runtime, tabletId1, 0); // tablet up in root hive
@@ -2564,12 +2574,11 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         for (ui32 node = 0; node < 2; ++node) {
             runtime.GetAppData(node).FeatureFlags.SetEnablePacedBackupExport(true);
         }
-        auto retry = TEvHive::TEvCreateTablet(testerTablet, 1, TTabletTypes::Dummy, BINDED_CHANNELS).Record;
-        retry.SetCount(1);
-        *retry.AddAllowedDomains() = subdomainKey;
         if (objectDomain) {
-            *retry.MutableObjectDomain() = objectDomain;
+            // The child must also recognize the original parameters after loading its own database.
+            RebootTablet(runtime, subHiveTablet, runtime.AllocateEdgeActor());
         }
+        retry.SetCount(1);
         for (const ui64 target : {hiveTablet, subHiveTablet}) {
             auto request = MakeHolder<TEvHive::TEvCreateTablet>();
             request->Record = retry;
@@ -2586,6 +2595,17 @@ Y_UNIT_TEST_SUITE(THiveTest) {
                 UNIT_ASSERT_VALUES_EQUAL(result.GetTabletID(), tabletId1);
             }
         }
+
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED), 1);
+        auto conflicting = MakeHolder<TEvHive::TEvCreateTablet>();
+        conflicting->Record = retry;
+        conflicting->Record.SetObjectId(retry.GetObjectId() + 1);
+        runtime.SendToPipe(subHiveTablet, sender, conflicting.Release(), 0, GetPipeConfigWithRetries());
+        const auto& conflict = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(handle)->Record;
+        UNIT_ASSERT_VALUES_EQUAL(conflict.ResultsSize(), 1);
+        UNIT_ASSERT_EQUAL(conflict.GetResults(0).GetErrorReason(), NKikimrHive::ERROR_REASON_CREATE_PARAMETERS_MISMATCH);
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_CONFLICT), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED), 1);
 
         if (!objectDomain) {
             // No IDs are available in the child Hive until its grant arrives.

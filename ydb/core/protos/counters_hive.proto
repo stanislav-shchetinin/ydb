@@ -67,6 +67,8 @@ enum ECumulativeCounters {
     COUNTER_SHRINK_MOVE_DATA_SENT = 17 [(CounterOpts) = {Name: "ShrinkMoveDataSent"}];
     COUNTER_SHRINK_MOVE_DATA_ANSWERED = 18 [(CounterOpts) = {Name: "ShrinkMoveDataAnswered"}];
     COUNTER_SHRINK_MOVE_DATA_RETRIED = 19 [(CounterOpts) = {Name: "ShrinkMoveDataRetried"}];
+    COUNTER_CREATE_BATCH_REPLAY_MATCHED = 20 [(CounterOpts) = {Name: "CreateTabletBatch/ReplayMatched"}];
+    COUNTER_CREATE_BATCH_REPLAY_CONFLICT = 21 [(CounterOpts) = {Name: "CreateTabletBatch/ReplayConflict"}];
 }
 
 enum EPercentileCounters {

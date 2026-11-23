@@ -34,6 +34,29 @@ public:
             tablet.State = static_cast<ETabletState>(protoTabletInfo.GetState());
             tablet.Owner = owner;
             tablet.BootMode = protoTabletInfo.GetTabletBootMode();
+            tablet.BalancerPolicy = protoTabletInfo.GetBalancerPolicy();
+            tablet.NodeFilter.AllowedNodes.assign(protoTabletInfo.GetAllowedNodes().begin(), protoTabletInfo.GetAllowedNodes().end());
+            tablet.NodeFilter.AllowedDataCenters = protoTabletInfo.GetAllowedDataCenters();
+            tablet.DataCentersPreference = protoTabletInfo.GetDataCentersPreference();
+            if (tablet.Category) {
+                tablet.Category->Tablets.erase(&tablet);
+                tablet.Category = nullptr;
+            }
+            if (protoTabletInfo.HasPlacementCategory()) {
+                const auto& settings = protoTabletInfo.GetPlacementCategory();
+                auto [it, inserted] = Self->TabletCategories.try_emplace(settings.GetTabletCategoryID(), settings.GetTabletCategoryID());
+                auto& category = it->second;
+                // Keep category settings already configured in the destination Hive.
+                if (inserted) {
+                    category.MaxDisconnectTimeout = settings.GetMaxDisconnectTimeout();
+                    category.StickTogetherInDC = settings.GetStickTogetherInDC();
+                    db.Table<Schema::TabletCategory>().Key(category.Id).Update(
+                        NIceDb::TUpdate<Schema::TabletCategory::MaxDisconnectTimeout>(category.MaxDisconnectTimeout),
+                        NIceDb::TUpdate<Schema::TabletCategory::StickTogetherInDC>(category.StickTogetherInDC));
+                }
+                tablet.Category = &category;
+                category.Tablets.insert(&tablet);
+            }
             if (protoTabletInfo.HasIsBackup()) {
                 tablet.IsBackup = protoTabletInfo.GetIsBackup();
             }
@@ -73,9 +96,11 @@ public:
                         NIceDb::TUpdate<Schema::Tablet::TabletType>(tablet.Type),
                         NIceDb::TUpdate<Schema::Tablet::State>(tablet.State),
                         NIceDb::TUpdate<Schema::Tablet::LeaderNode>(tablet.NodeId),
-                        //NIceDb::TUpdate<Schema::Tablet::Category>(),
-                        //NIceDb::TUpdate<Schema::Tablet::AllowedNodes>(),
-                        //NIceDb::TUpdate<Schema::Tablet::AllowedDataCenters>(),
+                        NIceDb::TUpdate<Schema::Tablet::Category>(tablet.Category ? tablet.Category->Id : 0),
+                        NIceDb::TUpdate<Schema::Tablet::AllowedNodes>(tablet.NodeFilter.AllowedNodes),
+                        NIceDb::TUpdate<Schema::Tablet::NewAllowedDataCenterIds>(tablet.NodeFilter.AllowedDataCenters),
+                        NIceDb::TUpdate<Schema::Tablet::DataCentersPreference>(tablet.DataCentersPreference),
+                        NIceDb::TUpdate<Schema::Tablet::BalancerPolicy>(tablet.BalancerPolicy),
                         NIceDb::TUpdate<Schema::Tablet::TabletStorageVersion>(tablet.TabletStorageInfo->Version),
                         NIceDb::TUpdate<Schema::Tablet::ConfirmedStorageVersion>(tablet.ConfirmedStorageVersion),
                         NIceDb::TUpdate<Schema::Tablet::ObjectID>(protoTabletInfo.GetObjectId()),
@@ -139,6 +164,7 @@ public:
                             NIceDb::TUpdate<Schema::TabletFollowerGroup::AllowedNodes>(followerGroup.NodeFilter.AllowedNodes),
                             NIceDb::TUpdate<Schema::TabletFollowerGroup::NewAllowedDataCenterIds>(followerGroup.NodeFilter.AllowedDataCenters),
                             NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireAllDataCenters>(followerGroup.RequireAllDataCenters),
+                            NIceDb::TUpdate<Schema::TabletFollowerGroup::LocalNodeOnly>(followerGroup.LocalNodeOnly),
                             NIceDb::TUpdate<Schema::TabletFollowerGroup::RequireDifferentNodes>(followerGroup.RequireDifferentNodes),
                             NIceDb::TUpdate<Schema::TabletFollowerGroup::FollowerCountPerDataCenter>(followerGroup.FollowerCountPerDataCenter));
 
