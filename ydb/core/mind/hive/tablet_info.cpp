@@ -311,14 +311,28 @@ bool TTabletInfo::IsPinnedToNode() const {
 }
 
 bool TTabletInfo::InitiateBoot(TNodeId node) {
-    if (IsStopped()) {
-        ChangeVolatileState(EVolatileState::TABLET_VOLATILE_STATE_BOOTING);
-        Hive.AddToBootQueue(this, node);
-        Hive.ProcessBootQueue();
-        return true;
-    } else {
+    if (!IsStopped()) {
         return false;
     }
+    if (IsFollower()) {
+        auto& suggestion = AsFollower().SuggestedNodeAfterInitialBoot;
+        if (GetLeader().InitialBootPending) {
+            // The follower can only start after the leader. Keep its placement hint
+            // until ConfirmInitialBoot admits the followers to the recovery queue.
+            if (node) {
+                suggestion = node;
+            }
+            return false;
+        }
+        const auto deferred = std::exchange(suggestion, 0);
+        if (!node) {
+            node = deferred;
+        }
+    }
+    ChangeVolatileState(EVolatileState::TABLET_VOLATILE_STATE_BOOTING);
+    Hive.AddToBootQueue(this, node);
+    Hive.ProcessBootQueue();
+    return true;
 }
 
 TActorId TTabletInfo::GetLocal() const {

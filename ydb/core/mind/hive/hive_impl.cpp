@@ -345,7 +345,7 @@ TInstant THive::GetAllowedBootingTime() {
 }
 
 EBootClass THive::BootClass(const TTabletInfo& tablet) const {
-    if (tablet.IsLeader() && tablet.AsLeader().InitialBootPending && AppData()->FeatureFlags.GetEnablePacedBackupExport()) {
+    if (tablet.IsLeader() && tablet.AsLeader().InitialBootPending) {
         return tablet.IsBackup ? BackupBootClass : InitialBootClass;
     }
     return RestartBootClass;
@@ -384,6 +384,7 @@ void THive::ConfirmInitialBoot(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db) {
     if (tablet.InitialBootPending && !tablet.IsBootingSuppressed()) {
         tablet.InitialBootPending = false;
         db.Table<Schema::Tablet>().Key(tablet.Id).Update<Schema::Tablet::InitialBootPending>(false);
+        tablet.InitiateFollowersBoot();
         if (TabletCounters) {
             TabletCounters->Cumulative()[tablet.IsBackup ? COUNTER_BOOT_BACKUP_READY : COUNTER_BOOT_INITIAL_READY].Increment(1);
         }
@@ -449,7 +450,7 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
         }
         ui64 classProcessed = 0;
         TCountedLeakyBucket* quota = nullptr;
-        if (bootClass != RestartBootClass && AppData()->FeatureFlags.GetEnablePacedBackupExport()) {
+        if (bootClass != RestartBootClass) {
             const auto& limits = BootLimits(bootClass);
             const ui32 burst = std::max<ui32>(1, limits.GetBurst());
             const ui32 rate = std::max<ui32>(1, limits.GetRatePerSecond());
@@ -653,8 +654,9 @@ void THive::AddToBootQueue(TTabletInfo* tablet, TNodeId node) {
     tablet->UpdateWeight();
     tablet->BootState = BootStateBooting;
     const TInstant now = TlsActivationContext ? TlsActivationContext->Now() : TInstant();
-    const bool paced = now && AppData()->FeatureFlags.GetEnablePacedBackupExport();
-    BootQueues[BootClass(*tablet)].AddToBootQueue(*tablet, node, paced ? now : TInstant());
+    const auto bootClass = BootClass(*tablet);
+    const bool paced = now && (bootClass != RestartBootClass || AppData()->FeatureFlags.GetEnablePacedBackupExport());
+    BootQueues[bootClass].AddToBootQueue(*tablet, node, paced ? now : TInstant());
     if (paced) {
         UpdateBootClassCounters(now);
     }

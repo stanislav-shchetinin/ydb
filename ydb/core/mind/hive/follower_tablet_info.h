@@ -14,6 +14,7 @@ public:
     TLeaderTabletInfo& LeaderTablet;
     TFollowerId Id;
     TFollowerGroup& FollowerGroup;
+    TNodeId SuggestedNodeAfterInitialBoot = 0;
 
     TFollowerTabletInfo(TLeaderTabletInfo& leaderTablet, TFollowerId id, TFollowerGroup& followerGroup);
 };

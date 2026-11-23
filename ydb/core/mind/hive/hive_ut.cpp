@@ -13230,6 +13230,97 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         }
     }
 
+    Y_UNIT_TEST(TestPacedInitialBootKeepsAdmissionAfterFlagChange) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxTabletsScheduled(8);
+            auto* limits = app.HiveConfig.MutableBackupInitialBoot();
+            limits->SetMaxInFlight(1);
+            limits->SetMaxInFlightPerNode(8);
+            limits->SetRatePerSecond(100);
+            limits->SetBurst(8);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        const auto hiveActor = GetHiveActor(runtime, hive);
+        runtime.EnableScheduleForActor(hiveActor);
+        TBlockEvents<NHive::TEvPrivate::TEvProcessBootQueue> queue(runtime, [&](const auto& ev) {
+            return ev->GetRecipientRewrite() == hiveActor;
+        });
+        TBlockEvents<TEvLocal::TEvBootTablet> boots(runtime, [](const auto& ev) {
+            return ev->Get()->Record.GetInfo().GetTabletType() == TTabletTypes::Dummy;
+        });
+        auto batch = MakeHolder<TEvHive::TEvCreateTablet>(owner, 100, TTabletTypes::Dummy, BINDED_CHANNELS);
+        batch->Record.SetCount(3);
+        batch->Record.SetIsBackup(true);
+        runtime.SendToPipe(hive, edge, batch.Release(), 0, GetPipeConfigWithRetries());
+        auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+        TVector<ui64> tablets;
+        for (const auto& result : reply->Get()->Record.GetResults()) {
+            UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), NKikimrProto::OK);
+            tablets.push_back(result.GetTabletID());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(tablets.size(), 3);
+        runtime.WaitFor("queued initial starts", [&] { return !queue.empty(); });
+        runtime.GetAppData(0).FeatureFlags.SetEnablePacedBackupExport(false);
+        const auto backupStarts = GetCumulativeCounter(runtime, hive, NHive::COUNTER_BOOT_BACKUP_STARTED);
+        queue.Stop().Unblock();
+        runtime.WaitFor("admitted initial start", [&] { return !boots.empty(); });
+        runtime.SimulateSleep(TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(boots.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BOOT_BACKUP_IN_FLIGHT), 1);
+
+        auto lost = std::move(boots.front());
+        boots.pop_front();
+        auto failure = IEventHandle::ForwardOnNondelivery(
+            std::unique_ptr<IEventHandle>(lost.Release()), TEvents::TEvUndelivered::ReasonActorUnknown);
+        UNIT_ASSERT(failure);
+        runtime.Send(failure.release());
+        boots.Stop().Unblock();
+        for (auto id : tablets) {
+            MakeSureTabletIsUp(runtime, id, 0);
+            UNIT_ASSERT(!GetHiveTabletInfo(runtime, hive, id, edge).GetInitialBootPending());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, hive, NHive::COUNTER_BOOT_BACKUP_STARTED) - backupStarts, 4);
+        const auto ordinaryStarts = GetCumulativeCounter(runtime, hive, NHive::COUNTER_BOOT_RESTART_STARTED);
+        auto legacy = MakeHolder<TEvHive::TEvCreateTablet>(owner, 200, TTabletTypes::Dummy, BINDED_CHANNELS);
+        legacy->Record.SetIsBackup(true);
+        const auto id = SendCreateTestTablet(runtime, hive, owner, std::move(legacy), 0, true);
+        UNIT_ASSERT(!GetHiveTabletInfo(runtime, hive, id, edge).GetInitialBootPending());
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, hive, NHive::COUNTER_BOOT_RESTART_STARTED) - ordinaryStarts, 1);
+    }
+
+    Y_UNIT_TEST(TestPacedInitialBootMakesProgressWithWaitingFollowers) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxBootBatchSize(1);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, 301, TTabletTypes::Dummy, BINDED_CHANNELS);
+        create->Record.SetIsBackup(true);
+        auto* follower = create->Record.AddFollowerGroups();
+        follower->SetFollowerCount(1);
+        follower->SetLocalNodeOnly(true);
+        const auto tablet = SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, false);
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            runtime.SendToPipe(hive, edge, new TEvHive::TEvRequestHiveInfo(tablet, true), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvResponseHiveInfo>(edge);
+            const auto& tablets = reply->Get()->Record.GetTablets();
+            return tablets.size() == 2 && AllOf(tablets, [](const auto& item) {
+                return item.GetVolatileState() == NKikimrHive::TABLET_VOLATILE_STATE_RUNNING;
+            });
+        }), "a follower waiting for its first leader consumed each scan before the initial boot queue was considered");
+    }
+
     std::optional<bool> ReadPileDrain(TTestActorRuntime& runtime, ui64 hiveTablet, const TActorId& sender, ui32 pile) {
         auto query = MakeHolder<TEvTablet::TEvLocalMKQL>();
         query->Record.MutableProgram()->MutableProgram()->SetText(TStringBuilder()
