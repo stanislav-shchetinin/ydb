@@ -14,6 +14,8 @@ class TTxCreateTablet : public TTransactionBase<THive> {
     ui64 OwnerIdx;
     TVector<ui64> BatchIndices;
     THashSet<ui64> ConflictingBindings;
+    ui32 MatchedReplays = 0;
+    ui32 ConflictingReplays = 0;
     THolder<TEvHive::TEvCreateTabletReply> BatchReply;
     TInstant ReceivedAt;
     const TTabletTypes::EType TabletType;
@@ -339,6 +341,7 @@ public:
             }
         }
         if (!BatchIndices.empty()) {
+            MatchedReplays = ConflictingReplays = 0;
             BatchReply = MakeHolder<TEvHive::TEvCreateTabletReply>();
             BatchReply->Record.SetOwner(OwnerId);
             BatchReply->Record.SetOrigin(Self->TabletID());
@@ -378,9 +381,11 @@ public:
                     if (existing && (existing->SeizedByChild || existing->NeedToReleaseFromParent)) {
                         ReplyToSender(NKikimrProto::TRYLATER);
                     } else if (!existing || !MatchesCreateParameters(*existing)) {
+                        ++ConflictingReplays;
                         ErrorReason = NKikimrHive::ERROR_REASON_CREATE_PARAMETERS_MISMATCH;
                         ReplyToSender(NKikimrProto::ERROR);
                     } else {
+                        ++MatchedReplays;
                         ReplyToSender(NKikimrProto::OK);
                     }
                     return;
@@ -719,6 +724,9 @@ public:
             {"tabletId", TabletId},
             {"sideEffects", SideEffects});
         if (!BatchIndices.empty()) {
+            auto& outcomes = Self->TabletCounters->Cumulative();
+            outcomes[NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED].Increment(MatchedReplays);
+            outcomes[NHive::COUNTER_CREATE_BATCH_REPLAY_CONFLICT].Increment(ConflictingReplays);
             auto& counters = Self->TabletCounters->Percentile();
             counters[NHive::COUNTER_CREATE_TABLET_BATCH_SIZE].IncrementFor(BatchIndices.size());
             counters[NHive::COUNTER_CREATE_TABLET_BATCH_DURATION_MS].IncrementFor((ctx.Now() - ReceivedAt).MilliSeconds());

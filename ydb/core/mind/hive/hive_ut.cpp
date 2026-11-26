@@ -2508,6 +2508,16 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         if (objectDomain) {
             createTablet1->Record.MutableObjectDomain()->CopyFrom(objectDomain);
         }
+        createTablet1->Record.AddAllowedNodeIDs(runtime.GetNodeId(1));
+        createTablet1->Record.SetBalancerPolicy(NKikimrHive::POLICY_IGNORE);
+        auto* category = createTablet1->Record.MutableTabletCategory();
+        category->SetTabletCategoryID(491);
+        category->SetMaxDisconnectTimeout(31);
+        auto* follower = createTablet1->Record.AddFollowerGroups();
+        follower->SetLocalNodeOnly(true);
+        follower->AddAllowedNodeIDs(runtime.GetNodeId(1));
+        createTablet1->Record.MutableDataCentersPreference()->AddDataCentersGroups()->AddDataCenter("1");
+        auto retry = createTablet1->Record;
         ui64 tabletId1 = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createTablet1), 0, true);
 
         MakeSureTabletIsUp(runtime, tabletId1, 0); // tablet up in root hive
@@ -2564,12 +2574,11 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         for (ui32 node = 0; node < 2; ++node) {
             runtime.GetAppData(node).FeatureFlags.SetEnablePacedBackupExport(true);
         }
-        auto retry = TEvHive::TEvCreateTablet(testerTablet, 1, TTabletTypes::Dummy, BINDED_CHANNELS).Record;
-        retry.SetCount(1);
-        *retry.AddAllowedDomains() = subdomainKey;
         if (objectDomain) {
-            *retry.MutableObjectDomain() = objectDomain;
+            // The child must also recognize the original parameters after loading its own database.
+            RebootTablet(runtime, subHiveTablet, runtime.AllocateEdgeActor());
         }
+        retry.SetCount(1);
         for (const ui64 target : {hiveTablet, subHiveTablet}) {
             auto request = MakeHolder<TEvHive::TEvCreateTablet>();
             request->Record = retry;
@@ -2586,6 +2595,17 @@ Y_UNIT_TEST_SUITE(THiveTest) {
                 UNIT_ASSERT_VALUES_EQUAL(result.GetTabletID(), tabletId1);
             }
         }
+
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED), 1);
+        auto conflicting = MakeHolder<TEvHive::TEvCreateTablet>();
+        conflicting->Record = retry;
+        conflicting->Record.SetObjectId(retry.GetObjectId() + 1);
+        runtime.SendToPipe(subHiveTablet, sender, conflicting.Release(), 0, GetPipeConfigWithRetries());
+        const auto& conflict = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(handle)->Record;
+        UNIT_ASSERT_VALUES_EQUAL(conflict.ResultsSize(), 1);
+        UNIT_ASSERT_EQUAL(conflict.GetResults(0).GetErrorReason(), NKikimrHive::ERROR_REASON_CREATE_PARAMETERS_MISMATCH);
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_CONFLICT), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED), 1);
 
         if (!objectDomain) {
             // No IDs are available in the child Hive until its grant arrives.
@@ -15866,7 +15886,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             Owner = Runtime.AllocateEdgeActor(1);
         }
 
-        void Import(const TActorId& owner, ui32 cpu) {
+        void Import(const TActorId& owner, ui32 cpu, std::function<void(NKikimrHive::TTabletInfo&)> configure = {}) {
             // The normal producer excludes locked tablets; exercise the receiver directly.
             auto seize = MakeHolder<TEvHive::TEvSeizeTabletsReply>();
             auto* tablet = seize->Record.AddTablets();
@@ -15884,6 +15904,9 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             tablet->MutableResourceUsage()->SetCPU(cpu);
             tablet->MutableResourceUsage()->SetMemory(cpu * 10);
             tablet->MutableResourceUsage()->SetNetwork(cpu * 100);
+            if (configure) {
+                configure(*tablet);
+            }
             Runtime.SendToPipe(HiveTablet, Sender, seize.Release(), 0, GetPipeConfigWithRetries());
             auto release = Runtime.GrabEdgeEventRethrow<TEvHive::TEvReleaseTablets>(Sender, TDuration::Seconds(10));
             UNIT_ASSERT_C(release, "No release request after importing lock for " << owner);
@@ -15981,6 +16004,76 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             UNIT_ASSERT_EQUAL(response->Get()->Record.GetStatus(), expectedStatus);
         }
     };
+
+    Y_UNIT_TEST(TestRepeatedSeizeReplyKeepsFollowerIdentity) {
+        TSeizedLockedTabletTest test(false);
+        const auto addFollower = [&](NKikimrHive::TTabletInfo& info) {
+            auto* group = info.AddFollowerGroups();
+            group->SetFollowerCount(1);
+            group->AddAllowedNodeIDs(test.Runtime.GetNodeId(0));
+        };
+        test.Import(test.Owner, 100, addFollower);
+        const auto* tablet = test.Hive->FindTablet(test.TabletId);
+        UNIT_ASSERT(tablet);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->FollowerGroups.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->Followers.size(), 1);
+        const auto group = tablet->FollowerGroups.front().Id;
+        const auto follower = tablet->Followers.front().Id;
+
+        test.Import(test.Owner, 200, addFollower);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->FollowerGroups.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->Followers.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->FollowerGroups.front().Id, group);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->Followers.front().Id, follower);
+        test.CheckAccounting(test.Owner, 200);
+    }
+
+    Y_UNIT_TEST(TestLegacySeizeReplayKeepsPlacementInChild) {
+        TSeizedLockedTabletTest test(false);
+        const auto allowed = test.Runtime.GetNodeId(0);
+        const auto addOtherDomain = [](NKikimrHive::TTabletInfo& info) {
+            auto* domain = info.AddAllowedDomains();
+            *domain = info.GetObjectDomain();
+            domain->SetPathId(2);
+        };
+        test.Import(test.Owner, 100, [&](NKikimrHive::TTabletInfo& info) {
+            info.AddAllowedNodes(allowed);
+            *info.AddAllowedDomains() = info.GetObjectDomain();
+            addOtherDomain(info);
+            info.SetBalancerPolicy(NKikimrHive::POLICY_IGNORE);
+            info.MutableAllowedDataCenters()->AddDataCenter("west");
+            info.MutableDataCentersPreference()->AddDataCentersGroups()->AddDataCenter("west");
+            info.MutablePlacementCategory()->SetTabletCategoryID(42);
+        });
+        // Older parents omit placement settings and remove the object domain from the allowlist.
+        test.Import(test.Owner, 200, addOtherDomain);
+        const auto* tablet = test.Hive->FindTablet(test.TabletId);
+        UNIT_ASSERT(tablet);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->NodeFilter.AllowedNodes.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->NodeFilter.AllowedNodes.front(), allowed);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->NodeFilter.AllowedDomains.size(), 2);
+        UNIT_ASSERT_EQUAL(tablet->NodeFilter.AllowedDomains.front(), tablet->ObjectDomain);
+        UNIT_ASSERT_EQUAL(tablet->BalancerPolicy, NKikimrHive::POLICY_IGNORE);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->NodeFilter.AllowedDataCenters.DataCenterSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->DataCentersPreference.DataCentersGroupsSize(), 1);
+        UNIT_ASSERT(tablet->Category);
+        UNIT_ASSERT_VALUES_EQUAL(tablet->Category->Id, 42);
+        test.CheckAccounting(test.Owner, 200);
+    }
+
+    Y_UNIT_TEST(TestBatchReplayWaitsForReleaseByParent) {
+        TSeizedLockedTabletTest test(false);
+        test.Runtime.GetAppData(0).FeatureFlags.SetEnablePacedBackupExport(true);
+        test.Import(test.Owner, 100);
+        // The sender received ReleaseTablets but has not acknowledged it yet.
+        const ui64 owner = MakeTabletID(false, 1);
+        auto replay = MakeHolder<TEvHive::TEvCreateTablet>(owner, 0, TTabletTypes::Dummy, BINDED_CHANNELS);
+        replay->Record.SetCount(1);
+        test.Runtime.SendToPipe(test.HiveTablet, test.Sender, replay.Release(), 0, GetPipeConfigWithRetries());
+        const auto reply = test.Runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(test.Sender);
+        UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.ResultsSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetResults(0).GetStatus(), NKikimrProto::TRYLATER);
+    }
 
     Y_UNIT_TEST(TestRepeatedSeizeReplyUpdatesLockedTabletMetrics) {
         for (bool metricsEnabled : {false, true}) {

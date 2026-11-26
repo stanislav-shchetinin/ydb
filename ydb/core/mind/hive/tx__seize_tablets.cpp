@@ -52,14 +52,7 @@ public:
         ui32 seizedTablets = 0;
         for (auto& [tabletId, tablet] : Self->Tablets) {
             if (IsMatch(tablet, request) && IsAbleToMigrate(tablet)) {
-                // to simplify migration we skip following fields:
-                // Schema::Tablet::Category - because nobody is using it now
-                // Schema::Tablet::ActorsToNotify - because it's volatile and we are going to restart the tablet
-                // Schema::Tablet::AllowedNodes - because nobody is using it now
-                // Schema::Tablet::AllowedDataCenters - because nobody is using it now
-
-                // we also skip current metrics state for followers
-
+                // Pending actor notifications are local to the former Hive.
                 TTabletId id = tabletId;
                 YDB_LOG_DEBUG("THive::TTxSeizeTablets::Execute migrating tablet",
                     {"logPrefix", GetLogPrefix()},
@@ -91,6 +84,18 @@ public:
                 tabletInfo.SetTabletStorageVersion(tablet.TabletStorageInfo->Version);
                 tabletInfo.SetConfirmedStorageVersion(tablet.ConfirmedStorageVersion);
                 tabletInfo.SetTabletBootMode(tablet.BootMode);
+                tabletInfo.SetBalancerPolicy(tablet.BalancerPolicy);
+                for (auto node : tablet.NodeFilter.AllowedNodes) {
+                    tabletInfo.AddAllowedNodes(node);
+                }
+                *tabletInfo.MutableAllowedDataCenters() = tablet.NodeFilter.AllowedDataCenters;
+                *tabletInfo.MutableDataCentersPreference() = tablet.DataCentersPreference;
+                if (tablet.Category) {
+                    auto* category = tabletInfo.MutablePlacementCategory();
+                    category->SetTabletCategoryID(tablet.Category->Id);
+                    category->SetMaxDisconnectTimeout(tablet.Category->MaxDisconnectTimeout);
+                    category->SetStickTogetherInDC(tablet.Category->StickTogetherInDC);
+                }
                 tablet.GetResourceValues().ToProto(tabletInfo.MutableResourceUsage());
                 if (tablet.IsBackup) {
                     tabletInfo.SetIsBackup(true);
@@ -101,9 +106,7 @@ public:
 
                 TVector<TSubDomainKey> allowedDomains = tabletRowset.GetValueOrDefault<Schema::Tablet::AllowedDomains>();
                 for (const auto& allowedDomain : allowedDomains) {
-                    if (allowedDomain != objectDomain) {
-                        tabletInfo.AddAllowedDomains()->CopyFrom(allowedDomain);
-                    }
+                    tabletInfo.AddAllowedDomains()->CopyFrom(allowedDomain);
                 }
 
                 auto tabletChannelRowset = db.Table<Schema::TabletChannel>().Range(tabletId).Select();
@@ -146,7 +149,11 @@ public:
                     followerGroup.SetAllowClientRead(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::AllowClientRead>());
                     followerGroup.SetRequireAllDataCenters(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::RequireAllDataCenters>());
                     followerGroup.SetLocalNodeOnly(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::LocalNodeOnly>());
-                    followerGroup.SetRequireAllDataCenters(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::RequireAllDataCenters>());
+                    for (auto node : tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::AllowedNodes>()) {
+                        followerGroup.AddAllowedNodeIDs(node);
+                    }
+                    const auto dcs = tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::NewAllowedDataCenterIds>();
+                    followerGroup.MutableAllowedDataCenters()->CopyFrom(dcs.GetDataCenter());
                     followerGroup.SetRequireDifferentNodes(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::RequireDifferentNodes>());
                     followerGroup.SetFollowerCountPerDataCenter(tabletFollowerGroupRowset.GetValueOrDefault<Schema::TabletFollowerGroup::FollowerCountPerDataCenter>());
                     if (!tabletFollowerGroupRowset.Next()) {
