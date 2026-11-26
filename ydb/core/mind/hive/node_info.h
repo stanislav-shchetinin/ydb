@@ -137,6 +137,8 @@ public:
 
         TCounterPtr NodeTabletsRunning;
         TCounterPtr NodeTabletsStarting;
+        std::array<TCounterPtr, BootClassCount> BootInFlight;
+        std::array<TCounterPtr, BootClassCount> BootStarted;
         TCounterPtr TabletsMovedToNode;
         TCounterPtr TabletsMovedFromNode;
     };
@@ -175,6 +177,8 @@ public:
     // The tablet, if any, that accounts for most of this node's usage and is therefore not moved
     // by the balancer. Diagnostics only.
     const TTabletInfo* GetPinnedTablet() const;
+
+    std::array<ui32, BootClassCount> StartingByClass{};
 
     ui32 GetTabletsScheduled() const {
         auto it = Tablets.find(TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_STARTING);

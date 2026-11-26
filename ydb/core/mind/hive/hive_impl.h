@@ -1,6 +1,7 @@
 #pragma once
 #include <bitset>
 #include <deque>
+#include <ydb/core/util/counted_leaky_bucket.h>
 #include <ydb/library/actors/core/interconnect.h>
 #include <ydb/core/base/hive.h>
 #include <ydb/core/base/reassign_tablets.h>
@@ -444,7 +445,18 @@ protected:
     std::unordered_map<TFullObjectId, TAggregateMetrics> ObjectToTabletMetrics;
     std::unordered_map<TTabletTypes::EType, TAggregateMetrics> TabletTypeToTabletMetrics;
 
-    TBootQueue BootQueue;
+    // Class indices are recovery (0), ordinary initial boot (1), backup initial boot (2).
+    std::array<TBootQueue, BootClassCount> BootQueues;
+    std::array<ui32, BootClassCount> StartingByClass{};
+    std::array<TCountedLeakyBucket, 2> BootQuota{};
+    EBootClass BootClass(const TTabletInfo& tablet) const;
+    bool CanScheduleBoot(const TNodeInfo& node, EBootClass bootClass) const;
+    size_t BootQueueSize() const;
+    size_t WaitQueueSize() const;
+    bool BootQueuesEmpty() const;
+    void UpdateBootClassCounters(TInstant now);
+    void ConfirmInitialBoot(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db);
+    const NKikimrConfig::THiveConfig::TBootAdmission& BootLimits(EBootClass bootClass) const;
     bool ProcessWaitQueueScheduled = false;
     bool ProcessBootQueueScheduled = false;
     bool ProcessPileDrainsScheduled = false;

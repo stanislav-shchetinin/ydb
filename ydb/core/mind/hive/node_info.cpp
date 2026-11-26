@@ -753,6 +753,11 @@ void TNodeInfo::CreateCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounte
     c.NodeUsageAvgCtr = counter("NodeUsageAvgCtr");
     c.NodeTabletsRunning = counter("NodeTabletsRunning");
     c.NodeTabletsStarting = counter("NodeTabletsStarting");
+    c.BootInFlight = {counter("RestartBoot/InFlight"), counter("InitialBoot/InFlight"), counter("BackupInitialBoot/InFlight")};
+    c.BootStarted = {counter("RestartBoot/Started", true), counter("InitialBoot/Started", true), counter("BackupInitialBoot/Started", true)};
+    for (size_t i = 0; i < StartingByClass.size(); ++i) {
+        c.BootInFlight[i]->Set(StartingByClass[i]);
+    }
     c.TabletsMovedToNode = counter("TabletsMovedToNode", true);
     c.TabletsMovedFromNode = counter("TabletsMovedFromNode", true);
 }

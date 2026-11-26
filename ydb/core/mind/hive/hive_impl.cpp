@@ -344,6 +344,70 @@ TInstant THive::GetAllowedBootingTime() {
     return result;
 }
 
+EBootClass THive::BootClass(const TTabletInfo& tablet) const {
+    if (tablet.IsLeader() && tablet.AsLeader().InitialBootPending) {
+        return tablet.IsBackup ? BackupBootClass : InitialBootClass;
+    }
+    return RestartBootClass;
+}
+
+const NKikimrConfig::THiveConfig::TBootAdmission& THive::BootLimits(EBootClass bootClass) const {
+    return bootClass == InitialBootClass ? CurrentConfig.GetOrdinaryInitialBoot() : CurrentConfig.GetBackupInitialBoot();
+}
+
+size_t THive::BootQueueSize() const {
+    return BootQueues[RestartBootClass].BootQueue.size() + BootQueues[InitialBootClass].BootQueue.size() + BootQueues[BackupBootClass].BootQueue.size();
+}
+
+size_t THive::WaitQueueSize() const {
+    return BootQueues[RestartBootClass].WaitQueue.size() + BootQueues[InitialBootClass].WaitQueue.size() + BootQueues[BackupBootClass].WaitQueue.size();
+}
+
+bool THive::BootQueuesEmpty() const {
+    return BootQueues[RestartBootClass].Empty() && BootQueues[InitialBootClass].Empty() && BootQueues[BackupBootClass].Empty();
+}
+
+bool THive::CanScheduleBoot(const TNodeInfo& node, EBootClass bootClass) const {
+    if (!node.IsAbleToScheduleTablet()) {
+        return false;
+    }
+    if (bootClass == RestartBootClass) {
+        return true;
+    }
+    const ui64 capacity = node.GetMaxTabletsScheduled();
+    const ui64 reserve = std::min<ui64>(capacity - 1, CurrentConfig.GetRestartBootReservedPerNode());
+    return node.StartingByClass[bootClass] < std::max<ui32>(1, BootLimits(bootClass).GetMaxInFlightPerNode())
+        && node.StartingByClass[InitialBootClass] + node.StartingByClass[BackupBootClass] < capacity - reserve;
+}
+
+void THive::ConfirmInitialBoot(TLeaderTabletInfo& tablet, NIceDb::TNiceDb& db) {
+    if (tablet.InitialBootPending && !tablet.IsBootingSuppressed()) {
+        tablet.InitialBootPending = false;
+        db.Table<Schema::Tablet>().Key(tablet.Id).Update<Schema::Tablet::InitialBootPending>(false);
+        tablet.InitiateFollowersBoot();
+        if (TabletCounters) {
+            TabletCounters->Cumulative()[tablet.IsBackup ? COUNTER_BOOT_BACKUP_READY : COUNTER_BOOT_INITIAL_READY].Increment(1);
+        }
+    }
+}
+
+void THive::UpdateBootClassCounters(TInstant now) {
+    if (!TabletCounters) {
+        return;
+    }
+    constexpr NHive::ESimpleCounters sizes[] = {COUNTER_BOOT_RESTART_QUEUE_SIZE, COUNTER_BOOT_INITIAL_QUEUE_SIZE, COUNTER_BOOT_BACKUP_QUEUE_SIZE};
+    constexpr NHive::ESimpleCounters ages[] = {COUNTER_BOOT_RESTART_OLDEST_MS, COUNTER_BOOT_INITIAL_OLDEST_MS, COUNTER_BOOT_BACKUP_OLDEST_MS};
+    constexpr NHive::ESimpleCounters slots[] = {COUNTER_BOOT_RESTART_IN_FLIGHT, COUNTER_BOOT_INITIAL_IN_FLIGHT, COUNTER_BOOT_BACKUP_IN_FLIGHT};
+    auto& counters = TabletCounters->Simple();
+    for (auto bootClass : {RestartBootClass, InitialBootClass, BackupBootClass}) {
+        const auto& queue = BootQueues[bootClass];
+        counters[sizes[bootClass]].Set(queue.BootQueue.size() + queue.WaitQueue.size());
+        const auto oldest = queue.Oldest();
+        counters[ages[bootClass]].Set(oldest && now > oldest ? (now - oldest).MilliSeconds() : 0);
+        counters[slots[bootClass]].Set(StartingByClass[bootClass]);
+    }
+}
+
 void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects) {
     TInstant now = TActivationContext::Now();
     if (WarmUp) {
@@ -360,121 +424,174 @@ void THive::ExecuteProcessBootQueue(NIceDb::TNiceDb&, TSideEffects& sideEffects)
     }
     YDB_LOG_DEBUG("Handle TEvPrivate::TEvProcessBootQueue:",
         {"logPrefix", GetLogPrefix()},
-        {"bootQueueSize", BootQueue.BootQueue.size()});
+        {"bootQueueSize", BootQueueSize()});
     THPTimer bootQueueProcessingTimer;
     if (ProcessWaitQueueScheduled) {
         YDB_LOG_DEBUG("ProcessBootQueue: processing wait queue",
             {"logPrefix", GetLogPrefix()},
-            {"waitQueueSize", BootQueue.WaitQueue.size()});
-        BootQueue.IncludeWaitQueue();
+            {"waitQueueSize", WaitQueueSize()});
+        for (auto& queue : BootQueues) {
+            queue.IncludeWaitQueue();
+        }
         ProcessWaitQueueScheduled = false;
     }
     ProcessBootQueueScheduled = false;
     ui64 processedItems = 0;
     ui64 tabletsStarted = 0;
     TInstant postponedStart;
-    TStackVec<TBootQueue::TBootQueueRecord> delayedTablets;
-    std::vector<TBootQueue::TBootQueueRecord> waitingTablets;
-    waitingTablets.reserve(std::min<size_t>(BootQueue.Size(), GetMaxBootBatchSize()));
-    while (!BootQueue.Empty() && processedItems < GetMaxBootBatchSize()) {
-        TBootQueue::TBootQueueRecord record = BootQueue.PopFromBootQueue();
-        YDB_LOG_TRACE("ProcessBootQueue: tablet has priority",
-            {"logPrefix", GetLogPrefix()},
-            {"tabletId", record.TabletId},
-            {"followerId", record.FollowerId},
-            {"priority", record.Priority});
-        ++processedItems;
-        TTabletInfo* tablet = FindTablet(record.TabletId, record.FollowerId);
-        if (tablet == nullptr) {
+    ui64 delayed = 0;
+    for (auto bootClass : {RestartBootClass, InitialBootClass, BackupBootClass}) {
+        if (processedItems >= GetMaxBootBatchSize()) {
+            break;
+        }
+        auto& queue = BootQueues[bootClass];
+        if (queue.Empty()) {
             continue;
         }
-        tablet->InWaitQueue = false;
-        if (tablet->IsAlive()) {
-            YDB_LOG_DEBUG("ProcessBootQueue: tablet already alive, skipping",
-                {"logPrefix", GetLogPrefix()},
-                {"tabletId", record.TabletId});
-            continue;
+        ui64 classProcessed = 0;
+        TCountedLeakyBucket* quota = nullptr;
+        if (bootClass != RestartBootClass) {
+            const auto& limits = BootLimits(bootClass);
+            const ui32 burst = std::max<ui32>(1, limits.GetBurst());
+            const ui32 rate = std::max<ui32>(1, limits.GetRatePerSecond());
+            const auto duration = TDuration::MicroSeconds(std::max<ui64>(1, ui64(burst) * 1000000 / rate));
+            quota = &BootQuota[bootClass - InitialBootClass];
+            if (quota->BucketSize != burst || quota->BucketDuration != duration) {
+                *quota = TCountedLeakyBucket(burst, duration, now);
+            }
+            quota->Update(now);
         }
-        if (tablet->IsReadyToStart(now)) {
-            TBestNodeResult bestNodeResult = FindBestNode(*tablet, record.SuggestedNodeId);
-            if (std::holds_alternative<TNodeInfo*>(bestNodeResult)) {
-                if (tablet->InitiateStart(std::get<TNodeInfo*>(bestNodeResult))) {
-                    ++tabletsStarted;
-                    continue;
-                }
-            } else {
-                if (std::holds_alternative<TTooManyTabletsStarting>(bestNodeResult)) {
-                    delayedTablets.push_back(record);
+        TStackVec<TBootQueue::TBootQueueRecord> delayedTablets;
+        std::vector<TBootQueue::TBootQueueRecord> waitingTablets;
+        while (!queue.Empty() && processedItems < GetMaxBootBatchSize()) {
+            if (quota) {
+                if (StartingByClass[bootClass] >= std::max<ui32>(1, BootLimits(bootClass).GetMaxInFlight())) {
                     break;
-                } else {
-                    if (std::holds_alternative<TNotEnoughResources>(bestNodeResult)) {
-                        NotEnoughResources = true;
-                    }
-                    tablet->NotifyOnRestart("boot delay", sideEffects);
-                    waitingTablets.push_back(record); // waiting for new node
-                    tablet->InWaitQueue = true;
-                    continue;
+                }
+                if (!quota->CanPush(1)) {
+                    // TCountedLeakyBucket coalesces refills below a quarter of a token.
+                    const double missing = std::max(0.25, 1.0 - quota->Available);
+                    const auto refill = now + TDuration::MicroSeconds(std::max<ui64>(1,
+                        std::ceil(missing * quota->BucketDuration.MicroSeconds() / quota->BucketSize)));
+                    postponedStart = postponedStart ? std::min(postponedStart, refill) : refill;
+                    break;
                 }
             }
-        } else {
-            TInstant tabletPostponedStart = tablet->PostponedStart;
-            YDB_LOG_DEBUG("ProcessBootQueue: tablet has postponed start",
+            auto record = queue.PopFromBootQueue();
+            YDB_LOG_TRACE("ProcessBootQueue: tablet has priority",
                 {"logPrefix", GetLogPrefix()},
                 {"tabletId", record.TabletId},
-                {"tabletPostponedStart", tabletPostponedStart});
-            if (tabletPostponedStart > now) {
-                if (postponedStart) {
-                    postponedStart = std::min(postponedStart, tabletPostponedStart);
+                {"followerId", record.FollowerId},
+                {"priority", record.Priority});
+            ++processedItems;
+            ++classProcessed;
+            TTabletInfo* tablet = FindTablet(record.TabletId, record.FollowerId);
+            if (tablet == nullptr) {
+                continue;
+            }
+            tablet->InWaitQueue = false;
+            if (tablet->IsAlive()) {
+                YDB_LOG_DEBUG("ProcessBootQueue: tablet already alive, skipping",
+                    {"logPrefix", GetLogPrefix()},
+                    {"tabletId", record.TabletId});
+                continue;
+            }
+            if (tablet->IsReadyToStart(now)) {
+                TBestNodeResult bestNodeResult = FindBestNode(*tablet, record.SuggestedNodeId);
+                if (std::holds_alternative<TNodeInfo*>(bestNodeResult)) {
+                    if (tablet->InitiateStart(std::get<TNodeInfo*>(bestNodeResult))) {
+                        if (quota) {
+                            quota->Push(now, 1);
+                        }
+                        constexpr NHive::ECumulativeCounters started[] = {COUNTER_BOOT_RESTART_STARTED, COUNTER_BOOT_INITIAL_STARTED, COUNTER_BOOT_BACKUP_STARTED};
+                        if (TabletCounters) {
+                            TabletCounters->Cumulative()[started[bootClass]].Increment(1);
+                            if (record.QueuedAt) {
+                                constexpr EPercentileCounters wait[] = {COUNTER_BOOT_RESTART_WAIT_MS, COUNTER_BOOT_INITIAL_WAIT_MS, COUNTER_BOOT_BACKUP_WAIT_MS};
+                                TabletCounters->Percentile()[wait[bootClass]].IncrementFor((now - record.QueuedAt).MilliSeconds());
+                            }
+                        }
+                        ++tabletsStarted;
+                        continue;
+                    }
                 } else {
-                    postponedStart = tabletPostponedStart;
+                    if (std::holds_alternative<TTooManyTabletsStarting>(bestNodeResult)) {
+                        delayedTablets.push_back(record);
+                        break;
+                    } else {
+                        if (std::holds_alternative<TNotEnoughResources>(bestNodeResult)) {
+                            NotEnoughResources = true;
+                        }
+                        tablet->NotifyOnRestart("boot delay", sideEffects);
+                        waitingTablets.push_back(record); // waiting for new node
+                        tablet->InWaitQueue = true;
+                        continue;
+                    }
+                }
+            } else {
+                TInstant tabletPostponedStart = tablet->PostponedStart;
+                YDB_LOG_DEBUG("ProcessBootQueue: tablet has postponed start",
+                    {"logPrefix", GetLogPrefix()},
+                    {"tabletId", record.TabletId},
+                    {"tabletPostponedStart", tabletPostponedStart});
+                if (tabletPostponedStart > now) {
+                    if (postponedStart) {
+                        postponedStart = std::min(postponedStart, tabletPostponedStart);
+                    } else {
+                        postponedStart = tabletPostponedStart;
+                    }
                 }
             }
+            if (tablet->IsBooting()) {
+                delayedTablets.push_back(record);
+            } else if (!(tablet->IsLeader() && tablet->AsLeader().IsBootingSuppressed())) {
+                tablet->InitiateStop(sideEffects, EHiveEventReason::BootQueue);
+            }
         }
-        if (tablet->IsBooting()) {
-            delayedTablets.push_back(record);
-        } else if (!(tablet->IsLeader() && tablet->AsLeader().IsBootingSuppressed())) {
-            tablet->InitiateStop(sideEffects, EHiveEventReason::BootQueue);
+        if ((classProcessed && waitingTablets.size() == classProcessed) || queue.WaitQueue.empty()) {
+            queue.ExcludeWaitQueue();
+        }
+        delayed += delayedTablets.size();
+        for (auto record : delayedTablets) {
+            record.Priority -= 1;
+            queue.AddToBootQueue(record);
+        }
+        for (auto record : waitingTablets) {
+            queue.AddToWaitQueue(record);
         }
     }
-    if (waitingTablets.size() == processedItems || BootQueue.WaitQueue.empty()) {
-        BootQueue.ExcludeWaitQueue();
-    }
-    for (TBootQueue::TBootQueueRecord record : delayedTablets) {
-        record.Priority -= 1;
-        BootQueue.AddToBootQueue(record);
-    }
-    for (auto& record : waitingTablets) {
-        BootQueue.AddToWaitQueue(record);
+    UpdateBootClassCounters(now);
+    if (postponedStart > now) {
+        PostponeProcessBootQueue(postponedStart - now);
     }
     if (TabletCounters != nullptr) {
-        UpdateCounterBootQueueSize(BootQueue.BootQueue.size());
-        TabletCounters->Simple()[NHive::COUNTER_WAITQUEUE_SIZE].Set(BootQueue.WaitQueue.size());
+        UpdateCounterBootQueueSize(BootQueueSize());
+        TabletCounters->Simple()[NHive::COUNTER_WAITQUEUE_SIZE].Set(WaitQueueSize());
         TabletCounters->Cumulative()[NHive::COUNTER_BOOTQUEUE_PROCESSED].Increment(1);
         TabletCounters->Cumulative()[NHive::COUNTER_BOOTQUEUE_TIME].Increment(ui64(1000000. * bootQueueProcessingTimer.PassedReset()));
     }
-    if (BootQueue.BootQueue.empty()) {
+    if (!BootQueueSize()) {
         YDB_LOG_DEBUG("ProcessBootQueue: boot queue empty",
             {"logPrefix", GetLogPrefix()},
-            {"waitQueueSize", BootQueue.WaitQueue.size()});
+            {"waitQueueSize", WaitQueueSize()});
     }
     if (processedItems > 0) {
         if (tabletsStarted > 0) {
             WarmUp = false;
         }
-        if (processedItems == delayedTablets.size() && postponedStart < now) {
+        // The next record may be a leader whose node just became available.
+        // Let the wait and normal queues alternate even with a one-record scan.
+        const bool hasNextWaiter = AnyOf(BootQueues, [](const auto& queue) { return queue.HasNextWaiter(); });
+        if (processedItems == delayed && postponedStart < now && !hasNextWaiter) {
             YDB_LOG_DEBUG("ProcessBootQueue: throttling boot queue",
                 {"logPrefix", GetLogPrefix()},
-                {"bootQueueSize", BootQueue.BootQueue.size()});
+                {"bootQueueSize", BootQueueSize()});
             return;
         }
-        if (processedItems == GetMaxBootBatchSize() && !BootQueue.Empty()) {
+        if (processedItems == GetMaxBootBatchSize() && !BootQueuesEmpty()) {
             YDB_LOG_DEBUG("ProcessBootQueue: rescheduling",
                 {"logPrefix", GetLogPrefix()});
             ProcessBootQueue();
-        } else if (postponedStart > now) {
-            YDB_LOG_DEBUG("ProcessBootQueue: postponing",
-                {"logPrefix", GetLogPrefix()});
-            PostponeProcessBootQueue(postponedStart - now);
         }
     }
 }
@@ -504,7 +621,7 @@ void THive::Handle(TEvPrivate::TEvPostponeProcessBootQueue::TPtr&) {
 void THive::ProcessBootQueue() {
     YDB_LOG_DEBUG("ProcessBootQueue:",
         {"logPrefix", GetLogPrefix()},
-        {"bootQueueSize", BootQueue.BootQueue.size()});
+        {"bootQueueSize", BootQueueSize()});
     if (!ProcessBootQueueScheduled) {
         YDB_LOG_TRACE("ProcessBootQueue: sending event",
             {"logPrefix", GetLogPrefix()});
@@ -528,7 +645,7 @@ void THive::PostponeProcessBootQueue(TDuration after) {
 void THive::ProcessWaitQueue() {
     YDB_LOG_DEBUG("ProcessWaitQueue:",
         {"logPrefix", GetLogPrefix()},
-        {"waitQueueSize", BootQueue.WaitQueue.size()});
+        {"waitQueueSize", WaitQueueSize()});
     ProcessWaitQueueScheduled = true;
     ProcessBootQueue();
 }
@@ -536,8 +653,14 @@ void THive::ProcessWaitQueue() {
 void THive::AddToBootQueue(TTabletInfo* tablet, TNodeId node) {
     tablet->UpdateWeight();
     tablet->BootState = BootStateBooting;
-    BootQueue.AddToBootQueue(*tablet, node);
-    UpdateCounterBootQueueSize(BootQueue.BootQueue.size());
+    const TInstant now = TlsActivationContext ? TlsActivationContext->Now() : TInstant();
+    const auto bootClass = BootClass(*tablet);
+    const bool paced = now && (bootClass != RestartBootClass || AppData()->FeatureFlags.GetEnablePacedBackupExport());
+    BootQueues[bootClass].AddToBootQueue(*tablet, node, paced ? now : TInstant());
+    if (paced) {
+        UpdateBootClassCounters(now);
+    }
+    UpdateCounterBootQueueSize(BootQueueSize());
 }
 
 void THive::Handle(TEvPrivate::TEvProcessPendingOperations::TPtr&) {
@@ -954,7 +1077,9 @@ void THive::BuildCurrentConfig() {
         SpreadNeighbours = false;
         ObjectDistributions.Disable();
     }
-    BootQueue.UpdateTabletBootQueuePriorities(CurrentConfig);
+    for (auto& queue : BootQueues) {
+        queue.UpdateTabletBootQueuePriorities(CurrentConfig);
+    }
 
     const bool lockedTabletsSendMetrics = CurrentConfig.GetLockedTabletsSendMetrics();
     if (previousLockedTabletsSendMetrics != lockedTabletsSendMetrics) {
@@ -1600,15 +1725,18 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet, TNodeId su
         return TNoNodeFound();
     }
 
+    const auto bootClass = BootClass(tablet);
     if (tablet.PreferredNodeId != 0) {
         TNodeInfo* node = FindNode(tablet.PreferredNodeId);
         if (node != nullptr) {
-            if (node->IsAlive() && node->IsAllowedToRunTablet(tablet) && node->IsAbleToScheduleTablet() && node->IsAbleToRunTablet(tablet)) {
+            if (node->IsAlive() && node->IsAllowedToRunTablet(tablet) && CanScheduleBoot(*node, bootClass) && node->IsAbleToRunTablet(tablet)) {
                 YDB_LOG_TRACE("[FBN] chose node because of preferred node",
                     {"logPrefix", GetLogPrefix()},
                     {"tablet", tablet},
                     {"nodeId", node->Id});
                 return node;
+            } else if (bootClass != RestartBootClass && node->IsAlive() && node->IsAllowedToRunTablet(tablet) && !CanScheduleBoot(*node, bootClass)) {
+                return TTooManyTabletsStarting();
             } else {
                 YDB_LOG_TRACE("[FBN] preferred node unavailable",
                     {"logPrefix", GetLogPrefix()},
@@ -1623,7 +1751,7 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet, TNodeId su
 
     if (suggestedNodeId != 0) {
         TNodeInfo* node = FindNode(suggestedNodeId);
-        if (node && node->IsAlive() && node->IsAllowedToRunTablet(tablet) && node->IsAbleToScheduleTablet() && node->IsAbleToRunTablet(tablet)) {
+        if (node && node->IsAlive() && node->IsAllowedToRunTablet(tablet) && CanScheduleBoot(*node, bootClass) && node->IsAbleToRunTablet(tablet)) {
             YDB_LOG_TRACE("[FBN] chose node because of suggested node",
                 {"logPrefix", GetLogPrefix()},
                 {"tablet", tablet},
@@ -1711,7 +1839,7 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet, TNodeId su
     for (auto& [_, nodeInfo] : Nodes) {
         if (nodeInfo.IsAlive()) {
             if (nodeInfo.IsAllowedToRunTablet(tablet, &debugState)) {
-                if (nodeInfo.IsAbleToScheduleTablet()) {
+                if (CanScheduleBoot(nodeInfo, bootClass)) {
                     if (nodeInfo.IsAbleToRunTablet(tablet, &debugState)) {
                         double usage = nodeInfo.GetNodeUsageForTablet(tablet, true, true);
                         selectedNodes.emplace_back(usage, &nodeInfo);
@@ -1732,7 +1860,7 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet, TNodeId su
                         {"tablet", tablet},
                         {"nodeId", nodeInfo.Id});
                     thereAreNodesWithManyStarts = true;
-                    if (GetBootStrategy() == NKikimrConfig::THiveConfig::HIVE_BOOT_STRATEGY_BALANCED) {
+                    if (bootClass == RestartBootClass && GetBootStrategy() == NKikimrConfig::THiveConfig::HIVE_BOOT_STRATEGY_BALANCED) {
                         tablet.BootState = BootStateTooManyStarting;
                         RecordTabletBootFailure(tablet, EHiveEventReason::TooManyStarting);
                         return TTooManyTabletsStarting();
@@ -2655,6 +2783,7 @@ void THive::FillTabletInfo(NKikimrHive::TEvResponseHiveInfo& response, ui64 tabl
         tabletInfo.MutableTabletOwner()->SetOwner(info->Owner.first);
         tabletInfo.MutableTabletOwner()->SetOwnerIdx(info->Owner.second);
         tabletInfo.SetGeneration(info->KnownGeneration);
+        tabletInfo.SetInitialBootPending(info->InitialBootPending);
         tabletInfo.MutableObjectDomain()->CopyFrom(info->ObjectDomain);
         if (info->BalancerPolicy != NKikimrHive::EBalancerPolicy::POLICY_BALANCE) {
             tabletInfo.SetBalancerPolicy(info->BalancerPolicy);
@@ -3109,14 +3238,14 @@ TResourceRawValues THive::GetDefaultResourceInitialMaximumValues() {
 }
 
 void THive::ProcessTabletBalancer() {
-    if (!ProcessTabletBalancerScheduled && !ProcessTabletBalancerPostponed && BootQueue.Empty()) {
+    if (!ProcessTabletBalancerScheduled && !ProcessTabletBalancerPostponed && BootQueuesEmpty()) {
         Schedule(GetBalancerCooldown(LastBalancerTrigger), new TEvPrivate::TEvProcessTabletBalancer());
         ProcessTabletBalancerScheduled = true;
     }
 }
 
 void THive::ProcessStorageBalancer() {
-    if (!ProcessStorageBalancerScheduled && BootQueue.Empty()) {
+    if (!ProcessStorageBalancerScheduled && BootQueuesEmpty()) {
         Schedule(GetBalancerCooldown(EBalancerType::Storage), new TEvPrivate::TEvProcessStorageBalancer());
         ProcessStorageBalancerScheduled = true;
     }
@@ -3507,7 +3636,7 @@ void THive::UpdateTotalResourceValues(
     TInstant now = TInstant::Now();
 
     if (LastResourceChangeReaction + GetResourceChangeReactionPeriod() < now) {
-        if (!BootQueue.Empty()) {
+        if (!BootQueuesEmpty()) {
             ProcessBootQueue();
         }
         ProcessTabletBalancer();
@@ -4775,6 +4904,7 @@ void THive::Handle(TEvNodeWardenStorageConfig::TPtr& ev) {
 }
 
 void THive::Handle(TEvPrivate::TEvUpdateBalanceCounters::TPtr&) {
+    UpdateBootClassCounters(TActivationContext::Now());
     THiveStats stats = GetStats();
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_SCATTER].Set(stats.Scatter * 100);
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_USAGE_MIN].Set(stats.MinUsage * 100);

@@ -13,12 +13,17 @@ TBootQueue::TBootQueueRecord::TBootQueueRecord(const TTabletInfo& tablet, double
 }
 
 void TBootQueue::AddToBootQueue(TBootQueueRecord record) {
+    if (record.QueuedAt) {
+        EnqueueTimes.insert(record.QueuedAt);
+    }
     BootQueue.push(record);
 }
 
-void TBootQueue::AddToBootQueue(const TTabletInfo &tablet, TNodeId node) {
+void TBootQueue::AddToBootQueue(const TTabletInfo &tablet, TNodeId node, TInstant queuedAt) {
     double priority = GetBootPriority(tablet);
-    BootQueue.emplace(tablet, priority, node);
+    TBootQueueRecord record(tablet, priority, node);
+    record.QueuedAt = queuedAt;
+    AddToBootQueue(record);
 }
 
 void TBootQueue::UpdateTabletBootQueuePriorities(const NKikimrConfig::THiveConfig& hiveConfig) {
@@ -42,6 +47,9 @@ TBootQueue::TBootQueueRecord TBootQueue::PopFromBootQueue() {
     TQueue& currentQueue = GetCurrentQueue();
     TBootQueueRecord record = currentQueue.top();
     currentQueue.pop();
+    if (record.QueuedAt) {
+        EnqueueTimes.erase(EnqueueTimes.find(record.QueuedAt));
+    }
     if (ProcessWaitQueue) {
         NextFromWaitQueue = !NextFromWaitQueue;
     }
@@ -49,6 +57,9 @@ TBootQueue::TBootQueueRecord TBootQueue::PopFromBootQueue() {
 }
 
 void TBootQueue::AddToWaitQueue(TBootQueueRecord record) {
+    if (record.QueuedAt) {
+        EnqueueTimes.insert(record.QueuedAt);
+    }
     WaitQueue.push(record);
 }
 

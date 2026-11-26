@@ -191,6 +191,30 @@ void TTabletInfo::ChangeVolatileState(EVolatileState state) {
         }
     }
     if (Node != nullptr) {
+        if (StartingClass && state != EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+            --Hive.StartingByClass[*StartingClass];
+            --Node->StartingByClass[*StartingClass];
+            if (Node->Counters) {
+                Node->Counters->BootInFlight[*StartingClass]->Set(Node->StartingByClass[*StartingClass]);
+            }
+            if (*StartingClass == RestartBootClass && state == EVolatileState::TABLET_VOLATILE_STATE_RUNNING
+                    && !GetLeader().IsLockedToActor() && !GetLeader().InitialBootPending && Hive.TabletCounters) {
+                Hive.TabletCounters->Cumulative()[COUNTER_BOOT_RESTART_READY].Increment(1);
+            }
+            StartingClass.reset();
+            if (!Hive.BootQueuesEmpty()) {
+                Hive.ProcessBootQueue();
+            }
+        }
+        if (!StartingClass && state == EVolatileState::TABLET_VOLATILE_STATE_STARTING) {
+            StartingClass = Hive.BootClass(*this);
+            ++Hive.StartingByClass[*StartingClass];
+            ++Node->StartingByClass[*StartingClass];
+            if (Node->Counters) {
+                Node->Counters->BootInFlight[*StartingClass]->Set(Node->StartingByClass[*StartingClass]);
+                Node->Counters->BootStarted[*StartingClass]->Inc();
+            }
+        }
         Node->OnTabletChangeVolatileState(this, state);
     }
     VolatileState = state;
@@ -287,14 +311,28 @@ bool TTabletInfo::IsPinnedToNode() const {
 }
 
 bool TTabletInfo::InitiateBoot(TNodeId node) {
-    if (IsStopped()) {
-        ChangeVolatileState(EVolatileState::TABLET_VOLATILE_STATE_BOOTING);
-        Hive.AddToBootQueue(this, node);
-        Hive.ProcessBootQueue();
-        return true;
-    } else {
+    if (!IsStopped()) {
         return false;
     }
+    if (IsFollower()) {
+        auto& suggestion = AsFollower().SuggestedNodeAfterInitialBoot;
+        if (GetLeader().InitialBootPending) {
+            // The follower can only start after the leader. Keep its placement hint
+            // until ConfirmInitialBoot admits the followers to the recovery queue.
+            if (node) {
+                suggestion = node;
+            }
+            return false;
+        }
+        const auto deferred = std::exchange(suggestion, 0);
+        if (!node) {
+            node = deferred;
+        }
+    }
+    ChangeVolatileState(EVolatileState::TABLET_VOLATILE_STATE_BOOTING);
+    Hive.AddToBootQueue(this, node);
+    Hive.ProcessBootQueue();
+    return true;
 }
 
 TActorId TTabletInfo::GetLocal() const {

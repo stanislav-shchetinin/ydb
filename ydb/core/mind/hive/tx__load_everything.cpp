@@ -546,6 +546,7 @@ public:
                 tablet.ChannelProfileReassignReason = tabletRowset.GetValueOrDefault<Schema::Tablet::ReassignReason>();
                 tablet.Statistics = tabletRowset.GetValueOrDefault<Schema::Tablet::Statistics>();
                 tablet.StoppedByTenant = tabletRowset.GetValueOrDefault<Schema::Tablet::StoppedByTenant>();
+                tablet.InitialBootPending = tabletRowset.GetValueOrDefault<Schema::Tablet::InitialBootPending>();
                 tablet.IsBackup = tabletRowset.GetValueOrDefault<Schema::Tablet::IsBackup>();
 
                 TDomainInfo* domain = Self->FindDomain(objectDomain);

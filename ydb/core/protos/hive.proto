@@ -535,6 +535,7 @@ message TTabletInfo {
     optional bool InWaitQueue = 25;
     optional bool IsBackup = 26 [default = false];
     optional uint32 ConfirmedStorageVersion = 27;
+    optional bool InitialBootPending = 28 [default = false];
     optional TTabletCategory PlacementCategory = 29;
     repeated uint32 AllowedNodes = 30;
     optional TDataCentersGroup AllowedDataCenters = 31;

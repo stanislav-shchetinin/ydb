@@ -117,6 +117,7 @@ public:
                 tablet->Statistics.SetLastAliveTimestamp(now.MilliSeconds());
                 if (tablet->IsLeader()) {
                     TLeaderTabletInfo& leader(tablet->AsLeader());
+                    Self->ConfirmInitialBoot(leader, db);
                     leader.KnownGeneration = Generation;
                     db.Table<Schema::Tablet>().Key(TabletId).Update(NIceDb::TUpdate<Schema::Tablet::LeaderNode>(tablet->NodeId),
                                                                     NIceDb::TUpdate<Schema::Tablet::KnownGeneration>(Generation),

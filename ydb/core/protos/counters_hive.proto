@@ -44,6 +44,15 @@ enum ESimpleCounters {
     COUNTER_SHRINK_HISTORY_TABLETS = 34 [(CounterOpts) = {Name: "ShrinkRemainingHistoryTablets"}];
     COUNTER_SHRINK_MOVE_DATA_INFLIGHT = 35 [(CounterOpts) = {Name: "ShrinkMoveDataInFlight"}];
     COUNTER_SHRINK_MOVE_DATA_QUEUED = 36 [(CounterOpts) = {Name: "ShrinkMoveDataQueued"}];
+    COUNTER_BOOT_RESTART_QUEUE_SIZE = 37 [(CounterOpts) = {Name: "RestartBoot/QueueSize"}];
+    COUNTER_BOOT_RESTART_OLDEST_MS = 38 [(CounterOpts) = {Name: "RestartBoot/OldestWaitingMs"}];
+    COUNTER_BOOT_RESTART_IN_FLIGHT = 39 [(CounterOpts) = {Name: "RestartBoot/InFlight"}];
+    COUNTER_BOOT_INITIAL_QUEUE_SIZE = 40 [(CounterOpts) = {Name: "InitialBoot/QueueSize"}];
+    COUNTER_BOOT_INITIAL_OLDEST_MS = 41 [(CounterOpts) = {Name: "InitialBoot/OldestWaitingMs"}];
+    COUNTER_BOOT_INITIAL_IN_FLIGHT = 42 [(CounterOpts) = {Name: "InitialBoot/InFlight"}];
+    COUNTER_BOOT_BACKUP_QUEUE_SIZE = 43 [(CounterOpts) = {Name: "BackupInitialBoot/QueueSize"}];
+    COUNTER_BOOT_BACKUP_OLDEST_MS = 44 [(CounterOpts) = {Name: "BackupInitialBoot/OldestWaitingMs"}];
+    COUNTER_BOOT_BACKUP_IN_FLIGHT = 45 [(CounterOpts) = {Name: "BackupInitialBoot/InFlight"}];
 }
 
 enum ECumulativeCounters {
@@ -69,6 +78,12 @@ enum ECumulativeCounters {
     COUNTER_SHRINK_MOVE_DATA_RETRIED = 19 [(CounterOpts) = {Name: "ShrinkMoveDataRetried"}];
     COUNTER_CREATE_BATCH_REPLAY_MATCHED = 20 [(CounterOpts) = {Name: "CreateTabletBatch/ReplayMatched"}];
     COUNTER_CREATE_BATCH_REPLAY_CONFLICT = 21 [(CounterOpts) = {Name: "CreateTabletBatch/ReplayConflict"}];
+    COUNTER_BOOT_RESTART_STARTED = 22 [(CounterOpts) = {Name: "RestartBoot/Started"}];
+    COUNTER_BOOT_INITIAL_STARTED = 23 [(CounterOpts) = {Name: "InitialBoot/Started"}];
+    COUNTER_BOOT_BACKUP_STARTED = 24 [(CounterOpts) = {Name: "BackupInitialBoot/Started"}];
+    COUNTER_BOOT_RESTART_READY = 25 [(CounterOpts) = {Name: "RestartBoot/Ready"}];
+    COUNTER_BOOT_INITIAL_READY = 26 [(CounterOpts) = {Name: "InitialBoot/Ready"}];
+    COUNTER_BOOT_BACKUP_READY = 27 [(CounterOpts) = {Name: "BackupInitialBoot/Ready"}];
 }
 
 enum EPercentileCounters {
@@ -138,6 +153,24 @@ enum EPercentileCounters {
         Ranges: { Value: 10 }, Ranges: { Value: 25 }, Ranges: { Value: 50 },
         Ranges: { Value: 100 }, Ranges: { Value: 250 }, Ranges: { Value: 500 },
         Ranges: { Value: 1000 }, Ranges: { Value: 5000 }
+    }];
+    COUNTER_BOOT_RESTART_WAIT_MS = 6 [(CounterOpts) = {
+        Name: "RestartBoot/WaitTimeMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 10 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
+        Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
+    }];
+    COUNTER_BOOT_INITIAL_WAIT_MS = 7 [(CounterOpts) = {
+        Name: "InitialBoot/WaitTimeMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 10 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
+        Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
+    }];
+    COUNTER_BOOT_BACKUP_WAIT_MS = 8 [(CounterOpts) = {
+        Name: "BackupInitialBoot/WaitTimeMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 10 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
+        Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
     }];
 }
 

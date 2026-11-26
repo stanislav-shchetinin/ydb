@@ -40,7 +40,7 @@ public:
     }
 
     TBootQueue& GetBootQueue() {
-        return BootQueue;
+        return BootQueues[0];
     }
 
     void MakeNodes(size_t numNodes) {
@@ -66,7 +66,7 @@ public:
             tablet.AssignDomains({1, 1}, {});
             tablet.Weight = RandomNumber<double>();
             tablet.ChangeVolatileState(TTabletInfo::EVolatileState::TABLET_VOLATILE_STATE_BOOTING);
-            BootQueue.AddToBootQueue(tablet, 0);
+            BootQueues[0].AddToBootQueue(tablet, 0);
         }
     }
 

@@ -351,11 +351,13 @@ public:
             tabletIndexFunction = [](const TTabletInfo& tablet) -> double { return tablet.GetFullTabletId().first * 100 + tablet.GetFullTabletId().second; };
         }
         if (WaitingOnly) {
-            tabletIdIndex.reserve(Self->BootQueue.WaitQueue.size());
-            for (const TBootQueue::TBootQueueRecord& rec : Self->BootQueue.WaitQueue.Container()) {
-                TTabletInfo* tablet = Self->FindTablet(rec.TabletId, rec.FollowerId);
-                if (tablet != nullptr) {
-                    tabletIdIndex.push_back({tabletIndexFunction(*tablet), tablet});
+            tabletIdIndex.reserve(Self->WaitQueueSize());
+            for (const auto& queue : Self->BootQueues) {
+                for (const TBootQueue::TBootQueueRecord& rec : queue.WaitQueue.Container()) {
+                    TTabletInfo* tablet = Self->FindTablet(rec.TabletId, rec.FollowerId);
+                    if (tablet != nullptr) {
+                        tabletIdIndex.push_back({tabletIndexFunction(*tablet), tablet});
+                    }
                 }
             }
         } else {
@@ -1811,8 +1813,8 @@ public:
 
         out << "<tr><td>" << "Nodes:" << "</td><td id='aliveNodes'>" << aliveNodes << "</td></tr>";
         out << "<tr><td>" << "Tablets:" << "</td><td id='runningTablets'>" << runningTablets << "</td></tr>";
-        out << "<tr><td>" << "Boot Queue:" << "</td><td id='bootQueue'>" << Self->BootQueue.BootQueue.size() << "</td></tr>";
-        out << "<tr><td>" << "Wait Queue:" << "</td><td id='waitQueue'>" << Self->BootQueue.WaitQueue.size() << "</td></tr>";
+        out << "<tr><td>" << "Boot Queue:" << "</td><td id='bootQueue'>" << Self->BootQueueSize() << "</td></tr>";
+        out << "<tr><td>" << "Wait Queue:" << "</td><td id='waitQueue'>" << Self->WaitQueueSize() << "</td></tr>";
         out << "<tr><td>" << "Hive Uptime:" << "</td><td id='hiveUptime'>" << GetDurationString(TActivationContext::Now() - Self->StartTime()) << "</td></tr>";
         out << "</table></div>";
         out << "<div style='width:180px'><table class='simple-table1'>";
@@ -3064,8 +3066,8 @@ public:
         jsonData["AliveNodes"] = aliveNodes;
         jsonData["ResourceTotal"] = GetResourceValuesJson(Self->TotalRawResourceValues);
         jsonData["ResourceVariance"] = GetResourceValuesJson(Self->GetStDevResourceValues());
-        jsonData["BootQueueSize"] = Self->BootQueue.BootQueue.size();
-        jsonData["WaitQueueSize"] = Self->BootQueue.WaitQueue.size();
+        jsonData["BootQueueSize"] = Self->BootQueueSize();
+        jsonData["WaitQueueSize"] = Self->WaitQueueSize();
         jsonData["HiveUptime"] = GetDurationString(TActivationContext::Now() - Self->StartTime());
         jsonData["Balancers"] = Self->GetBalancerProgressJson();
         jsonData["MaxUsage"] =  GetValueWithColoredGlyph(stats.MaxUsage, Self->GetMaxNodeUsageToKick()) ;
