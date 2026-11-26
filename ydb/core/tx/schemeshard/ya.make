@@ -288,6 +288,7 @@ SRCS(
     schemeshard_scheme_builders.cpp
     schemeshard_scheme_builders.h
     schemeshard_export.cpp
+    schemeshard_export_tablet_request.cpp
     schemeshard_export__cancel.cpp
     schemeshard_export__create.cpp
     schemeshard_export__forget.cpp
