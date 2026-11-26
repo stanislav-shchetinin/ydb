@@ -276,6 +276,7 @@ struct TSchemeShard::TExport::TTxCreate: public TSchemeShard::TXxport::TTxBase {
         }
 
         exportInfo->SanitizedToken = request.GetSanitizedToken();
+        exportInfo->Paced = exportInfo->Kind == TExportInfo::EKind::S3 && AppData()->FeatureFlags.GetEnablePacedBackupExport();
 
         NIceDb::TNiceDb db(txc.DB);
         Self->PersistCreateExport(db, *exportInfo);
@@ -512,6 +513,22 @@ private:
         Send(Self->SelfId(), MkDirPropose(Self, txId, exportInfo));
     }
 
+    void BeginCopyTables(TExportInfo& info, NIceDb::TNiceDb& db) {
+        if (info.Paced) {
+            if (!NExportPrepare::ReserveTablets(*Self, info, db, info.Issue)) {
+                info.State = EState::Cancelled;
+                info.EndTime = TAppData::TimeProvider->Now();
+                Self->EraseEncryptionKey(db, info);
+                return;
+            }
+            info.State = EState::PrepareCopyTables;
+            Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(info.Id));
+        } else {
+            info.State = EState::CopyTables;
+            AllocateTxId(info);
+        }
+    }
+
     void CopyTables(const TExportInfo& exportInfo, TTxId txId) {
         YDB_LOG_INFO("TExport::TTxProgress: CopyTables propose",
             {"info", exportInfo.ToString()},
@@ -519,7 +536,7 @@ private:
         );
 
         Y_ABORT_UNLESS(exportInfo.WaitTxId == InvalidTxId);
-        Send(Self->SelfId(), CopyTablesPropose(Self, txId, exportInfo));
+        Send(Self->SelfId(), CopyTablesPropose(Self, txId, exportInfo), 0, exportInfo.Paced ? exportInfo.Id : 0);
     }
 
     void TransferData(TExportInfo& exportInfo, ui32 itemIdx, TTxId txId) {
@@ -1097,6 +1114,27 @@ private:
         return output;
     }
 
+    void StartTransfers(const TExportInfo::TPtr& exportInfo, NIceDb::TNiceDb& db, const TActorContext& ctx) {
+        exportInfo->State = EState::Transferring;
+        exportInfo->WaitTxId = InvalidTxId;
+        TDeque<ui32> tables;
+        for (ui32 itemIdx : xrange(exportInfo->Items.size())) {
+            auto& item = exportInfo->Items[itemIdx];
+            item.State = EState::Transferring;
+            Self->PersistExportItemState(db, *exportInfo, itemIdx);
+
+            if (IsPathTypeTransferrable(item)) {
+                tables.emplace_back(itemIdx);
+            } else {
+                UploadScheme(*exportInfo, itemIdx, ctx);
+            }
+        }
+        exportInfo->PendingItems = std::move(tables);
+        for (ui32 itemIdx : exportInfo->PendingItems) {
+            AllocateTxId(*exportInfo, itemIdx);
+        }
+    }
+
     void Resume(TTransactionContext& txc, const TActorContext& ctx) {
         Y_ABORT_UNLESS(Self->Exports.contains(Id));
         TExportInfo::TPtr exportInfo = Self->Exports.at(Id);
@@ -1108,6 +1146,34 @@ private:
         NIceDb::TNiceDb db(txc.DB);
 
         switch (exportInfo->State) {
+        case EState::PrepareCopyTables:
+        case EState::ReleasingUnusedTablets:
+        case EState::CleaningPreparedTablets:
+            if (exportInfo->State == EState::CleaningPreparedTablets && exportInfo->WaitTxId != InvalidTxId) {
+                SubscribeTx(*exportInfo);
+            } else if (!Self->PreparedTabletDispatcher.IsDrained(Id)) {
+                Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(Id));
+            } else if (exportInfo->State == EState::ReleasingUnusedTablets) {
+                Self->PreparedTabletDispatcher.Forget(Id);
+                NExportPrepare::ReleaseReservations(*Self, *exportInfo, db);
+                StartTransfers(exportInfo, db, ctx);
+                Self->PersistExportState(db, *exportInfo);
+            } else if (exportInfo->State == EState::CleaningPreparedTablets) {
+                Self->PreparedTabletDispatcher.Forget(Id);
+                NExportPrepare::ReleaseReservations(*Self, *exportInfo, db);
+                exportInfo->State = EState::Cancelled;
+                exportInfo->EndTime = TAppData::TimeProvider->Now();
+                PersistExportStateAndNotify(exportInfo, db);
+                AuditLogExportEnd(*exportInfo, Self);
+            } else {
+                Self->PreparedTabletDispatcher.Forget(Id);
+                Self->TabletCounters->Percentile()[COUNTER_PREPARE_COPY_DURATION_MS].IncrementFor(
+                    (TAppData::TimeProvider->Now() - exportInfo->PrepareStarted).MilliSeconds());
+                exportInfo->State = EState::CopyTables;
+                Self->PersistExportState(db, *exportInfo);
+                AllocateTxId(*exportInfo);
+            }
+            break;
         case EState::CreateExportDir:
         case EState::CopyTables:
             if (exportInfo->WaitTxId == InvalidTxId) {
@@ -1311,6 +1377,7 @@ private:
         ui32 itemIdx;
         std::tie(id, itemIdx) = Self->TxIdToExport.at(txId);
         if (!Self->Exports.contains(id)) {
+            Self->TxIdToExport.erase(txId);
             YDB_LOG_ERROR("TExport::TTxProgress: OnModifyResult received unknown id",
                 {"id", id},
             );
@@ -1318,6 +1385,11 @@ private:
         }
 
         TExportInfo::TPtr exportInfo = Self->Exports.at(id);
+        if (ModifyResult->Cookie == id && exportInfo->Paced && exportInfo->State != EState::CopyTables
+                && record.GetStatus() == NKikimrScheme::StatusPreconditionFailed) {
+            Self->TxIdToExport.erase(txId);
+            return;
+        }
         NIceDb::TNiceDb db(txc.DB);
 
         if (record.GetStatus() != NKikimrScheme::StatusAccepted) {
@@ -1428,9 +1500,14 @@ private:
                     }
 
                     exportInfo->Issue = record.GetReason();
-                    exportInfo->State = EState::Cancelled;
-                    exportInfo->EndTime = TAppData::TimeProvider->Now();
-                    Self->EraseEncryptionKey(db, *exportInfo);
+                    if (exportInfo->Paced && exportInfo->State == EState::CopyTables) {
+                        exportInfo->State = EState::CleaningPreparedTablets;
+                        Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(exportInfo->Id));
+                    } else {
+                        exportInfo->State = EState::Cancelled;
+                        exportInfo->EndTime = TAppData::TimeProvider->Now();
+                        Self->EraseEncryptionKey(db, *exportInfo);
+                    }
                 }
 
                 Self->PersistExportState(db, *exportInfo);
@@ -1605,8 +1682,11 @@ private:
 
         Y_ABORT_UNLESS(exportInfo->State == EState::UploadExportMetadata);
         if (AnyOf(exportInfo->Items, &IsPathTypeTable)) {
-            exportInfo->State = EState::CopyTables;
-            AllocateTxId(*exportInfo);
+            BeginCopyTables(*exportInfo, db);
+            if (exportInfo->IsCancelled()) {
+                SendNotificationsIfFinished(exportInfo);
+                AuditLogExportEnd(*exportInfo, Self);
+            }
         } else {
             // None of the items is a table.
             for (ui32 i : xrange(exportInfo->Items.size())) {
@@ -1673,6 +1753,13 @@ private:
         NIceDb::TNiceDb db(txc.DB);
 
         switch (exportInfo->State) {
+        case EState::CleaningPreparedTablets:
+            if (txId != exportInfo->WaitTxId) {
+                return;
+            }
+            exportInfo->WaitTxId = InvalidTxId;
+            Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(exportInfo->Id));
+            break;
         case EState::CreateExportDir: {
             exportInfo->WaitTxId = InvalidTxId;
 
@@ -1691,8 +1778,7 @@ private:
                 // Persist modified metadata and new settings
                 Self->PersistExportMetadata(db, *exportInfo);
             } else if (AnyOf(exportInfo->Items, &IsPathTypeTable)) {
-                exportInfo->State = EState::CopyTables;
-                AllocateTxId(*exportInfo);
+                BeginCopyTables(*exportInfo, db);
             } else {
                 // None of the items is a table.
                 for (ui32 i : xrange(exportInfo->Items.size())) {
@@ -1717,23 +1803,12 @@ private:
                 return;
             }
 
-            exportInfo->State = EState::Transferring;
             exportInfo->WaitTxId = InvalidTxId;
-            TDeque<ui32> tables;
-            for (ui32 itemIdx : xrange(exportInfo->Items.size())) {
-                auto& item = exportInfo->Items[itemIdx];
-                item.State = EState::Transferring;
-                Self->PersistExportItemState(db, *exportInfo, itemIdx);
-
-                if (IsPathTypeTransferrable(item)) {
-                    tables.emplace_back(itemIdx);
-                } else {
-                    UploadScheme(*exportInfo, itemIdx, ctx);
-                }
-            }
-            exportInfo->PendingItems = std::move(tables);
-            for (ui32 itemIdx : exportInfo->PendingItems) {
-                AllocateTxId(*exportInfo, itemIdx);
+            if (exportInfo->Paced) {
+                exportInfo->State = EState::ReleasingUnusedTablets;
+                Send(Self->SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(exportInfo->Id));
+            } else {
+                StartTransfers(exportInfo, db, ctx);
             }
             break;
         }

@@ -1,0 +1,26 @@
+syntax = "proto2";
+
+import "ydb/core/protos/hive.proto";
+
+package NKikimrSchemeShard;
+
+// One durable row per bounded range. Addresses and settings are fixed before
+// the first send. A redirect only changes the Hive for the affected entry.
+message TPreparedBackupTabletBatch {
+    enum EState {
+        Pending = 0;
+        Created = 1;
+        Ready = 2;
+        Conflict = 3;
+        Deleted = 4;
+    }
+    message TTablet {
+        optional fixed64 Hive = 1;
+        optional fixed64 TabletId = 2;
+        optional EState State = 3;
+    }
+    optional fixed64 Hive = 1;
+    optional NKikimrHive.TEvCreateTablet Create = 2;
+    repeated TTablet Tablets = 3;
+    optional bool Retried = 4;
+}

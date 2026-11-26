@@ -92,6 +92,8 @@ void TSchemeShard::FromXxportInfo(NKikimrExport::TExport& exprt, const TExportIn
 
     switch (exportInfo.State) {
     case TExportInfo::EState::CreateExportDir:
+    case TExportInfo::EState::PrepareCopyTables:
+    case TExportInfo::EState::ReleasingUnusedTablets:
     case TExportInfo::EState::CopyTables:
     case TExportInfo::EState::UploadExportMetadata:
         exprt.SetProgress(Ydb::Export::ExportProgress::PROGRESS_PREPARING);
@@ -112,6 +114,7 @@ void TSchemeShard::FromXxportInfo(NKikimrExport::TExport& exprt, const TExportIn
         exprt.SetProgress(Ydb::Export::ExportProgress::PROGRESS_DONE);
         break;
 
+    case TExportInfo::EState::CleaningPreparedTablets:
     case TExportInfo::EState::Cancellation:
         FillIssues(exprt, exportInfo);
         exprt.SetProgress(Ydb::Export::ExportProgress::PROGRESS_CANCELLATION);
@@ -158,6 +161,7 @@ void TSchemeShard::PersistCreateExport(NIceDb::TNiceDb& db, const TExportInfo& e
         NIceDb::TUpdate<Schema::Exports::EnableChecksums>(exportInfo.EnableChecksums),
         NIceDb::TUpdate<Schema::Exports::EnablePermissions>(exportInfo.EnablePermissions),
         NIceDb::TUpdate<Schema::Exports::IncludeIndexData>(exportInfo.IncludeIndexData),
+        NIceDb::TUpdate<Schema::Exports::Paced>(exportInfo.Paced),
         NIceDb::TUpdate<Schema::Exports::PeerName>(exportInfo.PeerName),
         NIceDb::TUpdate<Schema::Exports::SanitizedToken>(exportInfo.SanitizedToken)
     );
@@ -191,6 +195,7 @@ void TSchemeShard::AddExport(const TExportInfo::TPtr& exportInfo) {
 }
 
 void TSchemeShard::PersistRemoveExport(NIceDb::TNiceDb& db, const TExportInfo& exportInfo) {
+    PreparedTabletDispatcher.Forget(exportInfo.Id);
     if (exportInfo.Uid) {
         ExportsByUid.erase(exportInfo.Uid);
     }

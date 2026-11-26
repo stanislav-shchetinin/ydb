@@ -2565,6 +2565,228 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         }
     }
 
+    Y_UNIT_TEST(PacedCopyRetriesFailedIndicesAndReusesTablets) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        TVector<NKikimrHive::TEvCreateTablet> requests;
+        auto requestObserver = Runtime().AddObserver<NKikimr::TEvHive::TEvCreateTablet>([&](auto& ev) {
+            if (ev->Get()->Record.GetIsBackup()) {
+                requests.push_back(ev->Get()->Record);
+            }
+        });
+        bool injected = false;
+        auto replyObserver = Runtime().AddObserver<NKikimr::TEvHive::TEvCreateTabletReply>([&](auto& ev) {
+            auto& record = ev->Get()->Record;
+            if (!injected && record.ResultsSize() == 2) {
+                auto* result = record.MutableResults(0);
+                result->SetStatus(NKikimrProto::TRYLATER);
+                result->ClearTabletID();
+                record.MutableResults()->SwapElements(0, 1);
+                injected = true;
+            }
+        });
+        const auto id = StartCompletionMarkerExport();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(id);
+        UNIT_ASSERT(injected);
+        UNIT_ASSERT_VALUES_EQUAL(requests.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(requests[0].GetCount(), 2);
+        UNIT_ASSERT(!requests[1].HasCount() && !requests[1].HasOwnerIdx());
+        UNIT_ASSERT_VALUES_EQUAL(requests[1].OwnerIdxsSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(requests[1].GetOwnerIdxs(0), requests[0].GetOwnerIdx());
+        UNIT_ASSERT_VALUES_EQUAL(requests[0].GetObjectId(), requests[1].GetObjectId());
+    }
+
+    Y_UNIT_TEST_TWIN(PacedCopyReplaysReservedRangeAfterSchemeShardRestart, ShrinkBatch) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        TVector<NKikimrHive::TEvCreateTablet> creates;
+        auto observer = Runtime().template AddObserver<NKikimr::TEvHive::TEvCreateTablet>([&](auto& ev) {
+            if (ev->Get()->Record.GetIsBackup()) {
+                creates.push_back(ev->Get()->Record);
+            }
+        });
+        TBlockEvents<NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult> committed(Runtime());
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("Hive created reserved tablets", [&] { return !committed.empty(); });
+        committed.Stop();
+        if (ShrinkBatch) {
+            Runtime().GetAppData().HiveConfig.SetMaxCreateTabletBatchSize(1);
+        }
+        RebootTablet(Runtime(), TTestTxConfig::SchemeShard, Runtime().AllocateEdgeActor());
+        committed.Unblock();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(id);
+        UNIT_ASSERT_VALUES_EQUAL(creates.size(), ShrinkBatch ? 3 : 2);
+        UNIT_ASSERT_VALUES_EQUAL(creates[0].GetCount(), 2);
+        if (ShrinkBatch) {
+            for (ui32 offset : xrange(2)) {
+                const auto& replay = creates[1 + offset];
+                UNIT_ASSERT(!replay.HasCount() && !replay.HasOwnerIdx());
+                UNIT_ASSERT_VALUES_EQUAL(replay.OwnerIdxsSize(), 1);
+                UNIT_ASSERT_VALUES_EQUAL(replay.GetOwnerIdxs(0), creates[0].GetOwnerIdx() + offset);
+                UNIT_ASSERT_VALUES_EQUAL(replay.GetObjectId(), creates[0].GetObjectId());
+            }
+        } else {
+            UNIT_ASSERT_VALUES_EQUAL(creates[0].SerializeAsString(), creates[1].SerializeAsString());
+        }
+    }
+
+    Y_UNIT_TEST(PacedCopySharesCreateWindowBetweenExports) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupCreateBatchesInFlightPerHive(1);
+        TBlockEvents<NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult> results(Runtime());
+        auto first = StartCompletionMarkerExport();
+        Runtime().WaitFor("first create occupies the slot", [&] { return !results.empty(); });
+        bool secondPreparing = false;
+        auto observer = Runtime().AddObserver<NKikimr::NSchemeShard::TEvPrivate::TEvDispatchPreparedTablets>([&](auto& ev) {
+            if (ev->Get()->ExportId == 102) {
+                secondPreparing = true;
+            }
+        });
+        TestExport(Runtime(), 102, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+                endpoint: "localhost:%d" scheme: HTTP
+                items { source_path: "/MyRoot/Table" destination_prefix: "second" }
+            }
+        )", S3Port()));
+        Runtime().WaitFor("second export has reserved its shards", [&] { return secondPreparing; });
+        Runtime().SimulateSleep(TDuration::MilliSeconds(25));
+        UNIT_ASSERT_VALUES_EQUAL(results.size(), 1);
+        results.Unblock(1);
+        Runtime().WaitFor("second export acquired the released slot", [&] { return !results.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(results.front()->Get()->Reply.ResultsSize(), 2);
+        results.Stop().Unblock();
+        for (ui64 id : {ui64(first), ui64(102)}) {
+            Env().TestWaitNotification(Runtime(), id);
+            TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        }
+    }
+
+    Y_UNIT_TEST(PacedCopyAmbiguousReplyCleansOnlyOwnedTablets) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        TBlockEvents<TEvHive::TEvCreateTablet> creates(Runtime(), [](auto& ev) {
+            return ev->Get()->Record.HasCount();
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("reserved backup range", [&] { return !creates.empty(); });
+        const auto range = creates.front()->Get()->Record;
+        auto existing = MakeHolder<TEvHive::TEvCreateTablet>();
+        existing->Record = range;
+        existing->Record.ClearCount();
+        existing->Record.SetIsBackup(false);
+        existing->Record.SetObjectId(range.GetObjectId() + 10);
+        const auto edge = Runtime().AllocateEdgeActor();
+        ForwardToTablet(Runtime(), TTestTxConfig::Hive, edge, existing.Release());
+        const auto original = Runtime().GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge)->Get()->Record;
+        UNIT_ASSERT_VALUES_EQUAL(original.GetStatus(), NKikimrProto::OK);
+
+        bool injected = false;
+        auto observer = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([&](auto& ev) {
+            auto& record = ev->Get()->Record;
+            if (record.ResultsSize() == 2) {
+                UNIT_ASSERT_VALUES_EQUAL(record.GetResults(0).GetStatus(), NKikimrProto::ERROR);
+                UNIT_ASSERT_VALUES_EQUAL(record.GetResults(1).GetStatus(), NKikimrProto::OK);
+                record.ClearResults(); // Hide both the conflict and the successful create.
+                injected = true;
+            }
+        });
+        creates.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        UNIT_ASSERT(injected);
+        const auto& tablets = Env().GetHiveState()->Tablets;
+        UNIT_ASSERT_VALUES_EQUAL(tablets.at({range.GetOwner(), range.GetOwnerIdx()}).TabletId, original.GetTabletID());
+        UNIT_ASSERT(!tablets.contains({range.GetOwner(), range.GetOwnerIdx() + 1}));
+    }
+
+    Y_UNIT_TEST(PacedCopyCancellationCleansCommittedBatch) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        TBlockEvents<NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult> committed(Runtime(), [](auto& ev) {
+            return ev->Get()->Reply.ResultsSize() > 0;
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("Hive created reserved tablets", [&] { return !committed.empty(); });
+        const auto reply = committed.front()->Get()->Reply;
+        UNIT_ASSERT_VALUES_EQUAL(reply.ResultsSize(), 2);
+        TestCancelExport(Runtime(), 102, "/MyRoot", id);
+        committed.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        for (const auto& entry : reply.GetResults()) {
+            UNIT_ASSERT(!Env().GetHiveState()->Tablets.contains({reply.GetOwner(), entry.GetOwnerIdx()}));
+        }
+    }
+
+    Y_UNIT_TEST_TWIN(PacedCancellationRejectsLateCopyProposal, ForgetFirst) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        TBlockEvents<TEvSchemeShard::TEvModifySchemeTransaction> proposal(Runtime(), [](const auto& ev) {
+            const auto& record = ev->Get()->Record;
+            return record.TransactionSize() == 1
+                && record.GetTransaction(0).GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateConsistentCopyTables;
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("export sent its copy proposal", [&] { return !proposal.empty(); });
+        const auto tx = proposal.front()->Get()->Record.GetTxId();
+        TestCancelExport(Runtime(), 102, "/MyRoot", id);
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        if (ForgetFirst) {
+            TestForgetExport(Runtime(), 103, "/MyRoot", id);
+            Env().TestWaitNotification(Runtime(), id);
+        }
+        TBlockEvents<TEvSchemeShard::TEvModifySchemeTransactionResult> result(Runtime(), [tx](const auto& ev) {
+            return ev->Get()->Record.GetTxId() == tx;
+        });
+        proposal.Stop().Unblock();
+        Runtime().WaitFor("delayed proposal received an answer", [&] { return !result.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(result.front()->Get()->Record.GetStatus(), NKikimrScheme::StatusPreconditionFailed);
+        result.Stop().Unblock();
+        if (!ForgetFirst) {
+            TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        }
+    }
+
+    Y_UNIT_TEST(PacedCopyCancellationWaitsForAcceptedCopy) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        THashSet<ui64> tablets;
+        auto created = Runtime().AddObserver<TEvHive::TEvCreateTabletReply>([&](const auto& ev) {
+            for (const auto& result : ev->Get()->Record.GetResults()) {
+                tablets.insert(result.GetTabletID());
+            }
+        });
+        TBlockEvents<TEvDataShard::TEvProposeTransaction> snapshot(Runtime(), [](const auto& ev) {
+            const auto& record = ev->Get()->Record;
+            if (record.GetTxKind() != NKikimrTxDataShard::TX_KIND_SCHEME) {
+                return false;
+            }
+            NKikimrTxDataShard::TFlatSchemeTransaction tx;
+            UNIT_ASSERT(tx.ParseFromString(record.GetTxBody()));
+            return tx.HasReceiveSnapshot();
+        });
+        const auto id = StartCompletionMarkerExport();
+        Runtime().WaitFor("CopyTable proposed snapshot to the destination", [&] { return !snapshot.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(tablets.size(), 2);
+        TestCancelExport(Runtime(), 102, "/MyRoot", id);
+        for (ui64 tablet : tablets) {
+            UNIT_ASSERT(Env().GetHiveState()->TabletIdToOwner.contains(tablet));
+        }
+        snapshot.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        TestForgetExport(Runtime(), 103, "/MyRoot", id);
+        Runtime().WaitFor("Cancelled copy dropped all allocated tablets", [&] {
+            return AllOf(tablets, [&](ui64 tablet) { return !Env().GetHiveState()->TabletIdToOwner.contains(tablet); });
+        });
+    }
+
     Y_UNIT_TEST(ShouldSucceedOnSingleShardTable) {
         RunS3({
             R"(

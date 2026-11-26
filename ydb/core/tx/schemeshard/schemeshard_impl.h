@@ -1,4 +1,5 @@
 #pragma once
+#include "schemeshard_export_prepare.h"
 
 #include "dedicated_pipe_pool.h"
 #include "olap/manager/manager.h"
@@ -1729,6 +1730,10 @@ public:
     THashMap<TString, TExportInfo::TPtr> ExportsByUid;
     TSet<std::pair<TInstant, ui64>> ExportsByTime;
     THashMap<TTxId, std::pair<ui64, ui32>> TxIdToExport;
+    NExportPrepare::TDispatcher PreparedTabletDispatcher;
+    THashMap<TPathId, std::pair<ui64, ui32>> PreparedBackupPaths;
+    void Handle(TEvPrivate::TEvDispatchPreparedTablets::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvPreparedTabletsResult::TPtr& ev, const TActorContext& ctx);
     THashMap<TTxId, THashSet<ui64>> TxIdToDependentExport;
     THashMap<TTxId, THashSet<TIndexBuildId>> TxIdToDependentIndexBuild;
     // This set is needed to kill all the running scheme uploaders on SchemeShard death.
@@ -1749,6 +1754,7 @@ public:
     static void EraseEncryptionKey(NIceDb::TNiceDb& db, TExportInfo& exportInfo); // Erases encryption key (if any) for the export after moving to the final state and persists it in the database
 
     struct TExport {
+        struct TTxPreparedTabletsResult;
         struct TTxCreate;
         struct TTxGet;
         struct TTxCancel;

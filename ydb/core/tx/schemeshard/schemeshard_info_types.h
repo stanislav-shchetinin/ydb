@@ -59,6 +59,7 @@
 #include <google/protobuf/util/message_differencer.h>
 
 #include <util/generic/guid.h>
+#include <util/generic/hash_multi_map.h>
 #include <util/generic/ptr.h>
 #include <util/generic/queue.h>
 #include <util/generic/set.h>
@@ -3862,6 +3863,9 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
         CopyTables = 3,
         Transferring = 4,
         UploadExportMetadata = 5,
+        PrepareCopyTables = 6,
+        CleaningPreparedTablets = 7,
+        ReleasingUnusedTablets = 8,
         Done = 240,
         Dropping = 241,
         Dropped = 242,
@@ -3893,6 +3897,7 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
         TTxId WaitTxId = InvalidTxId;
         TActorId SchemeUploader;
         TString Issue;
+        TVector<NKikimrSchemeShard::TPreparedBackupTabletBatch> PreparedTablets;
 
         TItem() = default;
 
@@ -3945,6 +3950,11 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
     bool EnableChecksums = false;
     bool EnablePermissions = false;
     bool IncludeIndexData = false;
+    bool Paced = false;
+    THashMultiMap<TPathId, ui32> PreparedItemsBySource;
+    THashSet<ui64> PreparedTabletIds;
+    TInstant PrepareStarted;
+    ui64 PendingCreateCount = 0; // Reconstructed from the batch rows on restart.
 
     NKikimrSchemeOp::TExportMetadata ExportMetadata;
     TActorId ExportMetadataUploader;
@@ -3982,7 +3992,8 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
     }
 
     bool IsPreparing() const {
-        return State == EState::CreateExportDir || State == EState::CopyTables || State == EState::UploadExportMetadata;
+        return State == EState::CreateExportDir || State == EState::PrepareCopyTables || State == EState::ReleasingUnusedTablets
+            || State == EState::CopyTables || State == EState::UploadExportMetadata;
     }
 
     bool IsWorking() const {
@@ -3998,7 +4009,7 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
     }
 
     bool IsCancelling() const {
-        return State == EState::Cancellation;
+        return State == EState::Cancellation || State == EState::CleaningPreparedTablets;
     }
 
     bool IsInProgress() const {
