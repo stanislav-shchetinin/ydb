@@ -138,6 +138,12 @@ message TEvCreateTablet {
 }
 
 message TEvLookupTablet {
+    message TBootKey {
+        optional uint64 OwnerIdx = 1;
+        optional fixed64 TabletID = 2;
+    }
+    // A bounded, read-only lookup of specific leader boot confirmations.
+    repeated TBootKey BootKeys = 3;
     optional fixed64 Owner = 1;
     optional uint64 OwnerIdx = 2;
 }
@@ -149,6 +155,7 @@ message TEvCreateTabletReply {
         optional fixed64 TabletID = 3;
         optional EErrorReason ErrorReason = 4;
         optional TForwardRequest ForwardRequest = 5;
+        optional bool InitialBootPending = 6;
     }
     repeated TResult Results = 8;
     optional NKikimrProto.EReplyStatus Status = 1;

@@ -1733,6 +1733,7 @@ public:
     NExportPrepare::TDispatcher PreparedTabletDispatcher;
     THashMap<TPathId, std::pair<ui64, ui32>> PreparedBackupPaths;
     void Handle(TEvPrivate::TEvDispatchPreparedTablets::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvRetryPreparedBootChecks::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvPreparedTabletsResult::TPtr& ev, const TActorContext& ctx);
     THashMap<TTxId, THashSet<ui64>> TxIdToDependentExport;
     THashMap<TTxId, THashSet<TIndexBuildId>> TxIdToDependentIndexBuild;

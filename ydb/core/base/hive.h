@@ -606,6 +606,9 @@ namespace NKikimr {
         struct TEvResponseHiveInfo : TEventPB<TEvResponseHiveInfo, NKikimrHive::TEvResponseHiveInfo, EvResponseHiveInfo> {};
 
         struct TEvLookupTablet : public TEventPB<TEvLookupTablet, NKikimrHive::TEvLookupTablet, EvLookupTablet> {
+            // A read for previously created tablets must survive changes to the create limit.
+            static constexpr ui32 MaxBootKeys = 32;
+
             TEvLookupTablet() = default;
 
             TEvLookupTablet(ui64 ownerId, ui64 ownerIdx) {

@@ -6,6 +6,8 @@
 #include <ydb/core/base/hive.h>
 #include <util/generic/xrange.h>
 
+#include <algorithm>
+
 namespace NKikimr::NSchemeShard::NExportPrepare {
 
 void PersistBatch(NIceDb::TNiceDb& db, ui64 exportId, ui32 item, ui32 index, const TBatch& data) {
@@ -156,8 +158,12 @@ static TMaybe<TWork> NextWork(TSchemeShard& ss, const TKey& key) {
     }
     const auto& batch = (*info)->Items.at(itemIdx).PreparedTablets.at(batchIdx);
     const bool cleanup = (*info)->State != TExportInfo::EState::PrepareCopyTables;
-    const ui32 limit = cleanup ? 1u : Max(1u, AppData()->HiveConfig.GetMaxCreateTabletBatchSize());
-    TWork work{id, itemIdx, batchIdx, 0, {}, cleanup, {}};
+    const bool checkBoot = !cleanup && std::none_of(batch.GetTablets().begin(), batch.GetTablets().end(),
+        [](const auto& slot) { return slot.GetState() == TBatch::Pending; });
+    const ui32 limit = cleanup ? 1u
+        : checkBoot ? TEvHive::TEvLookupTablet::MaxBootKeys
+        : Max(1u, AppData()->HiveConfig.GetMaxCreateTabletBatchSize());
+    TWork work{id, itemIdx, batchIdx, 0, {}, cleanup, checkBoot, {}};
     for (ui32 offset : xrange(batch.TabletsSize())) {
         const auto& slot = batch.GetTablets(offset);
         if (cleanup) {
@@ -165,7 +171,7 @@ static TMaybe<TWork> NextWork(TSchemeShard& ss, const TKey& key) {
             if (slot.GetState() == TBatch::Deleted || slot.GetState() == TBatch::Conflict || ss.ShardInfos.contains(shard)) {
                 continue;
             }
-        } else if (slot.GetState() != TBatch::Pending) {
+        } else if (slot.GetState() != (checkBoot ? TBatch::Created : TBatch::Pending)) {
             continue;
         }
         const ui64 hive = slot.HasHive() ? slot.GetHive() : batch.GetHive();
@@ -236,6 +242,13 @@ void TDispatcher::Pump(TSchemeShard& ss, const TActorContext& ctx) {
                     .ShardOwner = range.GetOwner(), .OwnerIdx = range.GetOwnerIdx() + offset,
                     .ObjectId = range.GetObjectId(), .TabletId = batch.GetTablets(offset).GetTabletId(),
                     .CurrentHive = ui64(ss.ResolveHive(info.DomainPathId))});
+            } else if (work->CheckBoot) {
+                TVector<std::pair<ui64, ui64>> tablets;
+                for (ui32 offset : work->Offsets) {
+                    tablets.emplace_back(range.GetOwnerIdx() + offset, batch.GetTablets(offset).GetTabletId());
+                }
+                request = CreateTabletBootCheck(ss.SelfId(), hive, range.GetOwner(), tablets);
+                ss.TabletCounters->Cumulative()[COUNTER_PREPARE_COPY_BOOT_CHECKS].Increment(1);
             } else {
                 const bool sparse = batch.GetRetried() || work->Offsets.size() != range.GetCount();
                 request = CreateTabletBatchRequest(ss.SelfId(), hive, range, work->Offsets, sparse);
@@ -274,6 +287,36 @@ const TWork* TDispatcher::Find(const TActorId& actor) const {
     return Workers.FindPtr(actor);
 }
 
+static constexpr auto RetryDelay = TDuration::MilliSeconds(250);
+
+void TDispatcher::ReleaseBootRetries(TSchemeShard& ss, TDeque<TKey>& waiting, ui32 limit, const TActorContext& ctx) {
+    while (limit && !waiting.empty()) {
+        const auto [id, item, batch] = waiting.front();
+        waiting.pop_front();
+        const auto* remaining = Remaining.FindPtr(id);
+        const auto* info = ss.Exports.FindPtr(id);
+        if (remaining && remaining->contains(std::pair{item, batch}) && info &&
+            (*info)->State == TExportInfo::EState::PrepareCopyTables) {
+            ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
+            --limit;
+        }
+    }
+}
+
+void TDispatcher::RetryBootChecks(TSchemeShard& ss, ui64 hive, const TActorContext& ctx) {
+    auto* waiting = WaitingBootRetries.FindPtr(hive);
+    if (!waiting) {
+        return;
+    }
+    const ui32 limit = Max(1u, AppData()->SchemeShardConfig.GetMaxBackupCreateBatchesInFlightPerHive());
+    ReleaseBootRetries(ss, *waiting, limit, ctx);
+    if (waiting->empty()) {
+        WaitingBootRetries.erase(hive);
+    } else {
+        ctx.Schedule(RetryDelay, new TEvPrivate::TEvRetryPreparedBootChecks(hive));
+    }
+}
+
 void TDispatcher::Finished(TSchemeShard& ss, const TActorId& actor, bool retry, const TActorContext& ctx) {
     const auto* work = Find(actor);
     if (!work) {
@@ -283,17 +326,29 @@ void TDispatcher::Finished(TSchemeShard& ss, const TActorId& actor, bool retry, 
     if (!--InFlight.at(work->Hive)) {
         InFlight.erase(work->Hive);
     }
-    if (!work->Delete) {
+    if (!work->Delete && !work->CheckBoot) {
         ss.TabletCounters->Simple()[COUNTER_BACKUP_CREATE_BATCHES_IN_FLIGHT].Sub(1);
         ss.TabletCounters->Percentile()[COUNTER_BACKUP_CREATE_ATTEMPT_TIME_US].IncrementFor((ctx.Now() - work->SentAt).MicroSeconds());
     }
+    const ui64 hive = work->Hive;
+    const bool checkBoot = work->CheckBoot;
     Workers.erase(actor);
     QueuedOrRunning.erase({id, item, batch});
-    auto* next = new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch);
-    if (retry) {
-        ctx.Schedule(TDuration::MilliSeconds(250), next);
+    const auto* info = ss.Exports.FindPtr(id);
+    if (!retry) {
+        ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
+        if (auto* waiting = checkBoot ? WaitingBootRetries.FindPtr(hive) : nullptr) {
+            // Drain already-booted leaders at the speed of their replies.
+            ReleaseBootRetries(ss, *waiting, 1, ctx);
+        }
+    } else if (checkBoot && info && (*info)->State == TExportInfo::EState::PrepareCopyTables) {
+        auto [it, inserted] = WaitingBootRetries.try_emplace(hive);
+        it->second.emplace_back(id, item, batch);
+        if (inserted) {
+            ctx.Schedule(RetryDelay, new TEvPrivate::TEvRetryPreparedBootChecks(hive));
+        }
     } else {
-        ctx.Send(ss.SelfId(), next);
+        ctx.Schedule(RetryDelay, new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
     }
     Pump(ss, ctx);
 }
@@ -312,6 +367,10 @@ void TDispatcher::Shutdown(const TActorContext& ctx) {
 } // namespace NKikimr::NSchemeShard::NExportPrepare
 
 namespace NKikimr::NSchemeShard {
+
+void TSchemeShard::Handle(TEvPrivate::TEvRetryPreparedBootChecks::TPtr& ev, const TActorContext& ctx) {
+    PreparedTabletDispatcher.RetryBootChecks(*this, ev->Get()->Hive, ctx);
+}
 
 void TSchemeShard::Handle(TEvPrivate::TEvDispatchPreparedTablets::TPtr& ev, const TActorContext& ctx) {
     const auto& msg = *ev->Get();
@@ -355,6 +414,7 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
         using TEvent = TEvPrivate::TEvPreparedTabletsResult;
         const auto& result = *Event->Get();
         TString failure;
+        bool changed = !work->CheckBoot;
         if (result.Status == TEvent::EStatus::Retry) {
             Retry = true;
         } else if (result.Status == TEvent::EStatus::Error) {
@@ -374,12 +434,28 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
                 auto& slot = *batch.MutableTablets(entry.GetOwnerIdx() - batch.GetCreate().GetOwnerIdx());
                 switch (entry.GetStatus()) {
                 case NKikimrProto::OK:
+                    if (work->CheckBoot) {
+                        if (info.State == TExportInfo::EState::PrepareCopyTables) {
+                            if (entry.GetInitialBootPending()) {
+                                Retry = true;
+                            } else {
+                                changed = true;
+                                slot.SetState(TBatch::Ready);
+                                --info.WaitingForBoot;
+                                Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_WAITING_BOOT].Sub(1);
+                                Self->TabletCounters->Cumulative()[COUNTER_PREPARE_COPY_READY].Increment(1);
+                            }
+                        }
+                        break;
+                    }
                     if (!info.PreparedTabletIds.insert(entry.GetTabletID()).second) {
                         failure = "Hive returned the same tablet ID for multiple reserved shards";
                         break;
                     }
                     if (info.State == TExportInfo::EState::PrepareCopyTables && slot.GetState() == TBatch::Pending) {
                         --info.PendingCreateCount;
+                        ++info.WaitingForBoot;
+                        Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_WAITING_BOOT].Add(1);
                         Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Sub(1);
                         Self->TabletCounters->Cumulative()[COUNTER_PREPARE_COPY_CREATED].Increment(1);
                     }
@@ -388,6 +464,7 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
                     slot.SetHive(work->Hive);
                     break;
                 case NKikimrProto::INVALID_OWNER:
+                    changed |= slot.GetHive() != entry.GetForwardRequest().GetHiveTabletId();
                     slot.SetHive(entry.GetForwardRequest().GetHiveTabletId());
                     break;
                 case NKikimrProto::TRYLATER:
@@ -403,9 +480,12 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
             }
         }
         NIceDb::TNiceDb db(txc.DB);
-        batch.SetRetried(true);
-        NExportPrepare::PersistBatch(db, work->ExportId, work->Item, work->Batch, batch);
+        if (changed) {
+            batch.SetRetried(true);
+            NExportPrepare::PersistBatch(db, work->ExportId, work->Item, work->Batch, batch);
+        }
         if (failure && info.State == TExportInfo::EState::PrepareCopyTables) {
+            Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_WAITING_BOOT].Sub(std::exchange(info.WaitingForBoot, 0));
             Self->TabletCounters->Simple()[COUNTER_PREPARE_COPY_PENDING_METADATA].Sub(std::exchange(info.PendingCreateCount, 0));
             info.Issue = TStringBuilder() << "Failed to prepare backup tablets: " << failure;
             info.State = TExportInfo::EState::CleaningPreparedTablets;

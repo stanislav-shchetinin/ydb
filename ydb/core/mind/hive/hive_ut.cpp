@@ -13195,6 +13195,66 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT(!GetHiveTabletInfo(runtime, hive, tablet, edge).GetInitialBootPending());
     }
 
+    Y_UNIT_TEST(TestPacedLookupReadsCommittedBootStateByIdentity) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) { app.FeatureFlags.SetEnablePacedBackupExport(true); });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        const auto ready = SendCreateTestTablet(runtime, hive, owner,
+            MakeHolder<TEvHive::TEvCreateTablet>(owner, 41, TTabletTypes::Dummy, BINDED_CHANNELS), 0, true);
+        TBlockEvents<TEvLocal::TEvBootTablet> boots(runtime, [](const auto& ev) {
+            return ev->Get()->Record.GetInfo().GetTabletType() == TTabletTypes::Dummy;
+        });
+        auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, 42, TTabletTypes::Dummy, BINDED_CHANNELS);
+        create->Record.SetIsBackup(true);
+        runtime.SendToPipe(hive, edge, create.Release(), 0, GetPipeConfigWithRetries());
+        const auto created = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+        const ui64 pending = created->Get()->Record.GetTabletID();
+        UNIT_ASSERT(pending);
+        runtime.WaitFor("pending initial boot", [&] { return !boots.empty(); });
+        auto read = [&](TVector<std::pair<ui64, ui64>> keys) {
+            auto req = MakeHolder<TEvHive::TEvLookupTablet>();
+            req->Record.SetOwner(owner);
+            for (auto [idx, id] : keys) {
+                auto& key = *req->Record.AddBootKeys();
+                key.SetOwnerIdx(idx);
+                key.SetTabletID(id);
+            }
+            runtime.SendToPipe(hive, edge, req.Release(), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+            return reply->Get()->Record;
+        };
+        const auto observed = read({{41, ready}, {42, pending}, {99, ready}});
+        UNIT_ASSERT_VALUES_EQUAL(observed.GetOrigin(), hive);
+        UNIT_ASSERT_VALUES_EQUAL(observed.ResultsSize(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(observed.GetResults(0).GetStatus(), NKikimrProto::OK);
+        UNIT_ASSERT(observed.GetResults(0).HasInitialBootPending() && !observed.GetResults(0).GetInitialBootPending());
+        UNIT_ASSERT_VALUES_EQUAL(observed.GetResults(1).GetStatus(), NKikimrProto::OK);
+        UNIT_ASSERT(observed.GetResults(1).GetInitialBootPending());
+        UNIT_ASSERT_VALUES_EQUAL(observed.GetResults(2).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT(!observed.GetResults(2).HasTabletID());
+        boots.Stop().Unblock();
+        MakeSureTabletIsUp(runtime, pending, 0);
+        RebootTablet(runtime, hive, edge);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        runtime.GetAppData().FeatureFlags.SetEnablePacedBackupExport(false);
+        auto config = runtime.GetAppData().HiveConfig;
+        config.SetMaxCreateTabletBatchSize(0);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        const auto committed = read({{41, ready}, {42, pending}});
+        UNIT_ASSERT_VALUES_EQUAL(committed.ResultsSize(), 2);
+        for (const auto& entry : committed.GetResults()) {
+            UNIT_ASSERT_VALUES_EQUAL(entry.GetStatus(), NKikimrProto::OK);
+            UNIT_ASSERT(entry.HasInitialBootPending() && !entry.GetInitialBootPending());
+        }
+        const auto oversized = read(TVector<std::pair<ui64, ui64>>(TEvHive::TEvLookupTablet::MaxBootKeys + 1, {42, pending}));
+        UNIT_ASSERT_VALUES_EQUAL(oversized.GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(oversized.ResultsSize(), 0);
+    }
+
     Y_UNIT_TEST(TestPacedInitialBootRateAndBurst) {
         TTestBasicRuntime runtime(1, false);
         Setup(runtime, true, 1, [](TAppPrepare& app) {

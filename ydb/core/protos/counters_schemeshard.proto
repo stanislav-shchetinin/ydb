@@ -321,7 +321,7 @@ enum ESimpleCounters {
     COUNTER_CDC_AGGREGATOR_COUNT = 246 [(CounterOpts) = {Name: "CdcAggregators"}];
     COUNTER_PREPARE_COPY_PENDING_METADATA = 247 [(CounterOpts) = {Name: "PrepareCopyTable/PendingMetadata"}];
     COUNTER_BACKUP_CREATE_BATCHES_IN_FLIGHT = 248 [(CounterOpts) = {Name: "BackupCreate/RequestsInFlight"}];
-
+    COUNTER_PREPARE_COPY_WAITING_BOOT = 249 [(CounterOpts) = {Name: "PrepareCopyTable/WaitingForBoot"}];
 }
 
 enum ECumulativeCounters {
@@ -543,6 +543,8 @@ enum ECumulativeCounters {
     COUNTER_BACKUP_CREATE_BATCHES = 156 [(CounterOpts) = {Name: "BackupCreate/RequestsSent"}];
     COUNTER_BACKUP_CREATE_ITEMS = 157 [(CounterOpts) = {Name: "BackupCreate/ItemsSent"}];
     COUNTER_BACKUP_CREATE_SPARSE_BATCHES = 158 [(CounterOpts) = {Name: "BackupCreate/SparseRequests"}];
+    COUNTER_PREPARE_COPY_READY = 159 [(CounterOpts) = {Name: "PrepareCopyTable/Ready"}];
+    COUNTER_PREPARE_COPY_BOOT_CHECKS = 160 [(CounterOpts) = {Name: "PrepareCopyTable/BootChecks"}];
 }
 
 enum EPercentileCounters {
