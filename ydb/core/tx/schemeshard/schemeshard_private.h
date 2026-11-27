@@ -70,10 +70,16 @@ namespace TEvPrivate {
         EvPreparedTabletsResult,
         EvDispatchPreparedTablets,
         EvRetryPreparedBootChecks,
+        EvRetryBackupDelete,
         EvEnd
     };
 
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE), "expect EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE)");
+
+    struct TEvRetryBackupDelete : TEventLocal<TEvRetryBackupDelete, EvRetryBackupDelete> {
+        const ui64 Cookie;
+        explicit TEvRetryBackupDelete(ui64 cookie) : Cookie(cookie) {}
+    };
 
     struct TEvDispatchPreparedTablets : TEventLocal<TEvDispatchPreparedTablets, EvDispatchPreparedTablets> {
         const ui64 ExportId;
@@ -95,6 +101,7 @@ namespace TEvPrivate {
         TString Error;
         NKikimrHive::TEvCreateTabletReply Reply;
         NKikimrHive::TEvDeleteTabletReply DeleteReply;
+        bool SentDelete = false;
     };
 
     // This event is sent by a schemeshard to itself to signal that some tx state has changed

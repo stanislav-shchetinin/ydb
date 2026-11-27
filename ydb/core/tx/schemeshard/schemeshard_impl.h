@@ -936,6 +936,7 @@ public:
     static void PersistRemoveTxDependency(NIceDb::TNiceDb& db, TTxId opId, TTxId dependentOpId);
     void PersistUpdateTxShard(NIceDb::TNiceDb& db, TOperationId txId, TShardIdx shardIdx, ui32 operation);
     void PersistRemoveTxShard(NIceDb::TNiceDb& db, TOperationId txId, TShardIdx shardIdx);
+    void PersistBackupHive(NIceDb::TNiceDb& db, TShardIdx shard, TTabletId hive);
     void PersistShardMapping(NIceDb::TNiceDb& db, TShardIdx shardIdx, TTabletId tabletId, TPathId pathId, TTxId txId, TTabletTypes::EType type);
     void PersistAdoptedShardMapping(NIceDb::TNiceDb& db, TShardIdx shardIdx, TTabletId tabletId, ui64 prevOwner, TLocalShardIdx prevShardIdx);
     void PersistShardPathId(NIceDb::TNiceDb& db, TShardIdx shardIdx, TPathId pathId);
@@ -1734,6 +1735,7 @@ public:
     THashMap<TPathId, std::pair<ui64, ui32>> PreparedBackupPaths;
     void Handle(TEvPrivate::TEvDispatchPreparedTablets::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvRetryPreparedBootChecks::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvRetryBackupDelete::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvPreparedTabletsResult::TPtr& ev, const TActorContext& ctx);
     THashMap<TTxId, THashSet<ui64>> TxIdToDependentExport;
     THashMap<TTxId, THashSet<TIndexBuildId>> TxIdToDependentIndexBuild;

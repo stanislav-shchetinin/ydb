@@ -787,7 +787,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
         return true;
     }
 
-    typedef std::tuple<TShardIdx, TTabletId, TPathId, TTxId, TTabletTypes::EType> TShardsRec;
+    typedef std::tuple<TShardIdx, TTabletId, TPathId, TTxId, TTabletTypes::EType, TTabletId> TShardsRec;
     typedef TDeque<TShardsRec> TShardsRows;
 
     template <typename SchemaTable, typename TRowSet>
@@ -796,7 +796,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
             rowSet.template GetValue<typename SchemaTable::TabletId>(),
             pathId,
             rowSet.template GetValueOrDefault<typename SchemaTable::LastTxId>(InvalidTxId),
-            rowSet.template GetValue<typename SchemaTable::TabletType>()
+            rowSet.template GetValue<typename SchemaTable::TabletType>(),
+            rowSet.template GetValueOrDefault<typename SchemaTable::BackupHive>(InvalidTabletId)
         );
     }
 
@@ -2397,6 +2398,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 shard.PathId = std::get<2>(rec);
                 shard.CurrentTxId = std::get<3>(rec);
                 shard.TabletType = std::get<4>(rec);
+                shard.BackupHive = std::get<5>(rec);
 
                 Self->IncrementPathDbRefCount(shard.PathId);
 

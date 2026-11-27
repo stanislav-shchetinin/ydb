@@ -41,6 +41,7 @@
 #include <ydb/core/tx/schemeshard/schemeshard_path.h>
 #include <ydb/core/tx/schemeshard/schemeshard_sysviews_update.h>
 
+#include <ydb/library/actors/core/log.h>
 #include <ydb/library/login/account_lockout/account_lockout.h>
 #include <ydb/library/login/password_checker/password_checker.h>
 
@@ -4432,6 +4433,15 @@ void TSchemeShard::PersistParentDomainEffectiveACL(NIceDb::TNiceDb& db, const TS
         NIceDb::TUpdate<Schema::SysParams::Value>(ToString(effectiveACLVersion)));
 }
 
+void TSchemeShard::PersistBackupHive(NIceDb::TNiceDb& db, TShardIdx shard, TTabletId hive) {
+    AFL_ENSURE(hive != InvalidTabletId)("tablet", TabletID())("shard", shard);
+    if (IsLocalId(shard)) {
+        db.Table<Schema::Shards>().Key(shard.GetLocalId()).Update<Schema::Shards::BackupHive>(hive);
+    } else {
+        db.Table<Schema::MigratedShards>().Key(shard.GetOwnerId(), shard.GetLocalId()).Update<Schema::MigratedShards::BackupHive>(hive);
+    }
+}
+
 void TSchemeShard::PersistShardMapping(NIceDb::TNiceDb& db, TShardIdx shardIdx, TTabletId tabletId, TPathId pathId, TTxId txId, TTabletTypes::EType type) {
     if (IsLocalId(shardIdx)) {
         db.Table<Schema::Shards>().Key(shardIdx.GetLocalId()).Update(
@@ -5472,11 +5482,20 @@ TTabletId TSchemeShard::ResolveHive(TShardIdx shardIdx) const {
 void TSchemeShard::DoShardsDeletion(const THashSet<TShardIdx>& shardIdxs, const TActorContext& ctx) {
     TMap<TTabletId, THashSet<TShardIdx>> shardsPerHive;
     for (TShardIdx shardIdx : shardIdxs) {
+        if (ShardDeleter.HasBackup(shardIdx)) {
+            continue;
+        }
+        const auto* shard = ShardInfos.FindPtr(shardIdx);
+        if (shard && shard->BackupHive && shard->TabletID) {
+            ShardDeleter.QueueBackup(shard->BackupHive, shardIdx, shard->TabletID, *this);
+            continue;
+        }
         TTabletId hiveToRequest = ResolveHive(shardIdx);
 
         shardsPerHive[hiveToRequest].emplace(shardIdx);
     }
 
+    ShardDeleter.DispatchBackup(*this, ctx);
     for (const auto& [hive, shards] : shardsPerHive) {
         ShardDeleter.SendDeleteRequests(hive, shards, ShardInfos, ctx);
     }
@@ -6242,6 +6261,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvPrivate::TEvExportCompletionUploadResult, Handle);
         HFuncTraced(TEvPrivate::TEvDispatchPreparedTablets, Handle);
         HFuncTraced(TEvPrivate::TEvRetryPreparedBootChecks, Handle);
+        HFuncTraced(TEvPrivate::TEvRetryBackupDelete, Handle);
         HFuncTraced(TEvPrivate::TEvPreparedTabletsResult, Handle);
 
         // namespace NImport {
@@ -7395,6 +7415,15 @@ void TSchemeShard::Handle(TEvHive::TEvDeleteTabletReply::TPtr &ev, const TActorC
         {"schemeshard", TabletID()},
     );
 
+    const auto& reply = ev->Get()->Record;
+    if (ev->Cookie) {
+        if (!ShardDeleter.AcceptBackupReply(ev->Cookie, reply, *this, ctx)) {
+            return;
+        }
+    } else if (!reply.HasShardOwnerId() || reply.ShardLocalIdxSize() != 1
+            || ShardDeleter.HasBackup(TShardIdx(reply.GetShardOwnerId(), reply.GetShardLocalIdx(0)))) {
+        return;
+    }
     Execute(CreateTxDeleteTabletReply(ev), ctx);
 }
 

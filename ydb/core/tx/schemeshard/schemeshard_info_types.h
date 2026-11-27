@@ -1780,6 +1780,7 @@ struct TAdoptedShard {
 };
 
 struct TShardInfo {
+    TTabletId BackupHive = InvalidTabletId; // Hive that confirmed this paced export shard.
     TTabletId TabletID = InvalidTabletId;
     TTxId CurrentTxId = InvalidTxId; ///< @note we support only one modifying transaction on shard at time
     TPathId PathId = InvalidPathId;

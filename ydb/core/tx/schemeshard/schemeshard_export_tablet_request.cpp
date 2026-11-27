@@ -39,6 +39,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
     }
 
     void Finish(THolder<TResult> result) {
+        result->SentDelete = Step == EStep::Delete;
         Send(Owner, result.Release());
         PassAway();
     }

@@ -20,7 +20,7 @@ bool ReserveTablets(TSchemeShard& ss, TExportInfo& info, NIceDb::TNiceDb& db, TS
 void ReleaseReservations(TSchemeShard& ss, TExportInfo& info, NIceDb::TNiceDb& db);
 TMaybe<TPathId> ReservedPath(TSchemeShard& ss, TTxId txId, TPathId source, const TString& destination);
 const TVector<TBatch>* FindBatches(const TSchemeShard& ss, TPathId pathId);
-TTabletId PreparedTablet(const TVector<TBatch>& batches, TShardIdx shardIdx);
+const TBatch::TTablet* PreparedTablet(const TVector<TBatch>& batches, TShardIdx shardIdx);
 void PersistBatch(NIceDb::TNiceDb& db, ui64 exportId, ui32 item, ui32 batch, const TBatch& data);
 
 struct TWork {
@@ -51,6 +51,7 @@ class TDispatcher {
     void Pump(TSchemeShard& ss, const TActorContext& ctx);
 
 public:
+    bool StartCleanup(TSchemeShard& ss, const TKey& key, ui64 hive, const TActorContext& ctx);
     void Begin(TSchemeShard& ss, ui64 exportId, const TActorContext& ctx);
     void ResumeBatch(TSchemeShard& ss, const TKey& key, const TActorContext& ctx);
     const TWork* Find(const TActorId& worker) const;
