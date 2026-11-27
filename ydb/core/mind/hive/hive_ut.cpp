@@ -593,17 +593,24 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         return tabletId;
     }
 
-    void WaitForHiveOwnerIndexRemoval(TTestActorRuntime& runtime, ui64 hive, ui64 owner, ui64 index) {
+    void WaitForPhysicalTabletRemoval(TTestActorRuntime& runtime, ui64 hive, ui64 tabletId) {
         const auto edge = runtime.AllocateEdgeActor();
         const auto deadline = runtime.GetCurrentTime() + TDuration::Seconds(10);
         for (;;) {
-            runtime.SendToPipe(hive, edge, new TEvHive::TEvLookupTablet(owner, index), 0, GetPipeConfigWithRetries());
-            const auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
-            if (reply->Get()->Record.GetStatus() == NKikimrProto::NODATA) {
+            auto query = MakeHolder<TEvTablet::TEvLocalMKQL>();
+            query->Record.MutableProgram()->MutableProgram()->SetText(TStringBuilder()
+                << "((let row (SelectRow 'Tablet '('('ID (Uint64 '" << tabletId << "))) '('ID)))"
+                << "(return (AsList (SetResult 'row row))))");
+            runtime.SendToPipe(hive, edge, query.Release(), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvTablet::TEvLocalMKQLResponse>(edge);
+            const auto& record = reply->Get()->Record;
+            UNIT_ASSERT_VALUES_EQUAL_C(record.GetStatus(), NKikimrProto::OK, record.ShortDebugString());
+            const auto& result = record.GetExecutionEngineEvaluatedResponse().GetValue().GetStruct(0);
+            UNIT_ASSERT(result.HasOptional());
+            if (!result.GetOptional().HasOptional()) {
                 return;
             }
-            UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetStatus(), NKikimrProto::OK);
-            UNIT_ASSERT_C(runtime.GetCurrentTime() < deadline, "Hive did not remove the old owner index");
+            UNIT_ASSERT_C(runtime.GetCurrentTime() < deadline, "Hive did not delete tablet " << tabletId);
             runtime.SimulateSleep(TDuration::MilliSeconds(10));
         }
     }
@@ -2680,7 +2687,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             runtime.WaitFor("child Hive sequence grant", [&] { return !sequences.empty(); });
             // The migrated tablet is gone, but its ID still belongs to the child Hive.
             // A delayed delete for that ID must leave the new scalar create at the same key queued.
-            WaitForHiveOwnerIndexRemoval(runtime, subHiveTablet, testerTablet, backupIndex);
+            WaitForPhysicalTabletRemoval(runtime, subHiveTablet, migratedBackupId);
             const auto edge = runtime.AllocateEdgeActor();
             const auto pipe = runtime.ConnectToPipe(subHiveTablet, edge, 0, GetPipeConfigWithRetries());
             auto scalar = MakeHolder<TEvHive::TEvCreateTablet>();
@@ -3689,6 +3696,15 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         }
     }
 
+    bool WaitUntil(TTestBasicRuntime& runtime, const std::function<bool()>& condition) {
+        bool done = condition();
+        for (ui32 i = 0; i < 300 && !done; ++i) {
+            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+            done = condition();
+        }
+        return done;
+    }
+
     void ApplyHiveConfig(TTestActorRuntime& runtime, ui64 hiveTablet,
                          const TActorId& sender, const NKikimrConfig::THiveConfig& hiveConfig) {
         auto config = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
@@ -3771,7 +3787,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         ApplyHiveConfig(runtime, hive, edge, config);
         UNIT_ASSERT_VALUES_EQUAL(remove({0, 2}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::ERROR);
         UNIT_ASSERT_VALUES_EQUAL(remove({0}, {ids[0]}).GetStatus(), NKikimrProto::OK);
-        WaitForHiveOwnerIndexRemoval(runtime, hive, owner, 0);
+        WaitForPhysicalTabletRemoval(runtime, hive, ids[0]);
         auto replacement = MakeHolder<TEvHive::TEvCreateTablet>(owner, 0, TTabletTypes::Dummy, BINDED_CHANNELS);
         const ui64 replacementId = SendCreateTestTablet(runtime, hive, owner, std::move(replacement), 0, true);
         UNIT_ASSERT_VALUES_UNEQUAL(replacementId, ids[0]);
@@ -5243,6 +5259,319 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             Cerr << tabletInfo.ShortDebugString() << Endl;
             UNIT_ASSERT_VALUES_EQUAL(
                 tabletInfo.GetTabletChannels(0).GetHistory().size(), 2);
+        }
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionReservesOrdinaryCapacityAndPacesStop) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(2);
+            auto& cfg = *app.HiveConfig.MutableBackupDelete();
+            cfg.SetRatePerSecond(2);
+            cfg.SetBurst(1);
+            cfg.SetMaxInFlight(2);
+            cfg.SetReservedOrdinarySlots(1);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        TVector<ui64> backups;
+        for (ui64 idx = 0; idx < 4; ++idx) {
+            auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, idx, TTabletTypes::Dummy, BINDED_CHANNELS);
+            create->Record.SetIsBackup(true);
+            backups.push_back(SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, true));
+        }
+        const auto ordinary = SendCreateTestTablet(runtime, hive, owner,
+            MakeHolder<TEvHive::TEvCreateTablet>(owner, 90, TTabletTypes::Dummy, BINDED_CHANNELS), 0, true);
+        THashSet<ui64> stopped;
+        TVector<TInstant> times;
+        auto stop = runtime.AddObserver<TEvLocal::TEvStopTablet>([&](const auto& ev) {
+            const auto id = ev->Get()->Record.GetTabletId();
+            if (IsIn(backups, id) && stopped.insert(id).second) {
+                times.push_back(runtime.GetCurrentTime());
+            }
+        });
+        TBlockEvents<TEvTabletBase::TEvDeleteTabletResult> complete(runtime, [&](const auto& ev) {
+            return IsIn(backups, ev->Get()->TabletId);
+        });
+        auto remove = MakeHolder<TEvHive::TEvDeleteTablet>();
+        remove->Record.SetShardOwnerId(owner);
+        for (size_t idx = 0; idx < backups.size(); ++idx) {
+            remove->Record.AddShardLocalIdx(idx);
+            remove->Record.AddTabletID(backups[idx]);
+        }
+        runtime.SendToPipe(hive, edge, remove.Release(), 0, GetPipeConfigWithRetries());
+        auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetStatus(), NKikimrProto::OK);
+        runtime.WaitFor("first backup storage deletion", [&] { return !complete.empty(); });
+        runtime.SimulateSleep(TDuration::MilliSeconds(600));
+        UNIT_ASSERT_VALUES_EQUAL(stopped.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_IN_FLIGHT), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 3);
+        bool normalDone = false;
+        auto result = runtime.AddObserver<TEvTabletBase::TEvDeleteTabletResult>([&](const auto& ev) {
+            normalDone |= ev->Get()->TabletId == ordinary;
+        });
+        SendDeleteTestTablet(runtime, hive, MakeHolder<TEvHive::TEvDeleteTablet>(owner, 90, ordinary, 0));
+        runtime.WaitFor("ordinary deletion uses reserved capacity", [&] { return normalDone; });
+        UNIT_ASSERT_VALUES_EQUAL(stopped.size(), 1);
+        complete.Stop().Unblock();
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            return GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_COMPLETED) == backups.size();
+        }), "all four paced deletions completed");
+        UNIT_ASSERT_VALUES_EQUAL(times.size(), backups.size());
+        for (size_t idx = 1; idx < times.size(); ++idx) {
+            UNIT_ASSERT(times[idx] - times[idx - 1] >= TDuration::MilliSeconds(500));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_IN_FLIGHT), 0);
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionMakesProgressWithAnOrdinaryBacklog) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(2);
+            app.HiveConfig.MutableBackupDelete()->SetReservedOrdinarySlots(1);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+        TVector<ui64> tablets;
+        for (ui64 idx = 0; idx < 5; ++idx) {
+            auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, idx, TTabletTypes::Dummy, BINDED_CHANNELS);
+            create->Record.SetIsBackup(idx == 2 || idx == 3);
+            tablets.push_back(SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, true));
+        }
+        TBlockEvents<TEvTabletBase::TEvDeleteTabletResult> complete(runtime, [&](const auto& ev) {
+            return IsIn(tablets, ev->Get()->TabletId);
+        });
+        auto remove = [&](ui64 idx) {
+            auto request = MakeHolder<TEvHive::TEvDeleteTablet>(owner, idx, tablets[idx], 0);
+            if (idx == 2) {
+                request->Record.ClearTxId_Deprecated();
+            }
+            runtime.SendToPipe(hive, edge, request.Release(), 0, GetPipeConfigWithRetries());
+            UNIT_ASSERT_VALUES_EQUAL(runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)->Get()->Record.GetStatus(), NKikimrProto::OK);
+        };
+        remove(0);
+        remove(1);
+        runtime.WaitFor("two physical deletions occupy the window", [&] { return complete.size() == 2; });
+        runtime.GetAppData(0).FeatureFlags.SetEnablePacedBackupExport(false);
+        remove(2); // A guarded cancellation keeps its class after the flag changes.
+        runtime.GetAppData(0).FeatureFlags.SetEnablePacedBackupExport(true);
+        runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        remove(3); // A legacy delete of a backup still uses ordinary capacity.
+        remove(4);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 1);
+        complete.Unblock(1);
+        runtime.WaitFor("a replacement physical deletion uses the released slot", [&] { return complete.size() == 2; });
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_IN_FLIGHT), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_ORDINARY_DELETE_IN_FLIGHT), 1);
+        complete.Stop().Unblock();
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            return GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_COMPLETED) == 1
+                && GetCumulativeCounter(runtime, hive, NHive::COUNTER_ORDINARY_DELETE_COMPLETED) == 4;
+        }), "all five physical deletions finish");
+    }
+
+    void CheckPacedDeletionDuringBoot(bool follower) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(0);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        MakeSureTabletIsUp(runtime, hive, 0);
+
+        ui64 booting = 0;
+        auto observeBoot = runtime.AddObserver<TEvLocal::TEvBootTablet>([&](const auto& ev) {
+            const auto& info = ev->Get()->Record.GetInfo();
+            if (info.GetTabletType() == TTabletTypes::Dummy) {
+                booting = info.GetTabletID();
+            }
+        });
+        TBlockEvents<TEvLocal::TEvTabletStatus> ready(runtime, [&](const auto& ev) {
+            const auto& r = ev->Get()->Record;
+            return booting && r.GetTabletID() == booting && bool(r.GetFollowerId()) == follower
+                && r.GetStatus() == TEvLocal::TEvTabletStatus::StatusOk;
+        });
+        auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, 42, TTabletTypes::Dummy, BINDED_CHANNELS);
+        create->Record.SetIsBackup(true);
+        if (follower) {
+            auto* group = create->Record.AddFollowerGroups();
+            group->SetFollowerCount(1);
+            group->SetLocalNodeOnly(true);
+        }
+        const auto tablet = SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, false);
+        runtime.WaitFor("Local started the tablet before Hive received its acknowledgement", [&] { return !ready.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(booting, tablet);
+        const auto bootSlots = follower ? NHive::COUNTER_BOOT_RESTART_IN_FLIGHT : NHive::COUNTER_BOOT_BACKUP_IN_FLIGHT;
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, bootSlots), 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_TABLETS_STARTING), 1);
+
+        unsigned stops = 0;
+        auto observeStop = runtime.AddObserver<TEvLocal::TEvStopTablet>([&](const auto& ev) {
+            if (ev->Get()->Record.GetTabletId() == tablet) {
+                ++stops;
+            }
+        });
+        auto remove = MakeHolder<TEvHive::TEvDeleteTablet>();
+        remove->Record.SetShardOwnerId(owner);
+        remove->Record.AddShardLocalIdx(42);
+        remove->Record.AddTabletID(tablet);
+        runtime.SendToPipe(hive, edge, remove.Release(), 0, GetPipeConfigWithRetries());
+        UNIT_ASSERT_VALUES_EQUAL(runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)
+            ->Get()->Record.GetStatus(), NKikimrProto::OK);
+        ready.Stop().Unblock();
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] { return GetSimpleCounter(runtime, hive, bootSlots) == 0; }),
+            "a cancelled boot kept its admission slot");
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_TABLETS_STARTING), 0);
+        UNIT_ASSERT_VALUES_EQUAL(stops, 0);
+
+        bool synchronized = false;
+        auto sync = runtime.AddObserver<TEvLocal::TEvSyncTablets>([&](const auto& ev) {
+            for (const auto& item : ev->Get()->Record.GetOnlineTablets()) {
+                if (item.GetTabletId() == tablet && bool(item.GetFollowerId()) == follower) {
+                    synchronized = true;
+                }
+            }
+        });
+        RebootTablet(runtime, hive, edge);
+        runtime.WaitFor("the new Hive received the live tablet inventory", [&] { return synchronized; });
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 1);
+        UNIT_ASSERT_VALUES_EQUAL(stops, 0);
+        auto config = runtime.GetAppData(0).HiveConfig;
+        config.SetMaxDeleteTabletInProgress(2);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            return GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_COMPLETED) == 1;
+        }), "pending physical deletion did not drain");
+        UNIT_ASSERT(stops > 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, bootSlots), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_TABLETS_STARTING), 0);
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionDuringLeaderBootPreservesPlacement) {
+        CheckPacedDeletionDuringBoot(false);
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionDuringFollowerBootPreservesPlacement) {
+        CheckPacedDeletionDuringBoot(true);
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionKeepsReusedOwnerIndexAcrossRecovery) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(0);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        auto create = [&](bool backup) {
+            auto request = MakeHolder<TEvHive::TEvCreateTablet>(owner, 0, TTabletTypes::Dummy, BINDED_CHANNELS);
+            request->Record.SetIsBackup(backup);
+            return SendCreateTestTablet(runtime, hive, owner, std::move(request), 0, true);
+        };
+        auto lookup = [&](NKikimrProto::EReplyStatus expected) {
+            runtime.SendToPipe(hive, edge, new TEvHive::TEvLookupTablet(owner, 0), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+            UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetStatus(), expected);
+            return reply->Get()->Record.GetTabletID();
+        };
+        const ui64 oldId = create(true);
+        MakeSureTabletIsUp(runtime, oldId, 0);
+        auto removeOld = [&] {
+            auto request = MakeHolder<TEvHive::TEvDeleteTablet>();
+            request->Record.SetShardOwnerId(owner);
+            request->Record.AddShardLocalIdx(0);
+            request->Record.AddTabletID(oldId);
+            runtime.SendToPipe(hive, edge, request.Release(), 0, GetPipeConfigWithRetries());
+            UNIT_ASSERT_VALUES_EQUAL(runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)
+                ->Get()->Record.GetStatus(), NKikimrProto::OK);
+        };
+        removeOld();
+        lookup(NKikimrProto::NODATA);
+        const ui64 replacement = create(false);
+        UNIT_ASSERT_VALUES_UNEQUAL(replacement, oldId);
+        UNIT_ASSERT_VALUES_EQUAL(lookup(NKikimrProto::OK), replacement);
+        removeOld();
+
+        RebootTablet(runtime, hive, edge);
+        UNIT_ASSERT_VALUES_EQUAL(lookup(NKikimrProto::OK), replacement);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 1);
+        removeOld();
+        auto config = runtime.GetAppData(0).HiveConfig;
+        config.SetMaxDeleteTabletInProgress(2);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        WaitForPhysicalTabletRemoval(runtime, hive, oldId);
+        removeOld();
+        UNIT_ASSERT_VALUES_EQUAL(lookup(NKikimrProto::OK), replacement);
+        MakeSureTabletIsUp(runtime, replacement, 0);
+    }
+
+    Y_UNIT_TEST(TestPacedDeletionRecoversAfterHiveRestartAndBlockFailure) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletInProgress(0);
+        });
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        const auto edge = runtime.AllocateEdgeActor();
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        TVector<ui64> tablets;
+        auto remove = MakeHolder<TEvHive::TEvDeleteTablet>();
+        remove->Record.SetShardOwnerId(owner);
+        for (ui64 idx = 0; idx < 2; ++idx) {
+            auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, idx, TTabletTypes::Dummy, BINDED_CHANNELS);
+            create->Record.SetIsBackup(true);
+            const auto tablet = SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, true);
+            MakeSureTabletIsUp(runtime, tablet, 0);
+            tablets.push_back(tablet);
+            remove->Record.AddShardLocalIdx(idx);
+            remove->Record.AddTabletID(tablet);
+        }
+        runtime.SendToPipe(hive, edge, remove.Release(), 0, GetPipeConfigWithRetries());
+        UNIT_ASSERT_VALUES_EQUAL(runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)
+            ->Get()->Record.GetStatus(), NKikimrProto::OK);
+        RebootTablet(runtime, hive, edge);
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            return GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE) == tablets.size();
+        }), "Hive recovered both pending backup deletes");
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_STARTED), 0);
+
+        TBlockEvents<TEvTabletBase::TEvBlockBlobStorageResult> block(runtime, [&](const auto& ev) {
+            return IsIn(tablets, ev->Get()->TabletId);
+        });
+        auto config = runtime.GetAppData(0).HiveConfig;
+        config.SetMaxDeleteTabletInProgress(2);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        runtime.WaitFor("first physical block", [&] { return !block.empty(); });
+        block.Stop();
+        auto first = block.front();
+        block.pop_front();
+        runtime.Send(new IEventHandle(first->Recipient, first->Sender,
+            new TEvTabletBase::TEvBlockBlobStorageResult(NKikimrProto::ERROR, first->Get()->TabletId), 0, first->Cookie));
+        block.Unblock();
+        UNIT_ASSERT_C(WaitUntil(runtime, [&] {
+            return GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_COMPLETED) == tablets.size();
+        }), "physical delete retried after failed block");
+        UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_STARTED), 3);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_SIZE), 0);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hive, NHive::COUNTER_BACKUP_DELETE_IN_FLIGHT), 0);
+        for (const auto tablet : tablets) {
+            MakeSureTabletIsDown(runtime, tablet, 0);
         }
     }
 
@@ -13254,15 +13583,6 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             setup(runtime);
             TestBridgeDisconnect(runtime, bridge, NUM_TABLETS, activeZone);
         });
-    }
-
-    bool WaitUntil(TTestBasicRuntime& runtime, const std::function<bool()>& condition) {
-        bool done = condition();
-        for (ui32 i = 0; i < 300 && !done; ++i) {
-            runtime.SimulateSleep(TDuration::MilliSeconds(100));
-            done = condition();
-        }
-        return done;
     }
 
     Y_UNIT_TEST(TestPacedInitialBootKeepsRecoverySlot) {

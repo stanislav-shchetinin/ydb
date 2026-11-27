@@ -17,7 +17,22 @@ public:
         : TBase(hive)
     {}
 
-    void DeleteTablet(TTabletId tabletId, NIceDb::TNiceDb& db) {
+    void CancelBootForDelete(TTabletInfo& tablet, bool deferStop) {
+        if (!tablet.IsStarting()) {
+            return;
+        }
+        if (tablet.BootTime != TInstant()) {
+            Self->UpdateCounterTabletsStarting(-1);
+            tablet.BootTime = {};
+        }
+        if (deferStop) {
+            // Hive no longer accepts boot acknowledgements for a deleting tablet.
+            // Retire its boot slot but keep the assigned node until physical stop.
+            tablet.BecomeUnknown(tablet.GetNode());
+        }
+    }
+
+    void DeleteTablet(TTabletId tabletId, NIceDb::TNiceDb& db, bool guardedBackup) {
         YDB_LOG_DEBUG("THive::TTxDeleteTablet::Execute deleting tablet",
             {"logPrefix", GetLogPrefix()},
             {"tabletId", tabletId});
@@ -30,12 +45,18 @@ public:
                 return;
             }
             if (tablet->State != ETabletState::Deleting) {
-                if (tablet->IsStarting()) {
-                    Self->UpdateCounterTabletsStarting(-1);
-                }
+                tablet->PacedDelete = guardedBackup;
+                CancelBootForDelete(*tablet, guardedBackup);
                 tablet->State = ETabletState::Deleting;
                 Self->RecordTabletEvent(*tablet, EHiveEventType::Deleting, EHiveEventReason::OwnerRequest);
-                db.Table<Schema::Tablet>().Key(tablet->Id).Update<Schema::Tablet::State, Schema::Tablet::LeaderNode>(ETabletState::Deleting, 0);
+                const auto* node = guardedBackup ? tablet->GetNode() : nullptr;
+                db.Table<Schema::Tablet>().Key(tablet->Id).Update<Schema::Tablet::State, Schema::Tablet::LeaderNode>(
+                    ETabletState::Deleting, node ? node->Id : 0);
+                if (guardedBackup) {
+                    // A new tablet can claim this owner index while physical removal is queued.
+                    Self->OwnerToTablet.erase(tablet->Owner);
+                    db.Table<Schema::Tablet>().Key(tablet->Id).Update<Schema::Tablet::PacedDelete>(true);
+                }
                 for (const TActorId& actor : tablet->ActorsToNotifyOnRestart) {
                     SideEffects.Send(actor, new TEvPrivate::TEvRestartComplete(tablet->GetFullTabletId(), "delete"));
                 }
@@ -43,17 +64,21 @@ public:
                 if (std::exchange(tablet->IsMarkedForReassign, false)) {
                     Self->UpdateCounterTabletsReassigning(-1);
                 }
-                tablet->InitiateStop(SideEffects, EHiveEventReason::Deleting);
+                if (!tablet->PacedDelete) {
+                    tablet->InitiateStop(SideEffects, EHiveEventReason::Deleting);
+                }
                 for (TTabletInfo& follower : tablet->Followers) {
                     for (const TActorId& actor : follower.ActorsToNotifyOnRestart) {
                         SideEffects.Send(actor, new TEvPrivate::TEvRestartComplete(follower.GetFullTabletId(), "delete"));
                     }
                     follower.ActorsToNotifyOnRestart.clear();
-                    if (follower.IsStarting()) {
-                        Self->UpdateCounterTabletsStarting(-1);
+                    CancelBootForDelete(follower, guardedBackup);
+                    const auto* followerNode = guardedBackup ? follower.GetNode() : nullptr;
+                    db.Table<Schema::TabletFollowerTablet>().Key(follower.GetFullTabletId())
+                        .Update<Schema::TabletFollowerTablet::FollowerNode>(followerNode ? followerNode->Id : 0);
+                    if (!guardedBackup) {
+                        follower.InitiateStop(SideEffects, EHiveEventReason::Deleting);
                     }
-                    follower.InitiateStop(SideEffects, EHiveEventReason::Deleting);
-                    db.Table<Schema::TabletFollowerTablet>().Key(follower.GetFullTabletId()).Update<Schema::TabletFollowerTablet::FollowerNode>(0);
                 }
                 Self->BlockStorageForDelete(tabletId, SideEffects);
             } else {
@@ -130,6 +155,10 @@ public:
                 if (tablet->SeizedByChild || tablet->NeedToReleaseFromParent) {
                     return RespondToSender(NKikimrProto::TRYLATER);
                 }
+                if (tablet->PacedDelete) {
+                    // This exact identity was accepted before the owner index was released.
+                    continue;
+                }
             } else {
                 NKikimrHive::TForwardRequest next;
                 if (Self->CheckForForwardTabletRequest(id, next)) {
@@ -156,7 +185,7 @@ public:
         }
         // A pending create may reuse the owner index and has no matching TabletID yet.
         for (const TTabletId id : request.GetTabletID()) {
-            DeleteTablet(id, db);
+            DeleteTablet(id, db, /*guardedBackup=*/true);
         }
         RespondToSender(NKikimrProto::OK);
     }
@@ -236,7 +265,7 @@ public:
         }
         NIceDb::TNiceDb db(txc.DB);
         for (TTabletId tabletId : tablets) {
-            DeleteTablet(tabletId, db);
+            DeleteTablet(tabletId, db, /*guardedBackup=*/false);
         }
         RespondToSender(NKikimrProto::OK);
         return true;
@@ -308,7 +337,7 @@ public:
         }
         NIceDb::TNiceDb db(txc.DB);
         for (TTabletId tabletId : tablets) {
-            DeleteTablet(tabletId, db);
+            DeleteTablet(tabletId, db, /*guardedBackup=*/false);
         }
         db.Table<Schema::BlockedOwner>().Key(rec.GetOwner()).Update();
         Self->BlockedOwners.emplace(Event->Get()->Record.GetOwner());

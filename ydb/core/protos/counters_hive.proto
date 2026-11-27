@@ -53,6 +53,12 @@ enum ESimpleCounters {
     COUNTER_BOOT_BACKUP_QUEUE_SIZE = 43 [(CounterOpts) = {Name: "BackupInitialBoot/QueueSize"}];
     COUNTER_BOOT_BACKUP_OLDEST_MS = 44 [(CounterOpts) = {Name: "BackupInitialBoot/OldestWaitingMs"}];
     COUNTER_BOOT_BACKUP_IN_FLIGHT = 45 [(CounterOpts) = {Name: "BackupInitialBoot/InFlight"}];
+    COUNTER_ORDINARY_DELETE_SIZE = 46 [(CounterOpts) = {Name: "OrdinaryDelete/QueueSize"}];
+    COUNTER_ORDINARY_DELETE_OLDEST_MS = 47 [(CounterOpts) = {Name: "OrdinaryDelete/OldestWaitingMs"}];
+    COUNTER_ORDINARY_DELETE_IN_FLIGHT = 48 [(CounterOpts) = {Name: "OrdinaryDelete/InFlight"}];
+    COUNTER_BACKUP_DELETE_SIZE = 49 [(CounterOpts) = {Name: "BackupDelete/QueueSize"}];
+    COUNTER_BACKUP_DELETE_OLDEST_MS = 50 [(CounterOpts) = {Name: "BackupDelete/OldestWaitingMs"}];
+    COUNTER_BACKUP_DELETE_IN_FLIGHT = 51 [(CounterOpts) = {Name: "BackupDelete/InFlight"}];
 }
 
 enum ECumulativeCounters {
@@ -84,6 +90,10 @@ enum ECumulativeCounters {
     COUNTER_BOOT_RESTART_READY = 25 [(CounterOpts) = {Name: "RestartBoot/Ready"}];
     COUNTER_BOOT_INITIAL_READY = 26 [(CounterOpts) = {Name: "InitialBoot/Ready"}];
     COUNTER_BOOT_BACKUP_READY = 27 [(CounterOpts) = {Name: "BackupInitialBoot/Ready"}];
+    COUNTER_ORDINARY_DELETE_STARTED = 28 [(CounterOpts) = {Name: "OrdinaryDelete/Started"}];
+    COUNTER_ORDINARY_DELETE_COMPLETED = 29 [(CounterOpts) = {Name: "OrdinaryDelete/Completed"}];
+    COUNTER_BACKUP_DELETE_STARTED = 30 [(CounterOpts) = {Name: "BackupDelete/Started"}];
+    COUNTER_BACKUP_DELETE_COMPLETED = 31 [(CounterOpts) = {Name: "BackupDelete/Completed"}];
 }
 
 enum EPercentileCounters {
@@ -185,6 +195,18 @@ enum EPercentileCounters {
         Ranges: { Value: 100 }, Ranges: { Value: 250 }, Ranges: { Value: 500 },
         Ranges: { Value: 1000 }, Ranges: { Value: 5000 }
     }];
+    COUNTER_ORDINARY_DELETE_WAIT_MS = 11 [(CounterOpts) = {
+        Name: "OrdinaryDelete/WaitTimeMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 10 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
+        Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
+    }];
+    COUNTER_BACKUP_DELETE_WAIT_MS = 12 [(CounterOpts) = {
+        Name: "BackupDelete/WaitTimeMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 10 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
+        Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
+    }];
 }
 
 enum ETxTypes {
@@ -269,4 +291,5 @@ enum ETxTypes {
     TXTYPE_CREATE_TABLET_BATCH = 78                       [(TxTypeOpts) = {Name: "TxCreateTabletBatch"}];
     TXTYPE_READ_INITIAL_BOOT = 79                         [(TxTypeOpts) = {Name: "TxReadInitialBoot"}];
     TXTYPE_DELETE_TABLET_BATCH = 80                       [(TxTypeOpts) = {Name: "TxDeleteTabletBatch"}];
+    TXTYPE_PROCESS_DELETE_QUEUE = 81 [(TxTypeOpts) = {Name: "TxProcessDeleteQueue"}];
 }

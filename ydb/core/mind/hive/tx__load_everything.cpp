@@ -484,7 +484,10 @@ public:
 
                 TObjectId objectId = tabletRowset.GetValueOrDefault<Schema::Tablet::ObjectID>();
                 TOwnerIdxType::TValueType owner = tabletRowset.GetValue<Schema::Tablet::Owner>();
-                Self->OwnerToTablet.emplace(owner, tabletId);
+                tablet.PacedDelete = tabletRowset.GetValueOrDefault<Schema::Tablet::PacedDelete>();
+                if (!tablet.PacedDelete) {
+                    Self->OwnerToTablet.emplace(owner, tabletId);
+                }
                 tablet.Owner = owner;
                 tablet.ObjectId = {owner.first, objectId};
 

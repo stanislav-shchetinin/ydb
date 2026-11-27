@@ -23,6 +23,7 @@ struct TTabletCategoryInfo {
 struct TStoragePoolInfo;
 
 struct TLeaderTabletInfo : TTabletInfo {
+    bool PacedDelete = false;
 public:
     static TString DEFAULT_STORAGE_POOL_NAME;
 

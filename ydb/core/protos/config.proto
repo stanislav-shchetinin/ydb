@@ -2955,6 +2955,13 @@ message THiveConfig {
     optional uint64 BalanceCountersRefreshFrequency = 88 [default = 15000]; // milliseconds
     optional bool LockedTabletsSendMetrics = 89 [default = false]; // if true then hive will process metrics from locked tablets
     optional uint64 MaxDeleteTabletInProgress = 90 [default = 100];
+    message TBackupDeleteAdmission {
+        optional uint32 RatePerSecond = 1 [default = 32];
+        optional uint32 Burst = 2 [default = 4];
+        optional uint32 MaxInFlight = 3 [default = 16];
+        optional uint32 ReservedOrdinarySlots = 4 [default = 1];
+    }
+    optional TBackupDeleteAdmission BackupDelete = 106;
     optional uint64 DataCenterChangeReactionPeriod = 91 [default = 300]; // seconds
     repeated THiveTabletAllowedMetrics DefaultTabletAllowedMetrics = 92;
     optional double TabletImpactToPin = 93 [default = 0.3, (ParamDescription) = "Usage impact at which a tablet is treated as high-impact and is potentially isolated on a node"];
