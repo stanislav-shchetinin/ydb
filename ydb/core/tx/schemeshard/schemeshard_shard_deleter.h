@@ -30,8 +30,12 @@ class TShardDeleter {
         TTabletId Tablet;
         bool Single = false;
     };
+    struct TQueuedBackup {
+        TShardIdx Shard;
+        ui64 RetryCookie = 0;
+    };
     struct TBackupQueue {
-        TMap<TOwnerId, TDeque<TShardIdx>> ByOwner;
+        TMap<TOwnerId, TDeque<TQueuedBackup>> ByOwner;
         TDeque<std::tuple<ui64, ui32, ui32>> Prepared;
         bool PreferPrepared = true;
         ui32 InFlight = 0;
@@ -39,6 +43,7 @@ class TShardDeleter {
     struct TBackupRequest {
         TTabletId Hive;
         TVector<TShardIdx> Shards;
+        bool InFlight = false;
         bool Committing = false;
     };
     THashMap<TShardIdx, TBackupShard> BackupShards;
@@ -46,7 +51,8 @@ class TShardDeleter {
     THashMap<ui64, TBackupRequest> BackupRequests;
     ui64 NextBackupCookie = 0;
 
-    void SendBackup(TTabletId hive, TBackupQueue& queue, ui32 size, TSchemeShard& ss, const TActorContext& ctx);
+    ui64 TakeBackupRequest(TTabletId hive, TBackupQueue& queue, ui32 size);
+    void SendBackup(ui64 cookie, TSchemeShard& ss, const TActorContext& ctx);
     void FinishBackup(ui64 cookie, bool success, bool singles, TTabletId redirect, TSchemeShard& ss, const TActorContext& ctx);
 
     struct TPerHiveDeletions {

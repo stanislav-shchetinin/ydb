@@ -2986,6 +2986,57 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         CheckPacedDeleteRetries(false, true);
     }
 
+    Y_UNIT_TEST_TWIN(PacedDeleteAcceptsDelayedAcknowledgement, SingleItem) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().HiveConfig.SetMaxDeleteTabletBatchSize(SingleItem ? 1 : 2);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupDeleteBatchesInFlightPerHive(1);
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> initial(Runtime(), [](const auto& ev) {
+            return !SingleItem && ev->Cookie != 0;
+        });
+        const auto exportId = SingleItem ? StartCompletionMarkerExport()
+            : StartCompletionMarkerExportWithDeleteBacklog(initial);
+        const ui64 initialCookie = initial.empty() ? 0 : initial.front()->Cookie;
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> replies(Runtime(), [&](const auto& ev) {
+            return ev->Cookie && ev->Cookie != initialCookie;
+        });
+        initial.Stop().Unblock();
+        // For singles the other shard now holds the only slot. For a batch two
+        // timeouts have expired. In both cases deliver only the first reply.
+        Runtime().WaitFor("Later guarded delete attempts reached Hive", [&] {
+            return replies.size() >= (SingleItem ? 2u : 3u);
+        });
+        const auto& first = replies.front()->Get()->Record;
+        const auto& second = replies[1]->Get()->Record;
+        UNIT_ASSERT_VALUES_EQUAL(first.ShardLocalIdxSize(), SingleItem ? 1u : 2u);
+        if (SingleItem) {
+            UNIT_ASSERT_UNEQUAL(first.GetShardLocalIdx(0), second.GetShardLocalIdx(0));
+        }
+        const auto edge = Runtime().AllocateEdgeActor();
+        TSet<TShardIdx> expected;
+        TSet<TShardIdx> observed;
+        auto notifications = Runtime().template AddObserver<TEvPrivate::TEvNotifyShardDeleted>([&](const auto& ev) {
+            if (ev->Recipient == edge) {
+                observed.insert(ev->Get()->ShardIdx);
+            }
+        });
+        for (auto index : first.GetShardLocalIdx()) {
+            const TShardIdx shard(first.GetShardOwnerId(), index);
+            expected.insert(shard);
+            ForwardToTablet(Runtime(), TTestTxConfig::SchemeShard, edge,
+                new TEvPrivate::TEvSubscribeToShardDeletion(shard));
+        }
+        Runtime().SimulateSleep(TDuration::MilliSeconds(100));
+        UNIT_ASSERT(observed.empty());
+        replies.Unblock(1);
+        Runtime().SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(observed == expected);
+        replies.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), exportId);
+        TestGetExport(Runtime(), exportId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(exportId);
+    }
+
     Y_UNIT_TEST(PacedDeleteRoutesOnlyMigratedBackupShardToChildHive) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);

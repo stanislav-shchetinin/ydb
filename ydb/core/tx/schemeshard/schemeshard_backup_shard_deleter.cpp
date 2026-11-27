@@ -9,7 +9,7 @@ namespace NKikimr::NSchemeShard {
 
 void TShardDeleter::QueueBackup(TTabletId hive, TShardIdx shard, TTabletId tablet, TSchemeShard& ss) {
     if (BackupShards.emplace(shard, TBackupShard{hive, tablet}).second) {
-        BackupQueues[hive].ByOwner[shard.GetOwnerId()].push_back(shard);
+        BackupQueues[hive].ByOwner[shard.GetOwnerId()].push_back({shard});
         ss.TabletCounters->Simple()[COUNTER_BACKUP_DELETE_QUEUED].Add(1);
     }
 }
@@ -41,7 +41,11 @@ void TShardDeleter::DispatchBackup(TSchemeShard& ss, const TActorContext& ctx) {
                 }
                 queue.PreferPrepared = false;
             } else {
-                SendBackup(hive, queue, size, ss, ctx);
+                const ui64 cookie = TakeBackupRequest(hive, queue, size);
+                if (!cookie) {
+                    continue;
+                }
+                SendBackup(cookie, ss, ctx);
                 queue.PreferPrepared = true;
             }
             ++queue.InFlight;
@@ -55,36 +59,62 @@ void TShardDeleter::DispatchBackup(TSchemeShard& ss, const TActorContext& ctx) {
     }
 }
 
-void TShardDeleter::SendBackup(TTabletId hive, TBackupQueue& queue, ui32 size, TSchemeShard& ss, const TActorContext& ctx) {
-    const ui64 cookie = ++NextBackupCookie;
-    auto& request = BackupRequests[cookie];
-    request.Hive = hive;
-    auto message = MakeHolder<TEvHive::TEvDeleteTablet>();
+ui64 TShardDeleter::TakeBackupRequest(TTabletId hive, TBackupQueue& queue, ui32 size) {
     auto owner = queue.ByOwner.begin();
-    message->Record.SetShardOwnerId(ui64(owner->first));
     auto& pending = owner->second;
-    while (!pending.empty() && request.Shards.size() < size) {
-        const auto shard = pending.front();
-        const auto& info = BackupShards.at(shard);
-        if (info.Single && !request.Shards.empty()) {
-            break;
-        }
+    ui64 cookie = pending.front().RetryCookie;
+    if (cookie) {
         pending.pop_front();
-        request.Shards.push_back(shard);
-        message->Record.AddShardLocalIdx(ui64(shard.GetLocalId()));
-        message->Record.AddTabletID(ui64(info.Tablet));
-        if (info.Single) {
-            break;
+        auto it = BackupRequests.find(cookie);
+        if (it == BackupRequests.end() || it->second.Committing) {
+            // A delayed reply settled this request while another operation held the slot.
+            cookie = 0;
+        } else if (it->second.Shards.size() > size) {
+            // The feature flag or the configured batch limit changed while waiting.
+            for (auto shard : it->second.Shards) {
+                BackupShards.at(shard).Single = true;
+                pending.push_back({shard});
+            }
+            BackupRequests.erase(it);
+            cookie = 0;
+        }
+    } else {
+        cookie = ++NextBackupCookie;
+        auto& request = BackupRequests[cookie];
+        request.Hive = hive;
+        while (!pending.empty() && !pending.front().RetryCookie && request.Shards.size() < size) {
+            const auto shard = pending.front().Shard;
+            const bool single = BackupShards.at(shard).Single;
+            if (single && !request.Shards.empty()) {
+                break;
+            }
+            pending.pop_front();
+            request.Shards.push_back(shard);
+            if (single) {
+                break;
+            }
         }
     }
     if (pending.empty()) {
         queue.ByOwner.erase(owner);
     }
+    return cookie;
+}
+
+void TShardDeleter::SendBackup(ui64 cookie, TSchemeShard& ss, const TActorContext& ctx) {
+    auto& request = BackupRequests.at(cookie);
+    request.InFlight = true;
+    auto message = MakeHolder<TEvHive::TEvDeleteTablet>();
+    message->Record.SetShardOwnerId(ui64(request.Shards.front().GetOwnerId()));
+    for (auto shard : request.Shards) {
+        message->Record.AddShardLocalIdx(ui64(shard.GetLocalId()));
+        message->Record.AddTabletID(ui64(BackupShards.at(shard).Tablet));
+    }
     ss.TabletCounters->Cumulative()[COUNTER_BACKUP_DELETE_REQUESTS].Increment(1);
     ss.TabletCounters->Cumulative()[COUNTER_BACKUP_DELETE_ITEMS].Increment(request.Shards.size());
     ss.TabletCounters->Simple()[COUNTER_BACKUP_DELETE_QUEUED].Sub(request.Shards.size());
     ctx.Send(MakePipePerNodeCacheID(EPipePerNodeCache::Leader),
-        new TEvPipeCache::TEvForward(message.Release(), ui64(hive), false), 0, cookie);
+        new TEvPipeCache::TEvForward(message.Release(), ui64(request.Hive), false), 0, cookie);
     ctx.Schedule(TDuration::Seconds(5), new TEvPrivate::TEvRetryBackupDelete(cookie));
 }
 
@@ -123,7 +153,11 @@ void TShardDeleter::FinishBackup(ui64 cookie, bool success, bool singles, TTable
     }
     auto request = std::move(it->second);
     BackupRequests.erase(it);
-    ReleaseBackupSlot(request.Hive, ss);
+    if (request.InFlight) {
+        ReleaseBackupSlot(request.Hive, ss);
+    } else {
+        ss.TabletCounters->Simple()[COUNTER_BACKUP_DELETE_QUEUED].Sub(request.Shards.size());
+    }
     for (auto shard : request.Shards) {
         if (success) {
             BackupShards.erase(shard);
@@ -133,7 +167,7 @@ void TShardDeleter::FinishBackup(ui64 cookie, bool success, bool singles, TTable
             if (redirect) {
                 info.Hive = redirect;
             }
-            BackupQueues[info.Hive].ByOwner[shard.GetOwnerId()].push_back(shard);
+            BackupQueues[info.Hive].ByOwner[shard.GetOwnerId()].push_back({shard});
             ss.TabletCounters->Simple()[COUNTER_BACKUP_DELETE_QUEUED].Add(1);
         }
     }
@@ -145,9 +179,15 @@ void TShardDeleter::BackupCommitted(ui64 cookie, TSchemeShard& ss, const TActorC
 }
 
 void TShardDeleter::RetryBackup(ui64 cookie, TSchemeShard& ss, const TActorContext& ctx) {
-    const auto* request = BackupRequests.FindPtr(cookie);
-    if (request && !request->Committing) {
-        FinishBackup(cookie, false, false, InvalidTabletId, ss, ctx);
+    auto* request = BackupRequests.FindPtr(cookie);
+    if (request && request->InFlight && !request->Committing) {
+        // A timeout releases capacity. Hive can still acknowledge the original request.
+        request->InFlight = false;
+        ReleaseBackupSlot(request->Hive, ss);
+        const auto first = request->Shards.front();
+        BackupQueues.at(request->Hive).ByOwner[first.GetOwnerId()].push_back({first, cookie});
+        ss.TabletCounters->Simple()[COUNTER_BACKUP_DELETE_QUEUED].Add(request->Shards.size());
+        DispatchBackup(ss, ctx);
     }
 }
 
