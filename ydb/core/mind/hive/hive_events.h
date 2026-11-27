@@ -45,10 +45,16 @@ struct TEvPrivate {
         EvLogHangingRequests,
         EvCheckNamedResourceEstimates,
         EvProcessPileDrains,
+        EvProcessDeleteQueue,
         EvEnd
     };
 
     static_assert(EvEnd < EventSpaceEnd(TEvents::ES_PRIVATE), "expect EvEnd < EventSpaceEnd(TEvents::ES_PRIVATE)");
+
+    struct TEvProcessDeleteQueue : TEventLocal<TEvProcessDeleteQueue, EvProcessDeleteQueue> {
+        bool QuotaTimer;
+        explicit TEvProcessDeleteQueue(bool quotaTimer = false) : QuotaTimer(quotaTimer) {}
+    };
 
     struct TEvKickTablet : TEventLocal<TEvKickTablet, EvKickTablet> {
         std::pair<TTabletId, TFollowerId> TabletId;

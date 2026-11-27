@@ -30,6 +30,10 @@ public:
             {"tabletId", TabletId},
             {"replyStatus", NKikimrProto::EReplyStatus_Name(msg->Status)});
         TLeaderTabletInfo* tablet = Self->FindTabletEvenInDeleting(TabletId);
+        if (tablet && tablet->PacedDelete && !Self->ActiveDeletes.contains(TabletId)) {
+            Success = false;
+            return true;
+        }
         if (tablet != nullptr) {
             if (msg->Status == NKikimrProto::OK) {
                 NIceDb::TNiceDb db(txc.DB);
@@ -65,7 +69,9 @@ public:
                     // Notify lock owner that lock has been lost
                     SideEffects.Send(unlockedFromActor, new TEvHive::TEvLockTabletExecutionLost(TabletId, NKikimrHive::LOCK_LOST_REASON_TABLET_DELETED));
                 }
-                Self->PendingCreateTablets.erase({tablet->Owner.first, tablet->Owner.second});
+                if (!tablet->PacedDelete) {
+                    Self->PendingCreateTablets.erase({tablet->Owner.first, tablet->Owner.second});
+                }
                 Self->DeleteTablet(tablet->Id);
             } else {
                 Success = false;
@@ -90,13 +96,7 @@ public:
             {"tabletId", TabletId},
             {"sideEffects", SideEffects});
         if (Success) {
-            --Self->DeleteTabletInProgress;
-            while (!Self->DeleteTabletQueue.empty() && Self->DeleteTabletInProgress < Self->GetMaxDeleteTabletInProgress()) {
-                Self->BlockStorageForDelete(Self->DeleteTabletQueue.front(), SideEffects);
-                Self->DeleteTabletQueue.pop();
-            }
-            Self->UpdateCounterDeleteTabletQueueSize();
-            Self->UpdateCounterTabletsDeleting();
+            Self->ReleaseDeleteSlot(TabletId, true);
         }
         SideEffects.Complete(ctx, Self->Requests);
     }

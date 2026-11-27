@@ -1101,6 +1101,9 @@ void THive::BuildCurrentConfig() {
     if (broadcastLocalSettings) {
         UpdateLocalSettings();
     }
+    // A queue paused by MaxDeleteTabletInProgress=0 has no completion
+    // or quota timer to wake it when new capacity becomes available.
+    ScheduleDeleteQueue();
 }
 
 void THive::Cleanup() {
@@ -1343,7 +1346,7 @@ void THive::Handle(TEvHive::TEvInitiateDeleteStorage::TPtr &ev) {
     TSideEffects sideEffects;
     sideEffects.Reset(SelfId());
     TLeaderTabletInfo* tablet = FindTabletEvenInDeleting(tabletId);
-    if (tablet != nullptr) {
+    if (tablet != nullptr && (!tablet->PacedDelete || ActiveDeletes.contains(tabletId))) {
         tablet->InitiateDeleteStorage(sideEffects);
     }
     sideEffects.Complete(TActivationContext::AsActorContext(), Requests);
@@ -2138,7 +2141,9 @@ void THive::DeleteTablet(TTabletId tabletId) {
         }
         ReportDeletedToWhiteboard(tablet);
         tablet.ReleaseAllocationUnits();
-        OwnerToTablet.erase(tablet.Owner);
+        if (!tablet.PacedDelete) {
+            OwnerToTablet.erase(tablet.Owner);
+        }
         if (tablet.Category) {
             tablet.Category->Tablets.erase(&tablet);
         }
@@ -2323,7 +2328,7 @@ void THive::UpdateCounterNodesFrozen(i64 nodesFrozenDiff) {
 void THive::UpdateCounterDeleteTabletQueueSize() {
     if (TabletCounters != nullptr) {
         auto& counter = TabletCounters->Simple()[NHive::COUNTER_DELETE_TABLET_QUEUE_SIZE];
-        counter.Set(DeleteTabletQueue.size());
+        counter.Set(DeleteTabletQueue.size() + BackupDeleteQueue.size());
     }
 }
 
@@ -4094,20 +4099,20 @@ ui64 THive::GetObjectImbalance(TFullObjectId object) {
 
 void THive::BlockStorageForDelete(TTabletId tabletId, TSideEffects& sideEffects) {
     auto* tablet = FindTabletEvenInDeleting(tabletId);
-    if (tablet == nullptr) {
+    if (!tablet || !tablet->IsDeleting() || ActiveDeletes.contains(tabletId) || QueuedDeletes.contains(tabletId)) {
         return;
     }
-    Y_ENSURE(tablet->IsDeleting());
-    if (DeleteTabletInProgress < GetMaxDeleteTabletInProgress()) {
-        ++DeleteTabletInProgress;
-        if (!tablet->InitiateBlockStorage(sideEffects, std::numeric_limits<ui32>::max())) {
-            DeleteTabletWithoutStorage(tablet);
-        }
-    } else {
-        DeleteTabletQueue.push(tabletId);
+    if (!tablet->PacedDelete && DeleteTabletQueue.empty() && BackupDeleteQueue.empty()
+            && DeleteTabletInProgress < GetMaxDeleteTabletInProgress()) {
+        StartPhysicalDelete(*tablet, sideEffects);
+        return;
     }
+    auto& queue = tablet->PacedDelete ? BackupDeleteQueue : DeleteTabletQueue;
+    queue.push({tabletId, TActivationContext::Now()});
+    QueuedDeletes.insert(tabletId);
     UpdateCounterDeleteTabletQueueSize();
-    UpdateCounterTabletsDeleting();
+    UpdateDeleteClassCounters(TActivationContext::Now());
+    ScheduleDeleteQueue();
 }
 
 void THive::ProcessPendingStopTablet() {
@@ -4305,6 +4310,7 @@ void THive::ProcessEvent(std::unique_ptr<IEventHandle> event) {
         hFunc(TEvInterconnect::TEvNodesInfo, Handle);
         hFunc(TEvents::TEvUndelivered, Handle);
         hFunc(TEvPrivate::TEvProcessBootQueue, Handle);
+        hFunc(TEvPrivate::TEvProcessDeleteQueue, Handle);
         hFunc(TEvPrivate::TEvProcessPileDrains, Handle);
         hFunc(TEvPrivate::TEvPostponeProcessBootQueue, Handle);
         hFunc(TEvPrivate::TEvProcessPendingOperations, Handle);
@@ -4432,6 +4438,7 @@ STFUNC(THive::StateWork) {
         fFunc(TEvInterconnect::TEvNodesInfo::EventType, EnqueueIncomingEvent);
         fFunc(TEvents::TEvUndelivered::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessBootQueue::EventType, EnqueueIncomingEvent);
+        fFunc(TEvPrivate::TEvProcessDeleteQueue::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessPileDrains::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvPostponeProcessBootQueue::EventType, EnqueueIncomingEvent);
         fFunc(TEvPrivate::TEvProcessPendingOperations::EventType, EnqueueIncomingEvent);
@@ -4912,6 +4919,7 @@ void THive::Handle(TEvNodeWardenStorageConfig::TPtr& ev) {
 }
 
 void THive::Handle(TEvPrivate::TEvUpdateBalanceCounters::TPtr&) {
+    UpdateDeleteClassCounters(TActivationContext::Now());
     UpdateBootClassCounters(TActivationContext::Now());
     THiveStats stats = GetStats();
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_SCATTER].Set(stats.Scatter * 100);

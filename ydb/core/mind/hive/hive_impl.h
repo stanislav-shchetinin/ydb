@@ -194,6 +194,7 @@ protected:
 
     friend class TTxInitScheme;
     friend class TTxDeleteBase;
+    friend class TTxProcessDeleteQueue;
     friend class TTxDeleteTablet;
     friend class TTxDeleteOwnerTablets;
     friend class TTxReassignGroups;
@@ -564,7 +565,19 @@ protected:
     ui64 UpdateTabletMetricsInProgress = 0;
     static constexpr ui64 MAX_UPDATE_TABLET_METRICS_IN_PROGRESS = 10000; // 10K
     i64 DeleteTabletInProgress = 0;
-    std::queue<TTabletId> DeleteTabletQueue;
+    struct TQueuedDelete {
+        TTabletId Tablet;
+        TInstant EnqueuedAt;
+    };
+    std::queue<TQueuedDelete> DeleteTabletQueue;
+    std::queue<TQueuedDelete> BackupDeleteQueue;
+    THashSet<TTabletId> QueuedDeletes;
+    THashMap<TTabletId, bool> ActiveDeletes; // true for a paced backup
+    ui32 ActiveBackupDeletes = 0;
+    TCountedLeakyBucket BackupDeleteQuota{};
+    bool DeleteQueueScheduled = false;
+    bool DeleteQuotaWakeupScheduled = false;
+
 
     TString BootStateBooting = "Booting";
     TString BootStateStarting = "Starting";
@@ -709,6 +722,7 @@ protected:
     void Handle(TEvPrivate::TEvCheckTabletNodeAlive::TPtr&);
     void HandleInit(TEvPrivate::TEvProcessBootQueue::TPtr&);
     void Handle(TEvPrivate::TEvProcessBootQueue::TPtr&);
+    void Handle(TEvPrivate::TEvProcessDeleteQueue::TPtr& ev);
     void Handle(TEvPrivate::TEvProcessPileDrains::TPtr&);
     void Handle(TEvPrivate::TEvPostponeProcessBootQueue::TPtr&);
     void Handle(TEvPrivate::TEvProcessDisconnectNode::TPtr&);
@@ -901,6 +915,12 @@ public:
     TDuration GetBalancerCooldown(EBalancerType balancerType) const;
     void UpdateObjectCount(const TLeaderTabletInfo& tablet, const TNodeInfo& node, i64 diff);
     ui64 GetObjectImbalance(TFullObjectId object);
+    ITransaction* CreateProcessDeleteQueue();
+    void ScheduleDeleteQueue();
+    void DrainDeleteQueue(NIceDb::TNiceDb& db, TSideEffects& sideEffects);
+    void StartPhysicalDelete(TLeaderTabletInfo& tablet, TSideEffects& sideEffects, TDuration waited = TDuration::Zero());
+    void ReleaseDeleteSlot(TTabletId tablet, bool completed);
+    void UpdateDeleteClassCounters(TInstant now);
     void BlockStorageForDelete(TTabletId tabletId, TSideEffects& sideEffects);
     void ProcessPendingStopTablet();
     void ProcessPendingResumeTablet();

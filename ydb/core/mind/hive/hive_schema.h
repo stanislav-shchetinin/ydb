@@ -100,6 +100,7 @@ struct Schema : NIceDb::Schema {
         struct StoppedByTenant : Column<124, NScheme::NTypeIds::Bool> {};
         struct NewAllowedDataCenterIds : Column<125, NScheme::NTypeIds::String> { using Type = NKikimrHive::TDataCentersGroup; };
         struct InitialBootPending : Column<128, NScheme::NTypeIds::Bool> { static constexpr bool Default = false; };
+        struct PacedDelete : Column<129, NScheme::NTypeIds::Bool> { static constexpr bool Default = false; };
         struct IsBackup : Column<126, NScheme::NTypeIds::Bool> { static constexpr bool Default = false; };
         struct ConfirmedStorageVersion : Column<127, NScheme::NTypeIds::Uint32> {
             static constexpr ui32 Default = Max<ui32>();
@@ -133,6 +134,7 @@ struct Schema : NIceDb::Schema {
             NewAllowedDataCenterIds,
             BalancerPolicy,
             StoppedByTenant,
+            PacedDelete,
             IsBackup,
             InitialBootPending,
             ConfirmedStorageVersion

@@ -28,6 +28,9 @@ public:
             {"replyStatus", NKikimrProto::EReplyStatus_Name(msg->Status)});
         TLeaderTabletInfo* tablet = Self->FindTabletEvenInDeleting(TabletId);
         if (tablet != nullptr) {
+            if (tablet->IsDeleting() && tablet->PacedDelete && !Self->ActiveDeletes.contains(TabletId)) {
+                return true;
+            }
             NIceDb::TNiceDb db(txc.DB);
             if (msg->Status == NKikimrProto::OK
                     || msg->Status == NKikimrProto::RACE
@@ -164,8 +167,7 @@ public:
                     {"replyStatus", NKikimrProto::EReplyStatus_Name(msg->Status)},
                     {"errorReason", msg->ErrorReason});
                 if (tablet->IsDeleting()) {
-                    --Self->DeleteTabletInProgress;
-                    Self->UpdateCounterTabletsDeleting();
+                    Self->ReleaseDeleteSlot(TabletId, false);
                 }
                 SideEffects.Schedule(TDuration::MilliSeconds(1000), new TEvHive::TEvInitiateBlockStorage(tablet->Id));
             }

@@ -58,6 +58,7 @@ JOIN_SRCS(
 JOIN_SRCS(
     all_process.cpp
     tx__process_boot_queue.cpp
+    tx__process_delete_queue.cpp
     tx__process_metrics.cpp
     tx__process_pending_operations.cpp
 )

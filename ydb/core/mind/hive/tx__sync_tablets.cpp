@@ -56,6 +56,15 @@ public:
                 }
             }
         }
+        auto waitingForDelete = [&](TFullTabletId id) {
+            const auto* tablet = Self->FindTabletEvenInDeleting(id.first, id.second);
+            if (tablet && tablet->GetLeader().PacedDelete && tablet->GetLeader().IsDeleting()
+                    && tablet->GetNode() == &node && !Self->ActiveDeletes.contains(id.first)) {
+                tabletsToRestart.erase(id);
+                return true;
+            }
+            return false;
+        };
         auto foundTablet = [&](TTabletInfo* tablet, const TString& state) {
             auto tabletId = tablet->GetFullTabletId();
             if (node.MatchesFilter(tablet->NodeFilter)) {
@@ -110,6 +119,9 @@ public:
         };
         for (const NKikimrLocal::TEvSyncTablets_TTabletInfo& ti : SyncTablets.GetInbootTablets()) {
             auto tabletId = std::pair<TTabletId, TFollowerId>(ti.GetTabletId(), ti.GetFollowerId());
+            if (waitingForDelete(tabletId)) {
+                continue;
+            }
             TTabletInfo* tablet = Self->FindTablet(tabletId);
             if (tablet) {
                 if (rejectUnexpectedTablet(*tablet, ti)) {
@@ -135,6 +147,9 @@ public:
         }
         for (const NKikimrLocal::TEvSyncTablets_TTabletInfo& ti : SyncTablets.GetOnlineTablets()) {
             auto tabletId = std::pair<TTabletId, TFollowerId>(ti.GetTabletId(), ti.GetFollowerId());
+            if (waitingForDelete(tabletId)) {
+                continue;
+            }
             TTabletInfo* tablet = Self->FindTablet(tabletId);
             if (tablet) {
                 if (rejectUnexpectedTablet(*tablet, ti)) {
