@@ -71,12 +71,27 @@ public:
 
 class TTxDeleteTablet : public TTxDeleteBase {
     TEvHive::TEvDeleteTablet::TPtr Event;
+    // Both legacy scalar constructors set TxId_Deprecated, including for tx id zero.
+    // A guarded delete can arrive after pacing is disabled or after Hive recovery.
+    bool IsGuarded() const {
+        const auto& record = Event->Get()->Record;
+        return record.TabletIDSize() && !record.HasTxId_Deprecated();
+    }
+
+    const bool Batch;
+    const TInstant ReceivedAt;
 
 public:
     TTxDeleteTablet(TEvHive::TEvDeleteTablet::TPtr& ev, THive* hive)
         : TTxDeleteBase(hive)
         , Event(ev)
+        , Batch(IsGuarded() && Event->Get()->Record.ShardLocalIdxSize() > 1)
+        , ReceivedAt(Batch ? TActivationContext::Now() : TInstant())
     {}
+
+    TTxType GetTxType() const override {
+        return Batch ? NHive::TXTYPE_DELETE_TABLET_BATCH : NHive::TXTYPE_DELETE_TABLET;
+    }
 
     void RespondToSender(NKikimrProto::EReplyStatus status, const NKikimrHive::TForwardRequest& forwardRequest = {}) {
         const NKikimrHive::TEvDeleteTablet& rec = Event->Get()->Record;
@@ -90,12 +105,73 @@ public:
         SideEffects.Send(Event->Sender, response.Release(), 0, Event->Cookie);
     }
 
+    // Resolve every identity and route before changing any tablet state.
+    void DeleteByIdentity(const NKikimrHive::TEvDeleteTablet& request, NIceDb::TNiceDb& db) {
+        const auto size = request.ShardLocalIdxSize();
+        if (!request.GetShardOwnerId() || !size || size != request.TabletIDSize()
+                || (Batch && size > Self->CurrentConfig.GetMaxDeleteTabletBatchSize())) {
+            return RespondToSender(NKikimrProto::ERROR);
+        }
+        THashSet<ui64> indices;
+        THashSet<TTabletId> ids;
+        NKikimrHive::TForwardRequest redirect;
+        size_t remote = 0;
+        for (size_t pos = 0; pos < size; ++pos) {
+            const ui64 idx = request.GetShardLocalIdx(pos);
+            const TTabletId id = request.GetTabletID(pos);
+            const TOwnerIdxType::TValueType owner(request.GetShardOwnerId(), idx);
+            if (!id || !indices.insert(idx).second || !ids.insert(id).second) {
+                return RespondToSender(NKikimrProto::ERROR);
+            }
+            if (const auto* tablet = Self->FindTabletEvenInDeleting(id)) {
+                if (!tablet->IsBackup || tablet->Owner != owner) {
+                    return RespondToSender(NKikimrProto::ERROR);
+                }
+                if (tablet->SeizedByChild || tablet->NeedToReleaseFromParent) {
+                    return RespondToSender(NKikimrProto::TRYLATER);
+                }
+            } else {
+                NKikimrHive::TForwardRequest next;
+                if (Self->CheckForForwardTabletRequest(id, next)) {
+                    if (redirect.HasHiveTabletId() && redirect.GetHiveTabletId() != next.GetHiveTabletId()) {
+                        return RespondToSender(NKikimrProto::ERROR);
+                    }
+                    redirect = next;
+                    ++remote;
+                }
+                // A missing local ID has already been removed. Its owner index may be reused.
+                continue;
+            }
+            // Validate the owner index of a local tablet before changing its state.
+            const auto byOwner = Self->OwnerToTablet.find(owner);
+            if (byOwner != Self->OwnerToTablet.end() && byOwner->second != id) {
+                return RespondToSender(NKikimrProto::ERROR);
+            }
+        }
+        if (remote) {
+            if (remote == size) {
+                return RespondToSender(NKikimrProto::INVALID_OWNER, redirect);
+            }
+            return RespondToSender(NKikimrProto::ERROR);
+        }
+        // A pending create may reuse the owner index and has no matching TabletID yet.
+        for (const TTabletId id : request.GetTabletID()) {
+            DeleteTablet(id, db);
+        }
+        RespondToSender(NKikimrProto::OK);
+    }
+
     bool Execute(TTransactionContext& txc, const TActorContext&) override {
         SideEffects.Reset(Self->SelfId());
         const NKikimrHive::TEvDeleteTablet& rec = Event->Get()->Record;
         YDB_LOG_DEBUG("THive::TTxDeleteTablet::Execute processing delete tablet request",
             {"logPrefix", GetLogPrefix()},
             {"request", rec.ShortDebugString()});
+        if (IsGuarded()) {
+            NIceDb::TNiceDb db(txc.DB);
+            DeleteByIdentity(rec, db);
+            return true;
+        }
         // resolving ownerid:owneridx to tabletids
         std::vector<TTabletId> tablets;
         tablets.reserve(rec.ShardLocalIdxSize());
@@ -170,6 +246,11 @@ public:
         YDB_LOG_DEBUG("THive::TTxDeleteTablet::Complete",
             {"logPrefix", GetLogPrefix()},
             {"sideEffects", SideEffects});
+        if (Batch) {
+            auto& counters = Self->TabletCounters->Percentile();
+            counters[NHive::COUNTER_DELETE_TABLET_BATCH_SIZE].IncrementFor(Event->Get()->Record.ShardLocalIdxSize());
+            counters[NHive::COUNTER_DELETE_TABLET_BATCH_DURATION_MS].IncrementFor((ctx.Now() - ReceivedAt).MilliSeconds());
+        }
         SideEffects.Complete(ctx, Self->Requests);
     }
 };
