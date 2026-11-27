@@ -593,6 +593,21 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         return tabletId;
     }
 
+    void WaitForHiveOwnerIndexRemoval(TTestActorRuntime& runtime, ui64 hive, ui64 owner, ui64 index) {
+        const auto edge = runtime.AllocateEdgeActor();
+        const auto deadline = runtime.GetCurrentTime() + TDuration::Seconds(10);
+        for (;;) {
+            runtime.SendToPipe(hive, edge, new TEvHive::TEvLookupTablet(owner, index), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+            if (reply->Get()->Record.GetStatus() == NKikimrProto::NODATA) {
+                return;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetStatus(), NKikimrProto::OK);
+            UNIT_ASSERT_C(runtime.GetCurrentTime() < deadline, "Hive did not remove the old owner index");
+            runtime.SimulateSleep(TDuration::MilliSeconds(10));
+        }
+    }
+
     bool SendDeleteTestTablet(TTestActorRuntime &runtime, ui64 hiveTablet,
             THolder<TEvHive::TEvDeleteTablet> ev, ui32 nodeIndex = 0,
             std::optional<NKikimrProto::EReplyStatus> expectedStatus = NKikimrProto::OK) {
@@ -2520,6 +2535,13 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         auto retry = createTablet1->Record;
         ui64 tabletId1 = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createTablet1), 0, true);
 
+        constexpr ui64 backupIndex = 42;
+        auto backup = MakeHolder<TEvHive::TEvCreateTablet>();
+        backup->Record = retry;
+        backup->Record.SetIsBackup(true);
+        backup->Record.SetOwnerIdx(backupIndex);
+        const ui64 migratedBackupId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(backup), 0, true);
+
         MakeSureTabletIsUp(runtime, tabletId1, 0); // tablet up in root hive
 
         int iterations = 0;
@@ -2607,6 +2629,36 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_CONFLICT), 1);
         UNIT_ASSERT_VALUES_EQUAL(GetCumulativeCounter(runtime, subHiveTablet, NHive::COUNTER_CREATE_BATCH_REPLAY_MATCHED), 1);
 
+        // The same owner can have shards in both Hives. Reject the mixed
+        // batch as a whole, then follow the redirect for the migrated key.
+        auto local = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, 44, TTabletTypes::Dummy, BINDED_CHANNELS);
+        local->Record.SetIsBackup(true);
+        const ui64 localTablet = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(local), 0, true);
+        auto remove = [&](ui64 target, const TVector<std::pair<ui64, ui64>>& shards) {
+            auto request = MakeHolder<TEvHive::TEvDeleteTablet>();
+            request->Record.SetShardOwnerId(testerTablet);
+            for (const auto& [index, id] : shards) {
+                request->Record.AddShardLocalIdx(index);
+                request->Record.AddTabletID(id);
+            }
+            runtime.SendToPipe(target, sender, request.Release(), 0, GetPipeConfigWithRetries());
+            return runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(handle)->Record;
+        };
+        UNIT_ASSERT_VALUES_EQUAL(remove(hiveTablet, {{44, localTablet}, {backupIndex, migratedBackupId}}).GetStatus(), NKikimrProto::ERROR);
+        MakeSureTabletIsUp(runtime, localTablet, 0);
+        MakeSureTabletIsUp(runtime, migratedBackupId, 0);
+        // A later root-local tablet can occupy the same owner index after migration.
+        // Route the old identity to its current Hive without touching the replacement.
+        auto replacement = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, backupIndex, TTabletTypes::Dummy, BINDED_CHANNELS);
+        const ui64 replacementId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(replacement), 0, true);
+        UNIT_ASSERT_VALUES_UNEQUAL(replacementId, migratedBackupId);
+        const auto moved = remove(hiveTablet, {{backupIndex, migratedBackupId}});
+        UNIT_ASSERT_VALUES_EQUAL(moved.GetStatus(), NKikimrProto::INVALID_OWNER);
+        UNIT_ASSERT_VALUES_EQUAL(moved.GetForwardRequest().GetHiveTabletId(), subHiveTablet);
+        UNIT_ASSERT_VALUES_EQUAL(remove(subHiveTablet, {{backupIndex, migratedBackupId}}).GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsUp(runtime, replacementId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(remove(hiveTablet, {{44, localTablet}}).GetStatus(), NKikimrProto::OK);
+
         if (!objectDomain) {
             // No IDs are available in the child Hive until its grant arrives.
             // Retrying the sparse subset must allocate each key exactly once.
@@ -2626,8 +2678,29 @@ Y_UNIT_TEST_SUITE(THiveTest) {
                 UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), NKikimrProto::TRYLATER);
             }
             runtime.WaitFor("child Hive sequence grant", [&] { return !sequences.empty(); });
+            // The migrated tablet is gone, but its ID still belongs to the child Hive.
+            // A delayed delete for that ID must leave the new scalar create at the same key queued.
+            WaitForHiveOwnerIndexRemoval(runtime, subHiveTablet, testerTablet, backupIndex);
+            const auto edge = runtime.AllocateEdgeActor();
+            const auto pipe = runtime.ConnectToPipe(subHiveTablet, edge, 0, GetPipeConfigWithRetries());
+            auto scalar = MakeHolder<TEvHive::TEvCreateTablet>();
+            scalar->Record = retry;
+            scalar->Record.ClearOwnerIdxs();
+            scalar->Record.SetOwnerIdx(backupIndex);
+            runtime.SendToPipe(pipe, edge, scalar.Release());
+            auto stale = MakeHolder<TEvHive::TEvDeleteTablet>();
+            stale->Record.SetShardOwnerId(testerTablet);
+            stale->Record.AddShardLocalIdx(backupIndex);
+            stale->Record.AddTabletID(migratedBackupId);
+            runtime.SendToPipe(pipe, edge, stale.Release());
+            const auto ack = runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge);
+            UNIT_ASSERT_VALUES_EQUAL(ack->Get()->Record.GetStatus(), NKikimrProto::OK);
             sequences.Stop().Unblock();
-            runtime.SimulateSleep(TDuration::MilliSeconds(100));
+            const auto fresh = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(edge);
+            UNIT_ASSERT_VALUES_EQUAL(fresh->Get()->Record.GetStatus(), NKikimrProto::OK);
+            UNIT_ASSERT_VALUES_EQUAL(fresh->Get()->Record.GetOwnerIdx(), backupIndex);
+            UNIT_ASSERT(fresh->Get()->Record.GetTabletID() && fresh->Get()->Record.GetTabletID() != migratedBackupId);
+            runtime.ClosePipe(pipe, edge, 0);
             const auto allocated = sendNew();
             UNIT_ASSERT_VALUES_EQUAL(allocated.ResultsSize(), 2);
             for (const auto& result : allocated.GetResults()) {
@@ -3623,6 +3696,95 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         runtime.SendToPipe(hiveTablet, sender, config.Release(), 0, GetPipeConfigWithRetries());
         TAutoPtr<IEventHandle> handle;
         runtime.GrabEdgeEventRethrow<NConsole::TEvConsole::TEvConfigNotificationResponse>(handle);
+    }
+
+    Y_UNIT_TEST(TestGuardedBatchDeleteIsAtomicAndReplayable) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.FeatureFlags.SetEnablePacedBackupExport(true);
+            app.HiveConfig.SetMaxDeleteTabletBatchSize(2);
+        });
+        const auto edge = runtime.AllocateEdgeActor();
+        const ui64 hive = MakeDefaultHiveID();
+        const ui64 owner = MakeTabletID(false, 1);
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hive, TTabletTypes::Hive), &CreateDefaultHive);
+        TVector<ui64> ids;
+        for (ui64 idx = 0; idx < 3; ++idx) {
+            auto create = MakeHolder<TEvHive::TEvCreateTablet>(owner, idx, TTabletTypes::Dummy, BINDED_CHANNELS);
+            create->Record.SetIsBackup(true);
+            ids.push_back(SendCreateTestTablet(runtime, hive, owner, std::move(create), 0, true));
+        }
+        auto remove = [&](std::initializer_list<ui64> indices, std::initializer_list<ui64> tablets) {
+            auto request = MakeHolder<TEvHive::TEvDeleteTablet>();
+            request->Record.SetShardOwnerId(owner);
+            for (auto index : indices) {
+                request->Record.AddShardLocalIdx(index);
+            }
+            for (auto tablet : tablets) {
+                request->Record.AddTabletID(tablet);
+            }
+            runtime.SendToPipe(hive, edge, request.Release(), 0, GetPipeConfigWithRetries());
+            return runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)->Get()->Record;
+        };
+        auto missingOwner = MakeHolder<TEvHive::TEvDeleteTablet>();
+        missingOwner->Record.AddShardLocalIdx(0);
+        missingOwner->Record.AddTabletID(ids[0]);
+        runtime.SendToPipe(hive, edge, missingOwner.Release(), 0, GetPipeConfigWithRetries());
+        const auto invalid = runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(invalid->Get()->Record.GetStatus(), NKikimrProto::ERROR);
+        auto ordinary = MakeHolder<TEvHive::TEvCreateTablet>(owner, 3, TTabletTypes::Dummy, BINDED_CHANNELS);
+        const ui64 ordinaryId = SendCreateTestTablet(runtime, hive, owner, std::move(ordinary), 0, true);
+        UNIT_ASSERT_VALUES_EQUAL(remove({}, {ids[0]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 3}, {ids[0], ordinaryId}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({3}, {ordinaryId}).GetStatus(), NKikimrProto::ERROR);
+        MakeSureTabletIsUp(runtime, ordinaryId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 1}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({2, 2}, {ids[1], ids[2]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 1}, {ids[0], ids[0]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 1}, {ids[0]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 1, 2}, {ids[0], ids[1], ids[2]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({17}, {ids[0]}).GetStatus(), NKikimrProto::ERROR);
+        for (auto tablet : ids) {
+            MakeSureTabletIsUp(runtime, tablet, 0);
+        }
+        auto oldDelete = MakeHolder<TEvHive::TEvDeleteTablet>(owner, 3, ordinaryId, 0);
+        runtime.SendToPipe(hive, edge, oldDelete.Release(), 0, GetPipeConfigWithRetries());
+        UNIT_ASSERT_VALUES_EQUAL(runtime.GrabEdgeEventRethrow<TEvHive::TEvDeleteTabletReply>(edge)->Get()->Record.GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsDown(runtime, ordinaryId, 0);
+
+        runtime.GetAppData().FeatureFlags.SetEnablePacedBackupExport(false);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 1}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::ERROR);
+        auto reply = remove({0, 2}, {ids[0], ids[2]});
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NKikimrProto::OK);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetShardOwnerId(), owner);
+        UNIT_ASSERT_VALUES_EQUAL(reply.ShardLocalIdxSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetShardLocalIdx(0), 0);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetShardLocalIdx(1), 2);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 2}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsDown(runtime, ids[0], 0);
+        MakeSureTabletIsDown(runtime, ids[2], 0);
+        RebootTablet(runtime, hive, edge);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 2}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsUp(runtime, ids[1], 0);
+        auto config = runtime.GetAppData().HiveConfig;
+        config.SetMaxDeleteTabletBatchSize(0);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 2}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0}, {ids[0]}).GetStatus(), NKikimrProto::OK);
+        WaitForHiveOwnerIndexRemoval(runtime, hive, owner, 0);
+        auto replacement = MakeHolder<TEvHive::TEvCreateTablet>(owner, 0, TTabletTypes::Dummy, BINDED_CHANNELS);
+        const ui64 replacementId = SendCreateTestTablet(runtime, hive, owner, std::move(replacement), 0, true);
+        UNIT_ASSERT_VALUES_UNEQUAL(replacementId, ids[0]);
+        // A retry for a physically deleted ID must finish even if the reply was lost
+        // and a new tablet has already claimed the same owner index.
+        UNIT_ASSERT_VALUES_EQUAL(remove({0}, {ids[0]}).GetStatus(), NKikimrProto::OK);
+        config.SetMaxDeleteTabletBatchSize(2);
+        ApplyHiveConfig(runtime, hive, edge, config);
+        UNIT_ASSERT_VALUES_EQUAL(remove({0, 2}, {ids[0], ids[2]}).GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsUp(runtime, replacementId, 0);
+        // The legacy owner-only request accepts a list and ignores missing keys.
+        UNIT_ASSERT_VALUES_EQUAL(remove({1, 99, 100}, {}).GetStatus(), NKikimrProto::OK);
+        MakeSureTabletIsDown(runtime, ids[1], 0);
     }
 
     Y_UNIT_TEST(TestCreateTabletBatch) {

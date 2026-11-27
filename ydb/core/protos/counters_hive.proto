@@ -172,6 +172,19 @@ enum EPercentileCounters {
         Ranges: { Value: 100 }, Ranges: { Value: 500 }, Ranges: { Value: 1000 },
         Ranges: { Value: 5000 }, Ranges: { Value: 30000 }, Ranges: { Value: 60000 }
     }];
+    COUNTER_DELETE_TABLET_BATCH_SIZE = 9 [(CounterOpts) = {
+        Name: "DeleteTabletBatchSize",
+        Ranges: { Value: 1 }, Ranges: { Value: 4 }, Ranges: { Value: 8 },
+        Ranges: { Value: 16 }, Ranges: { Value: 32 }, Ranges: { Value: 64 },
+        Ranges: { Value: 128 }, Ranges: { Value: 256 }
+    }];
+    COUNTER_DELETE_TABLET_BATCH_DURATION_MS = 10 [(CounterOpts) = {
+        Name: "DeleteTabletBatchDurationMs",
+        Ranges: { Value: 1 }, Ranges: { Value: 2 }, Ranges: { Value: 5 },
+        Ranges: { Value: 10 }, Ranges: { Value: 25 }, Ranges: { Value: 50 },
+        Ranges: { Value: 100 }, Ranges: { Value: 250 }, Ranges: { Value: 500 },
+        Ranges: { Value: 1000 }, Ranges: { Value: 5000 }
+    }];
 }
 
 enum ETxTypes {
@@ -255,4 +268,5 @@ enum ETxTypes {
     TXTYPE_REASSIGN_TABLETS = 77                          [(TxTypeOpts) = {Name: "TxReassignTablets"}];
     TXTYPE_CREATE_TABLET_BATCH = 78                       [(TxTypeOpts) = {Name: "TxCreateTabletBatch"}];
     TXTYPE_READ_INITIAL_BOOT = 79                         [(TxTypeOpts) = {Name: "TxReadInitialBoot"}];
+    TXTYPE_DELETE_TABLET_BATCH = 80                       [(TxTypeOpts) = {Name: "TxDeleteTabletBatch"}];
 }

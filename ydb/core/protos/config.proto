@@ -2989,6 +2989,7 @@ message THiveConfig {
     optional TBootAdmission OrdinaryInitialBoot = 102;
     optional TBootAdmission BackupInitialBoot = 103;
     optional uint32 RestartBootReservedPerNode = 104 [default = 1];
+    optional uint32 MaxDeleteTabletBatchSize = 105 [default = 32, (ParamDescription) = "Maximum number of tablet identities in one guarded delete request."];
     optional uint32 MaxCreateTabletBatchSize = 101 [default = 32, (ParamDescription) = "Maximum number of owner indices in a batched create-tablet request."];
 }
 

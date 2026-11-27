@@ -26,6 +26,14 @@ class TWorker : public TActorBootstrapped<TWorker> {
     THolder<IEventBase> Request;
     const TActorId PipeCache = MakePipePerNodeCacheID(EPipePerNodeCache::Leader);
 
+    THolder<TEvHive::TEvDeleteTablet> MakeBackupDelete(ui64 index, ui64 tabletId) const {
+        auto request = MakeHolder<TEvHive::TEvDeleteTablet>();
+        request->Record.SetShardOwnerId(ShardOwner);
+        request->Record.AddShardLocalIdx(index);
+        request->Record.AddTabletID(tabletId);
+        return request;
+    }
+
     void SendToHive(IEventBase* event) {
         Send(PipeCache, new TEvPipeCache::TEvForward(event, Hive, /* subscribe */ true));
     }
@@ -121,7 +129,7 @@ class TWorker : public TActorBootstrapped<TWorker> {
             return CleanupTargetMissing();
         }
         Step = EStep::Delete;
-        SendToHive(new TEvHive::TEvDeleteTablet(ShardOwner, tablet.GetTabletOwner().GetOwnerIdx(), tablet.GetTabletID(), 0));
+        SendToHive(MakeBackupDelete(tablet.GetTabletOwner().GetOwnerIdx(), tablet.GetTabletID()).Release());
     }
 
     void Handle(TEvHive::TEvDeleteTabletReply::TPtr& ev) {
@@ -205,7 +213,7 @@ public:
         Expected.insert(target.OwnerIdx);
         if (target.TabletId) {
             Step = EStep::Delete;
-            Request = MakeHolder<TEvHive::TEvDeleteTablet>(ShardOwner, target.OwnerIdx, target.TabletId, 0);
+            Request = MakeBackupDelete(target.OwnerIdx, target.TabletId);
         } else {
             // Verify ownership when the create reply was lost before the export persisted it.
             Step = EStep::Lookup;
