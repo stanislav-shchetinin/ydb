@@ -545,6 +545,9 @@ enum ECumulativeCounters {
     COUNTER_BACKUP_CREATE_SPARSE_BATCHES = 158 [(CounterOpts) = {Name: "BackupCreate/SparseRequests"}];
     COUNTER_PREPARE_COPY_READY = 159 [(CounterOpts) = {Name: "PrepareCopyTable/Ready"}];
     COUNTER_PREPARE_COPY_BOOT_CHECKS = 160 [(CounterOpts) = {Name: "PrepareCopyTable/BootChecks"}];
+    COUNTER_COPY_PREPARED_REUSED = 161 [(CounterOpts) = {Name: "CopyTable/PreparedReused"}];
+    COUNTER_COPY_UNUSED_RELEASED = 162 [(CounterOpts) = {Name: "CopyTable/UnusedReleased"}];
+    COUNTER_COPY_ADDITIONAL_CREATED = 163 [(CounterOpts) = {Name: "CopyTable/AdditionalCreated"}];
 }
 
 enum EPercentileCounters {
@@ -720,6 +723,20 @@ enum EPercentileCounters {
         Ranges: { Value: 1024000 Name: "1024 s" }
     }];
     COUNTER_BACKUP_CREATE_ATTEMPT_TIME_US = 10 [(CounterOpts) = {Name: "BackupCreate/AttemptTimeUs"}];
+    COUNTER_BACKUP_COPY_DURATION_MS = 11 [(CounterOpts) = {
+        Name: "CopyTable/DurationMs"
+        Ranges: { Value: 1       Name: "1 ms" }
+        Ranges: { Value: 4       Name: "4 ms" }
+        Ranges: { Value: 16      Name: "16 ms" }
+        Ranges: { Value: 64      Name: "64 ms" }
+        Ranges: { Value: 250     Name: "250 ms" }
+        Ranges: { Value: 1000    Name: "1 s" }
+        Ranges: { Value: 4000    Name: "4 s" }
+        Ranges: { Value: 16000   Name: "16 s" }
+        Ranges: { Value: 64000   Name: "64 s" }
+        Ranges: { Value: 256000  Name: "256 s" }
+        Ranges: { Value: 1024000 Name: "1024 s" }
+    }];
 }
 
 enum ETxTypes {

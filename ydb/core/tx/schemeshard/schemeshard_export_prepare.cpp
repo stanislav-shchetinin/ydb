@@ -423,6 +423,9 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
             const auto& deleted = result.DeleteReply;
             auto& slot = *batch.MutableTablets(work->Offsets.front());
             if (deleted.GetStatus() == NKikimrProto::OK) {
+                if (info.State == TExportInfo::EState::ReleasingUnusedTablets) {
+                    Self->TabletCounters->Cumulative()[COUNTER_COPY_UNUSED_RELEASED].Increment(1);
+                }
                 slot.SetState(TBatch::Deleted);
             } else if (deleted.GetStatus() == NKikimrProto::INVALID_OWNER && deleted.GetForwardRequest().GetHiveTabletId()) {
                 slot.SetHive(deleted.GetForwardRequest().GetHiveTabletId());
