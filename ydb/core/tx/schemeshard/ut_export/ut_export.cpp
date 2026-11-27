@@ -2675,6 +2675,148 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         UNIT_ASSERT(copying);
     }
 
+    Y_UNIT_TEST_TWIN(PacedCopyReusesPreparedTabletsAfterRepartition, Split) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        using TResult = NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult;
+        TBlockEvents<TResult> prepared(Runtime(), [](const auto& ev) {
+            const auto& reply = ev->Get()->Reply;
+            return reply.ResultsSize() && !reply.GetResults(0).HasInitialBootPending();
+        });
+        TVector<NKikimrHive::TEvCreateTablet> creates;
+        auto observer = Runtime().template AddObserver<TEvHive::TEvCreateTablet>([&](auto& ev) {
+            if (ev->Get()->Record.GetIsBackup()) {
+                creates.push_back(ev->Get()->Record);
+            }
+        });
+        TBlockEvents<TEvHive::TEvCreateTabletReply> extraReply(Runtime(), [&](const auto& ev) {
+            const auto& reply = ev->Get()->Record;
+            return Split && creates.size() == 2 && !creates.back().HasCount()
+                && reply.GetOwner() == creates.back().GetOwner()
+                && reply.GetOwnerIdx() == creates.back().GetOwnerIdx();
+        });
+        const auto id = StartCompletionMarkerExport(false);
+        Runtime().WaitFor("Backup tablets created", [&] { return !prepared.empty(); });
+        const auto& result = prepared.front()->Get()->Reply;
+        UNIT_ASSERT_VALUES_EQUAL(result.ResultsSize(), 2);
+        THashSet<ui64> reserved;
+        for (const auto& entry : result.GetResults()) {
+            reserved.insert(entry.GetTabletID());
+        }
+        const auto source = GetTableShards(Runtime(), TTestTxConfig::SchemeShard, "/MyRoot/Table");
+        UNIT_ASSERT_VALUES_EQUAL(source.size(), 2);
+        TStringBuilder request;
+        request << "SourceTabletId: " << source[0];
+        if (Split) {
+            request << " SplitBoundary { KeyPrefix { Tuple { Optional { Uint32: 10 } } } }";
+        } else {
+            TestAlterTable(Runtime(), 102, "/MyRoot", R"(
+                Name: "Table"
+                PartitionConfig { PartitioningPolicy { MinPartitionsCount: 1 } }
+            )");
+            Env().TestWaitNotification(Runtime(), 102);
+            request << " SourceTabletId: " << source[1];
+        }
+        TestSplitTable(Runtime(), 103, "/MyRoot/Table", request);
+        Env().TestWaitNotification(Runtime(), 103);
+        prepared.Stop().Unblock();
+        ui64 extraTabletId = 0;
+        if (Split) {
+            Runtime().WaitFor("Hive allocated the additional backup tablet", [&] { return !extraReply.empty(); });
+            extraTabletId = extraReply.front()->Get()->Record.GetTabletID();
+            UNIT_ASSERT(extraTabletId);
+            UNIT_ASSERT(!reserved.contains(extraTabletId));
+            extraReply.Stop().clear();
+            RebootTablet(Runtime(), TTestTxConfig::SchemeShard, Runtime().AllocateEdgeActor());
+        }
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(id);
+        UNIT_ASSERT_VALUES_EQUAL(creates.size(), Split ? 3 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(creates.front().GetCount(), 2);
+        if (Split) {
+            UNIT_ASSERT(!creates[1].HasCount() && !creates[2].HasCount());
+            UNIT_ASSERT_VALUES_EQUAL(creates[1].GetOwner(), creates[2].GetOwner());
+            UNIT_ASSERT_VALUES_EQUAL(creates[1].GetOwnerIdx(), creates[2].GetOwnerIdx());
+            UNIT_ASSERT_VALUES_EQUAL(creates[1].GetObjectId(), creates[2].GetObjectId());
+        }
+        const auto& tablets = Env().GetHiveState()->Tablets;
+        if (Split) {
+            const auto key = std::make_pair(creates.back().GetOwner(), creates.back().GetOwnerIdx());
+            UNIT_ASSERT_VALUES_EQUAL(tablets.at(key).TabletId, extraTabletId);
+        }
+        size_t reused = 0;
+        size_t liveBackup = 0;
+        for (const auto& [owner, tablet] : tablets) {
+            if (tablet.IsBackup && tablet.ObjectId == creates.front().GetObjectId()) {
+                ++liveBackup;
+                reused += reserved.contains(tablet.TabletId);
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(liveBackup, Split ? 3 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(reused, Split ? 2 : 1);
+    }
+
+    Y_UNIT_TEST(PacedCopyReplacesTabletsWithObsoleteChannelBindings) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().FeatureFlags.SetEnableExportAutoDropping(false);
+        TestCreateTable(Runtime(), 100, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32" }
+            Columns { Name: "value" Type: "Utf8" }
+            KeyColumnNames: ["key"]
+            UniformPartitionsCount: 2
+            PartitionConfig {
+                ColumnFamilies { Id: 0 StorageConfig {
+                    SysLog { PreferredPoolKind: "pool-kind-1" }
+                    Log { PreferredPoolKind: "pool-kind-1" }
+                    Data { PreferredPoolKind: "pool-kind-1" }
+                } }
+            }
+        )");
+        Env().TestWaitNotification(Runtime(), 100);
+        using TResult = NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult;
+        TBlockEvents<TResult> created(Runtime(), [](const auto& ev) {
+            const auto& reply = ev->Get()->Reply;
+            return reply.ResultsSize() && !reply.GetResults(0).HasInitialBootPending();
+        });
+        TestExport(Runtime(), 101, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+                endpoint: "localhost:%d" scheme: HTTP
+                items { source_path: "/MyRoot/Table" destination_prefix: "backup/table" }
+            }
+        )", S3Port()));
+        Runtime().WaitFor("Original backup tablets created", [&] { return !created.empty(); });
+        THashSet<ui64> reserved;
+        for (const auto& result : created.front()->Get()->Reply.GetResults()) {
+            reserved.insert(result.GetTabletID());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(reserved.size(), 2);
+        TestAlterTable(Runtime(), 102, "/MyRoot", R"(
+            Name: "Table"
+            PartitionConfig { ColumnFamilies { Name: "default" StorageConfig {
+                Data { PreferredPoolKind: "pool-kind-2" }
+            } } }
+        )");
+        Env().TestWaitNotification(Runtime(), 102);
+        created.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), 101);
+        TestGetExport(Runtime(), 101, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(101);
+        size_t backupTablets = 0;
+        for (const auto& [owner, tablet] : Env().GetHiveState()->Tablets) {
+            UNIT_ASSERT(!reserved.contains(tablet.TabletId));
+            if (tablet.IsBackup) {
+                ++backupTablets;
+                UNIT_ASSERT(std::ranges::any_of(tablet.BoundChannels, [](const auto& binding) {
+                    return binding.GetStoragePoolName() == "pool-2";
+                }));
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(backupTablets, 2);
+    }
+
     Y_UNIT_TEST(PacedCopyRetriesFailedIndicesAndReusesTablets) {
         Env();
         Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);

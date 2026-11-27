@@ -243,6 +243,9 @@ bool TCreateParts::HandleReply(TEvHive::TEvCreateTabletReply::TPtr& ev, TOperati
     }
 
     if (shardInfo.TabletID == InvalidTabletId) {
+        if (txState.TxType == TTxState::TxCopyTable && NExportPrepare::FindBatches(*context.SS, txState.TargetPathId)) {
+            context.SS->TabletCounters->Cumulative()[COUNTER_COPY_ADDITIONAL_CREATED].Increment(1);
+        }
         switch (shardInfo.TabletType) {
         case ETabletType::DataShard:
             context.SS->TabletCounters->Simple()[COUNTER_TABLE_SHARD_ACTIVE_COUNT].Add(1);
@@ -361,6 +364,7 @@ bool TCreateParts::ProgressState(TOperationContext& context) {
                 Y_ABORT_UNLESS(mapping.TabletID == InvalidTabletId || mapping.TabletID == tablet);
                 if (mapping.TabletID == InvalidTabletId) {
                     mapping.TabletID = tablet;
+                    context.SS->TabletCounters->Cumulative()[COUNTER_COPY_PREPARED_REUSED].Increment(1);
                     context.SS->TabletIdToShardIdx[tablet] = shard.Idx;
                     context.SS->TabletCounters->Simple()[COUNTER_TABLE_SHARD_ACTIVE_COUNT].Add(1);
                     context.SS->PersistShardMapping(db, shard.Idx, tablet, mapping.PathId, OperationId.GetTxId(), mapping.TabletType);
@@ -506,6 +510,14 @@ bool TDone::Process(TOperationContext& context) {
                 auto storeInfo = context.SS->OlapStores.at(storePathId);
                 storeInfo->ColumnTablesUnderOperation.erase(pathId);
             }
+        }
+    }
+
+    if (txState->TxType == TTxState::TxCopyTable && context.SS->IsBackupTable(pathId)) {
+        const auto now = ::Now();
+        if (txState->StartTime != TInstant::Zero() && txState->StartTime <= now) {
+            context.SS->TabletCounters->Percentile()[COUNTER_BACKUP_COPY_DURATION_MS].IncrementFor(
+                (now - txState->StartTime).MilliSeconds());
         }
     }
 
@@ -1050,15 +1062,17 @@ TVector<TTableShardInfo> ApplyPartitioningCopyTable(const TShardInfo &templateDa
     ui64 count = dstPartitions.size();
     const auto* prepared = NExportPrepare::FindBatches(*ss, txState.TargetPathId);
     ui64 first = 0;
-    bool reuse = false;
+    ui64 reuse = 0;
     if (prepared && !prepared->empty()) {
         const auto& request = prepared->front().GetCreate();
         const auto& last = prepared->back().GetCreate();
         first = request.GetOwnerIdx();
         const ui64 available = last.GetOwnerIdx() - first + last.GetCount();
-        reuse = count == available && std::ranges::equal(
+        if (std::ranges::equal(
             templateDatashardInfo.BindedChannels, request.GetBindedChannels(),
-            [](const auto& left, const auto& right) { return left.SerializeAsString() == right.SerializeAsString(); });
+            [](const auto& left, const auto& right) { return left.SerializeAsString() == right.SerializeAsString(); })) {
+            reuse = std::min(count, available);
+        }
     }
     txState.Shards.reserve(count*2);
     for (ui64 i = 0; i < count; ++i) {
@@ -1069,7 +1083,7 @@ TVector<TTableShardInfo> ApplyPartitioningCopyTable(const TShardInfo &templateDa
         Y_ABORT_UNLESS(srcTabletId != InvalidTabletId);
         txState.Shards.emplace_back(srcShardIdx, ETabletType::DataShard, TTxState::ConfigureParts);
         // Destination shards need to be created, configured and then they will receive parts
-        auto idx = reuse
+        auto idx = i < reuse
             ? ss->RegisterShardInfo(TShardIdx(ss->TabletID(), TLocalShardIdx(first + i)), templateDatashardInfo)
             : ss->RegisterShardInfo(templateDatashardInfo);
         txState.Shards.emplace_back(idx, ETabletType::DataShard, TTxState::CreateParts);
