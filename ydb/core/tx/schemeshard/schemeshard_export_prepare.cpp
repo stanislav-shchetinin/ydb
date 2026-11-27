@@ -41,20 +41,20 @@ const TVector<TBatch>* FindBatches(const TSchemeShard& ss, TPathId pathId) {
     return nullptr;
 }
 
-TTabletId PreparedTablet(const TVector<TBatch>& batches, TShardIdx shardIdx) {
+const TBatch::TTablet* PreparedTablet(const TVector<TBatch>& batches, TShardIdx shardIdx) {
     const auto& first = batches.front().GetCreate();
     const ui64 index = ui64(shardIdx.GetLocalId());
     if (ui64(shardIdx.GetOwnerId()) != first.GetOwner() || index < first.GetOwnerIdx()) {
-        return InvalidTabletId;
+        return nullptr;
     }
     const ui64 offset = index - first.GetOwnerIdx();
     const ui64 batch = offset / first.GetCount();
     const ui32 slot = offset % first.GetCount();
     if (batch >= batches.size() || slot >= batches[batch].TabletsSize()) {
-        return InvalidTabletId;
+        return nullptr;
     }
-    const ui64 tablet = batches[batch].GetTablets(slot).GetTabletId();
-    return tablet ? TTabletId(tablet) : InvalidTabletId;
+    const auto& tablet = batches[batch].GetTablets(slot);
+    return tablet.GetTabletId() ? &tablet : nullptr;
 }
 
 bool ReserveTablets(TSchemeShard& ss, TExportInfo& info, NIceDb::TNiceDb& db, TString& error) {
@@ -197,7 +197,11 @@ void TDispatcher::QueueBatch(TSchemeShard& ss, const TKey& key, const TActorCont
     const auto [id, item, batch] = key;
     if (auto work = NextWork(ss, key)) {
         QueuedOrRunning.insert(key);
-        Queue[work->Hive].push_back(key);
+        if (work->Delete) {
+            ss.ShardDeleter.QueuePreparedCleanup(TTabletId(work->Hive), key, ss);
+        } else {
+            Queue[work->Hive].push_back(key);
+        }
     } else if (auto* remaining = Remaining.FindPtr(id)) {
         remaining->erase({item, batch});
     }
@@ -217,6 +221,26 @@ void TDispatcher::Begin(TSchemeShard& ss, ui64 id, const TActorContext& ctx) {
     Pump(ss, ctx);
 }
 
+bool TDispatcher::StartCleanup(TSchemeShard& ss, const TKey& key, ui64 hive, const TActorContext& ctx) {
+    const auto [id, item, batchIdx] = key;
+    auto work = NextWork(ss, key);
+    if (!work || !work->Delete || work->Hive != hive) {
+        QueuedOrRunning.erase(key);
+        ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batchIdx));
+        return false;
+    }
+    const auto& info = *ss.Exports.at(id);
+    const auto& batch = info.Items.at(item).PreparedTablets.at(batchIdx);
+    const auto& range = batch.GetCreate();
+    const ui32 offset = work->Offsets.front();
+    const auto worker = ctx.Register(CreateTabletCleanupRequest(ss.SelfId(), hive, {
+        .ShardOwner = range.GetOwner(), .OwnerIdx = range.GetOwnerIdx() + offset,
+        .ObjectId = range.GetObjectId(), .TabletId = batch.GetTablets(offset).GetTabletId(),
+        .CurrentHive = ui64(ss.ResolveHive(info.DomainPathId))}));
+    Workers.emplace(worker, std::move(*work));
+    return true;
+}
+
 void TDispatcher::Pump(TSchemeShard& ss, const TActorContext& ctx) {
     const ui32 limit = Max(1u, AppData()->SchemeShardConfig.GetMaxBackupCreateBatchesInFlightPerHive());
     TVector<TKey> redirected;
@@ -227,7 +251,7 @@ void TDispatcher::Pump(TSchemeShard& ss, const TActorContext& ctx) {
             const TKey key = queue.front();
             queue.pop_front();
             auto work = NextWork(ss, key);
-            if (!work || work->Hive != hive) {
+            if (!work || work->Delete || work->Hive != hive) {
                 QueuedOrRunning.erase(key);
                 redirected.push_back(key);
                 continue;
@@ -236,13 +260,7 @@ void TDispatcher::Pump(TSchemeShard& ss, const TActorContext& ctx) {
             const auto& batch = info.Items.at(work->Item).PreparedTablets.at(work->Batch);
             const auto& range = batch.GetCreate();
             IActor* request = nullptr;
-            if (work->Delete) {
-                const ui32 offset = work->Offsets.front();
-                request = CreateTabletCleanupRequest(ss.SelfId(), hive, {
-                    .ShardOwner = range.GetOwner(), .OwnerIdx = range.GetOwnerIdx() + offset,
-                    .ObjectId = range.GetObjectId(), .TabletId = batch.GetTablets(offset).GetTabletId(),
-                    .CurrentHive = ui64(ss.ResolveHive(info.DomainPathId))});
-            } else if (work->CheckBoot) {
+            if (work->CheckBoot) {
                 TVector<std::pair<ui64, ui64>> tablets;
                 for (ui32 offset : work->Offsets) {
                     tablets.emplace_back(range.GetOwnerIdx() + offset, batch.GetTablets(offset).GetTabletId());
@@ -270,6 +288,7 @@ void TDispatcher::Pump(TSchemeShard& ss, const TActorContext& ctx) {
             ++it;
         }
     }
+    ss.ShardDeleter.DispatchBackup(ss, ctx);
     for (const auto& [id, item, batch] : redirected) {
         ctx.Send(ss.SelfId(), new TEvPrivate::TEvDispatchPreparedTablets(id, item, batch));
     }
@@ -323,7 +342,9 @@ void TDispatcher::Finished(TSchemeShard& ss, const TActorId& actor, bool retry, 
         return;
     }
     const auto [id, item, batch] = TKey{work->ExportId, work->Item, work->Batch};
-    if (!--InFlight.at(work->Hive)) {
+    if (work->Delete) {
+        ss.ShardDeleter.ReleaseBackupSlot(TTabletId(work->Hive), ss);
+    } else if (!--InFlight.at(work->Hive)) {
         InFlight.erase(work->Hive);
     }
     if (!work->Delete && !work->CheckBoot) {
@@ -413,6 +434,10 @@ struct TSchemeShard::TExport::TTxPreparedTabletsResult : NTabletFlatExecutor::TT
         using TBatch = NExportPrepare::TBatch;
         using TEvent = TEvPrivate::TEvPreparedTabletsResult;
         const auto& result = *Event->Get();
+        if (result.SentDelete && work->Delete) {
+            Self->TabletCounters->Cumulative()[COUNTER_BACKUP_DELETE_REQUESTS].Increment(1);
+            Self->TabletCounters->Cumulative()[COUNTER_BACKUP_DELETE_ITEMS].Increment(1);
+        }
         TString failure;
         bool changed = !work->CheckBoot;
         if (result.Status == TEvent::EStatus::Retry) {

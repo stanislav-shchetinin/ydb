@@ -514,7 +514,7 @@ class TFakeHive : public TActor<TFakeHive>, public TTabletExecutedFlat {
                 State.Tablets.erase(it);
             }
         }
-        ctx.Send(ev->Sender, new TEvHive::TEvDeleteTabletReply(NKikimrProto::OK, TabletID(), rec.GetTxId_Deprecated(), rec.GetShardOwnerId(), localIds));
+        ctx.Send(ev->Sender, new TEvHive::TEvDeleteTabletReply(NKikimrProto::OK, TabletID(), rec.GetTxId_Deprecated(), rec.GetShardOwnerId(), localIds), 0, ev->Cookie);
     }
 
     void Handle(TEvHive::TEvDeleteOwnerTablets::TPtr &ev, const TActorContext &ctx) {

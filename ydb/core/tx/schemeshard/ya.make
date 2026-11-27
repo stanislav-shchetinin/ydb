@@ -331,6 +331,7 @@ SRCS(
     schemeshard_set_column_constraint__get.cpp
     schemeshard_set_column_constraint__list.cpp
     schemeshard_set_column_constraint__progress.cpp
+    schemeshard_backup_shard_deleter.cpp
     schemeshard_shard_deleter.cpp
     schemeshard_shard_deleter.h
     schemeshard_subop_state_types.cpp

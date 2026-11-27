@@ -10,6 +10,7 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/base/tablet_pipe.h>
+#include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/kesus/tablet/events.h>
 #include <ydb/core/metering/metering.h>
 #include <ydb/core/protos/s3_settings.pb.h>
@@ -28,6 +29,7 @@
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/local_indexes.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/mon_helpers.h>
+#include <ydb/core/tx/schemeshard/ut_helpers/schemeshard_counters.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/ut_backup_restore_common.h>
 #include <ydb/core/wrappers/s3_wrapper.h>
 #include <ydb/core/wrappers/ut_helpers/s3_mock.h>
@@ -505,6 +507,92 @@ namespace {
                 Env().TestWaitNotification(Runtime(), exportId);
                 TestGetExport(Runtime(), exportId, "/MyRoot", Ydb::StatusIds::NOT_FOUND);
             }
+        }
+
+        ui64 StartCompletionMarkerExportWithDeleteBacklog(TBlockEvents<TEvHive::TEvDeleteTabletReply>& initial) {
+            THashSet<ui64> offline;
+            auto states = Runtime().AddObserver<TEvDataShard::TEvStateChanged>([&](const auto& ev) {
+                if (ev->Get()->Record.GetState() == NKikimr::NDataShard::TShardState::Offline) {
+                    offline.insert(ev->Get()->Record.GetTabletId());
+                }
+            });
+            const auto id = StartCompletionMarkerExport(true, 3);
+            Runtime().WaitFor("All backup shards reported Offline", [&] {
+                return offline.size() == 3 && !initial.empty();
+            });
+            // Offline notifications commit separately. Hold the first acknowledgement
+            // while the remaining two deletions enter the queue behind the occupied slot.
+            Runtime().SimulateSleep(TDuration::MilliSeconds(100));
+            UNIT_ASSERT_VALUES_EQUAL(initial.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(initial.front()->Get()->Record.ShardLocalIdxSize(), 1);
+            return id;
+        }
+
+        void CheckPacedDeleteRetries(bool loseReply, bool missingStatus, bool disableBeforeRecovery = false) {
+            Env();
+            Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+            Runtime().GetAppData().SchemeShardConfig.SetMaxBackupDeleteBatchesInFlightPerHive(1);
+            TBlockEvents<TEvHive::TEvDeleteTabletReply> initial(Runtime(), [](const auto& ev) {
+                return ev->Cookie != 0;
+            });
+            const auto id = StartCompletionMarkerExportWithDeleteBacklog(initial);
+            TVector<NKikimrHive::TEvDeleteTablet> sent;
+            auto requests = Runtime().AddObserver<TEvHive::TEvDeleteTablet>([&](const auto& ev) {
+                if (ev->Cookie) {
+                    sent.push_back(ev->Get()->Record);
+                }
+            });
+            TBlockEvents<TEvHive::TEvDeleteTabletReply> first(Runtime(), [](const auto& ev) {
+                return ev->Cookie && ev->Get()->Record.ShardLocalIdxSize() == 2;
+            });
+            initial.Stop().Unblock();
+            Runtime().WaitFor("Hive accepted both backup shard deletions", [&] { return !first.empty(); });
+            UNIT_ASSERT_VALUES_EQUAL(sent.size(), 1);
+            const auto original = sent.front();
+            UNIT_ASSERT_VALUES_EQUAL(original.ShardLocalIdxSize(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(original.TabletIDSize(), 2);
+            UNIT_ASSERT_UNEQUAL(original.GetTabletID(0), original.GetTabletID(1));
+            first.Stop();
+            if (loseReply) {
+                if (disableBeforeRecovery) {
+                    Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(false);
+                }
+                // A new SchemeShard has only the persistent origin, shard and tablet IDs.
+                RebootTablet(Runtime(), TTestTxConfig::SchemeShard, Runtime().AllocateEdgeActor());
+            } else {
+                auto& reply = first.front()->Get()->Record;
+                if (missingStatus) {
+                    // An absent proto2 status reads as OK; it does not confirm deletion.
+                    reply.ClearStatus();
+                } else {
+                    reply.SetShardLocalIdx(1, reply.GetShardLocalIdx(0));
+                }
+            }
+            first.Unblock();
+            Runtime().WaitFor("resubmitted unacknowledged delete identities", [&] {
+                return sent.size() >= (loseReply && !disableBeforeRecovery ? 2u : 3u);
+            });
+            THashMap<ui64, ui64> originalIds;
+            for (size_t n = 0; n < 2; ++n) {
+                originalIds[original.GetShardLocalIdx(n)] = original.GetTabletID(n);
+            }
+            THashSet<ui64> retried;
+            for (size_t n = 1; n < sent.size(); ++n) {
+                const auto& req = sent[n];
+                UNIT_ASSERT(!req.HasTxId_Deprecated());
+                if (!loseReply || disableBeforeRecovery) {
+                    UNIT_ASSERT_VALUES_EQUAL(req.ShardLocalIdxSize(), 1);
+                }
+                UNIT_ASSERT_VALUES_EQUAL(req.GetShardOwnerId(), original.GetShardOwnerId());
+                for (size_t pos = 0; pos < req.ShardLocalIdxSize(); ++pos) {
+                    UNIT_ASSERT_VALUES_EQUAL(originalIds.at(req.GetShardLocalIdx(pos)), req.GetTabletID(pos));
+                    retried.insert(req.GetShardLocalIdx(pos));
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(retried.size(), 2);
+            Env().TestWaitNotification(Runtime(), id);
+            TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+            CheckCompletionMarkerContents(id);
         }
 
         void CheckCompletionMarkerContents(ui64 exportId) {
@@ -2884,6 +2972,240 @@ Y_UNIT_TEST_SUITE_F(TExportToS3Tests, TExportFixture) {
         } else {
             UNIT_ASSERT_VALUES_EQUAL(creates[0].SerializeAsString(), creates[1].SerializeAsString());
         }
+    }
+
+    Y_UNIT_TEST_TWIN(PacedDeleteRetriesOnlyConfirmedBackupIdentities, LoseReply) {
+        CheckPacedDeleteRetries(LoseReply, false);
+    }
+
+    Y_UNIT_TEST(PacedDeleteRecoversAsGuardedSinglesWhenDisabled) {
+        CheckPacedDeleteRetries(true, false, true);
+    }
+
+    Y_UNIT_TEST(PacedDeleteRequiresExplicitSuccess) {
+        CheckPacedDeleteRetries(false, true);
+    }
+
+    Y_UNIT_TEST_TWIN(PacedDeleteAcceptsDelayedAcknowledgement, SingleItem) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().HiveConfig.SetMaxDeleteTabletBatchSize(SingleItem ? 1 : 2);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupDeleteBatchesInFlightPerHive(1);
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> initial(Runtime(), [](const auto& ev) {
+            return !SingleItem && ev->Cookie != 0;
+        });
+        const auto exportId = SingleItem ? StartCompletionMarkerExport()
+            : StartCompletionMarkerExportWithDeleteBacklog(initial);
+        const ui64 initialCookie = initial.empty() ? 0 : initial.front()->Cookie;
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> replies(Runtime(), [&](const auto& ev) {
+            return ev->Cookie && ev->Cookie != initialCookie;
+        });
+        initial.Stop().Unblock();
+        // For singles the other shard now holds the only slot. For a batch two
+        // timeouts have expired. In both cases deliver only the first reply.
+        Runtime().WaitFor("Later guarded delete attempts reached Hive", [&] {
+            return replies.size() >= (SingleItem ? 2u : 3u);
+        });
+        const auto& first = replies.front()->Get()->Record;
+        const auto& second = replies[1]->Get()->Record;
+        UNIT_ASSERT_VALUES_EQUAL(first.ShardLocalIdxSize(), SingleItem ? 1u : 2u);
+        if (SingleItem) {
+            UNIT_ASSERT_UNEQUAL(first.GetShardLocalIdx(0), second.GetShardLocalIdx(0));
+        }
+        const auto edge = Runtime().AllocateEdgeActor();
+        TSet<TShardIdx> expected;
+        TSet<TShardIdx> observed;
+        auto notifications = Runtime().template AddObserver<TEvPrivate::TEvNotifyShardDeleted>([&](const auto& ev) {
+            if (ev->Recipient == edge) {
+                observed.insert(ev->Get()->ShardIdx);
+            }
+        });
+        for (auto index : first.GetShardLocalIdx()) {
+            const TShardIdx shard(first.GetShardOwnerId(), index);
+            expected.insert(shard);
+            ForwardToTablet(Runtime(), TTestTxConfig::SchemeShard, edge,
+                new TEvPrivate::TEvSubscribeToShardDeletion(shard));
+        }
+        Runtime().SimulateSleep(TDuration::MilliSeconds(100));
+        UNIT_ASSERT(observed.empty());
+        replies.Unblock(1);
+        Runtime().SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(observed == expected);
+        replies.Stop().Unblock();
+        Env().TestWaitNotification(Runtime(), exportId);
+        TestGetExport(Runtime(), exportId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(exportId);
+    }
+
+    Y_UNIT_TEST(PacedDeleteRoutesOnlyMigratedBackupShardToChildHive) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupDeleteBatchesInFlightPerHive(1);
+        const ui64 rootHive = TTestTxConfig::Hive;
+        auto root = Env().GetHiveState();
+        const ui64 childHive = root->AllocateTabletId();
+        TFakeHiveState::TPtr child = new TFakeHiveState();
+        BootFakeHive(Runtime(), childHive, child);
+
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> initial(Runtime(), [](const auto& ev) {
+            return ev->Cookie != 0;
+        });
+        const auto id = StartCompletionMarkerExportWithDeleteBacklog(initial);
+        using TForward = TEvPipeCache::TEvForward;
+        TBlockEvents<TForward> deletes(Runtime(), [](const auto& ev) {
+            return ev->Cookie && ev->Get()->Ev->Type() == TEvHive::EvDeleteTablet;
+        });
+        auto nextDelete = [&]() -> const NKikimrHive::TEvDeleteTablet& {
+            Runtime().WaitFor("SchemeShard forwarded a backup deletion", [&] { return !deletes.empty(); });
+            return static_cast<const TEvHive::TEvDeleteTablet&>(*deletes.front()->Get()->Ev).Record;
+        };
+        const auto edge = Runtime().AllocateEdgeActor();
+        auto rejectAtRoot = [&](NKikimrProto::EReplyStatus status, ui64 redirect = 0) {
+            auto& request = deletes.front();
+            UNIT_ASSERT_VALUES_EQUAL(request->Get()->TabletId, rootHive);
+            auto reply = MakeHolder<TEvHive::TEvDeleteTabletReply>(status, rootHive, nextDelete());
+            if (redirect) {
+                reply->Record.MutableForwardRequest()->SetHiveTabletId(redirect);
+            }
+            Runtime().Send(new IEventHandle(request->Sender, edge, reply.Release(), 0, request->Cookie), 0, true);
+            deletes.pop_front();
+        };
+
+        initial.Stop().Unblock();
+        const auto batch = nextDelete();
+        UNIT_ASSERT_VALUES_EQUAL(batch.ShardLocalIdxSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(batch.TabletIDSize(), 2);
+        const auto owner = batch.GetShardOwnerId();
+        const auto localKey = std::pair{owner, batch.GetShardLocalIdx(0)};
+        const auto movedKey = std::pair{owner, batch.GetShardLocalIdx(1)};
+        const auto localId = batch.GetTabletID(0);
+        const auto movedId = batch.GetTabletID(1);
+        UNIT_ASSERT_VALUES_EQUAL(root->TabletIdToOwner.at(localId), localKey);
+        UNIT_ASSERT_VALUES_EQUAL(root->TabletIdToOwner.at(movedId), movedKey);
+        UNIT_ASSERT(root->Tablets.at(localKey).IsBackup && root->Tablets.at(movedKey).IsBackup);
+        child->Tablets.emplace(movedKey, root->Tablets.at(movedKey));
+        child->TabletIdToOwner.emplace(movedId, movedKey);
+        root->Tablets.erase(movedKey);
+        root->TabletIdToOwner.erase(movedId);
+        rejectAtRoot(NKikimrProto::ERROR);
+
+        bool missingRoute = false;
+        bool redirected = false;
+        THashSet<ui64> delivered;
+        for (ui32 i = 0; i < 4; ++i) {
+            const auto& single = nextDelete();
+            UNIT_ASSERT_VALUES_EQUAL(single.ShardLocalIdxSize(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(single.TabletIDSize(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(single.GetShardOwnerId(), owner);
+            UNIT_ASSERT(!single.HasTxId_Deprecated());
+            const auto tablet = single.GetTabletID(0);
+            const auto target = deletes.front()->Get()->TabletId;
+            UNIT_ASSERT(tablet == localId || tablet == movedId);
+            UNIT_ASSERT_VALUES_EQUAL(single.GetShardLocalIdx(0), tablet == localId ? localKey.second : movedKey.second);
+            if (tablet == movedId && target == rootHive) {
+                UNIT_ASSERT(!redirected);
+                if (!missingRoute) {
+                    missingRoute = true;
+                    rejectAtRoot(NKikimrProto::INVALID_OWNER);
+                } else {
+                    redirected = true;
+                    rejectAtRoot(NKikimrProto::INVALID_OWNER, childHive);
+                }
+            } else {
+                UNIT_ASSERT_VALUES_EQUAL(target, tablet == localId ? rootHive : childHive);
+                UNIT_ASSERT(tablet == localId || redirected);
+                UNIT_ASSERT(delivered.insert(tablet).second);
+                deletes.Unblock(1);
+            }
+        }
+        UNIT_ASSERT(missingRoute && redirected);
+        UNIT_ASSERT_VALUES_EQUAL(delivered.size(), 2);
+        deletes.Stop();
+        Runtime().WaitFor("Both Hives removed their backup tablets", [&] {
+            return !root->Tablets.contains(localKey) && !child->Tablets.contains(movedKey);
+        });
+        Env().TestWaitNotification(Runtime(), id);
+        TestGetExport(Runtime(), id, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        CheckCompletionMarkerContents(id);
+    }
+
+    Y_UNIT_TEST_TWIN(PacedDeleteSharesWindowWithReservationCleanup, CancelFirst) {
+        Env();
+        Runtime().GetAppData().FeatureFlags.SetEnablePacedBackupExport(true);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupCreateBatchesInFlightPerHive(2);
+        Runtime().GetAppData().SchemeShardConfig.SetMaxBackupDeleteBatchesInFlightPerHive(1);
+        using TResult = NKikimr::NSchemeShard::TEvPrivate::TEvPreparedTabletsResult;
+        TBlockEvents<TResult> prepared(Runtime(), [](const auto& ev) {
+            return ev->Get()->Reply.ResultsSize() > 0;
+        });
+        const auto cancelled = StartCompletionMarkerExport(true, 1);
+        Runtime().WaitFor("First export created its reservation", [&] { return !prepared.empty(); });
+        prepared.Stop();
+        const auto reserved = prepared.front()->Get()->Reply.GetResults(0).GetTabletID();
+        UNIT_ASSERT(reserved);
+
+        TBlockEvents<TEvSchemeShard::TEvModifySchemeTransaction> drop(Runtime(), [](const auto& ev) {
+            return ev->Get()->Record.GetTransaction(0).GetOperationType() == NKikimrSchemeOp::ESchemeOpDropTable;
+        });
+        TestExport(Runtime(), 102, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+                endpoint: "localhost:%d" scheme: HTTP
+                items { source_path: "/MyRoot/Table" destination_prefix: "second" }
+            }
+        )", S3Port()));
+        Runtime().WaitFor("Second export is ready to drop its copy", [&] { return !drop.empty(); });
+
+        TVector<ui64> sent;
+        auto requests = Runtime().template AddObserver<TEvHive::TEvDeleteTablet>([&](const auto& ev) {
+            const auto& record = ev->Get()->Record;
+            if (record.TabletIDSize() && !record.HasTxId_Deprecated()) {
+                UNIT_ASSERT_VALUES_EQUAL(record.TabletIDSize(), 1);
+                sent.push_back(record.GetTabletID(0));
+            }
+        });
+        TBlockEvents<TEvHive::TEvDeleteTabletReply> replies(Runtime());
+        auto cancel = [&] {
+            TestCancelExport(Runtime(), 103, "/MyRoot", cancelled);
+            prepared.Unblock();
+        };
+        if (CancelFirst) {
+            cancel();
+        } else {
+            drop.Stop().Unblock();
+        }
+        Runtime().WaitFor("First deletion occupies the only slot", [&] { return !replies.empty(); });
+        UNIT_ASSERT_VALUES_EQUAL(sent.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sent.front() == reserved, CancelFirst);
+        if (CancelFirst) {
+            drop.Stop().Unblock();
+        } else {
+            cancel();
+        }
+        const auto deadline = Runtime().GetCurrentTime() + TDuration::Seconds(4);
+        while (!GetSimpleCounter(Runtime(), "SchemeShard/BackupDelete/QueuedItems")) {
+            UNIT_ASSERT_C(Runtime().GetCurrentTime() < deadline, "Second deletion did not queue before the retry");
+            Runtime().SimulateSleep(TDuration::MilliSeconds(10));
+        }
+        CheckSimpleCounter(Runtime(), "SchemeShard/BackupDelete/RequestsInFlight", 1);
+        UNIT_ASSERT_VALUES_EQUAL(sent.size(), 1);
+        replies.Stop().Unblock();
+        Runtime().WaitFor("Second deletion reached Hive", [&] { return sent.size() >= 2; });
+        Env().TestWaitNotification(Runtime(), cancelled);
+        Env().TestWaitNotification(Runtime(), 102);
+        TestGetExport(Runtime(), cancelled, "/MyRoot", Ydb::StatusIds::CANCELLED);
+        TestGetExport(Runtime(), 102, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_VALUES_EQUAL(sent.size(), 2);
+        UNIT_ASSERT_VALUES_UNEQUAL(sent[0], sent[1]);
+        UNIT_ASSERT_VALUES_EQUAL(sent.back() == reserved, !CancelFirst);
+        const auto drainedBy = Runtime().GetCurrentTime() + TDuration::Seconds(4);
+        while (GetSimpleCounter(Runtime(), "SchemeShard/BackupDelete/RequestsInFlight")) {
+            UNIT_ASSERT_C(Runtime().GetCurrentTime() < drainedBy, "A delete slot remained after both acks");
+            Runtime().SimulateSleep(TDuration::MilliSeconds(10));
+        }
+        for (const auto& [key, tablet] : Env().GetHiveState()->Tablets) {
+            UNIT_ASSERT(tablet.TabletId != sent[0] && tablet.TabletId != sent[1]);
+        }
+        CheckSimpleCounter(Runtime(), "SchemeShard/BackupDelete/QueuedItems", 0);
     }
 
     Y_UNIT_TEST(PacedCopySharesCreateWindowBetweenExports) {

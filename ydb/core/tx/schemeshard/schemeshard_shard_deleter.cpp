@@ -157,11 +157,11 @@ bool TShardDeleter::Has(TTabletId hiveTabletId, TActorId pipeClientActorId) cons
 }
 
 bool TShardDeleter::Has(TShardIdx shardIdx) const {
-    return ShardHive.contains(shardIdx);
+    return ShardHive.contains(shardIdx) || BackupShards.contains(shardIdx);
 }
 
 bool TShardDeleter::Empty() const {
-    return PerHiveDeletions.empty();
+    return PerHiveDeletions.empty() && BackupShards.empty();
 }
 
 }  // namespace

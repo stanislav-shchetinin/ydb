@@ -322,6 +322,8 @@ enum ESimpleCounters {
     COUNTER_PREPARE_COPY_PENDING_METADATA = 247 [(CounterOpts) = {Name: "PrepareCopyTable/PendingMetadata"}];
     COUNTER_BACKUP_CREATE_BATCHES_IN_FLIGHT = 248 [(CounterOpts) = {Name: "BackupCreate/RequestsInFlight"}];
     COUNTER_PREPARE_COPY_WAITING_BOOT = 249 [(CounterOpts) = {Name: "PrepareCopyTable/WaitingForBoot"}];
+    COUNTER_BACKUP_DELETE_IN_FLIGHT = 250 [(CounterOpts) = {Name: "BackupDelete/RequestsInFlight"}];
+    COUNTER_BACKUP_DELETE_QUEUED = 251 [(CounterOpts) = {Name: "BackupDelete/QueuedItems"}];
 }
 
 enum ECumulativeCounters {
@@ -548,6 +550,9 @@ enum ECumulativeCounters {
     COUNTER_COPY_PREPARED_REUSED = 161 [(CounterOpts) = {Name: "CopyTable/PreparedReused"}];
     COUNTER_COPY_UNUSED_RELEASED = 162 [(CounterOpts) = {Name: "CopyTable/UnusedReleased"}];
     COUNTER_COPY_ADDITIONAL_CREATED = 163 [(CounterOpts) = {Name: "CopyTable/AdditionalCreated"}];
+    COUNTER_BACKUP_DELETE_REQUESTS = 164 [(CounterOpts) = {Name: "BackupDelete/RequestsSent"}];
+    COUNTER_BACKUP_DELETE_ITEMS = 165 [(CounterOpts) = {Name: "BackupDelete/ItemsSent"}];
+    COUNTER_BACKUP_DELETE_FALLBACK = 166 [(CounterOpts) = {Name: "BackupDelete/SingleFallbacks"}];
 }
 
 enum EPercentileCounters {

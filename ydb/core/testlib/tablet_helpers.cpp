@@ -804,7 +804,7 @@ namespace NKikimr {
                 deletedIdx.push_back(rec.GetShardLocalIdx(i));
                 DeleteTablet(id, ctx);
             }
-            ctx.Send(ev->Sender, new TEvHive::TEvDeleteTabletReply(NKikimrProto::OK, TabletID(), rec.GetTxId_Deprecated(), rec.GetShardOwnerId(), deletedIdx));
+            ctx.Send(ev->Sender, new TEvHive::TEvDeleteTabletReply(NKikimrProto::OK, TabletID(), rec.GetTxId_Deprecated(), rec.GetShardOwnerId(), deletedIdx), 0, ev->Cookie);
         }
 
         void Handle(TEvHive::TEvDeleteOwnerTablets::TPtr &ev, const TActorContext &ctx) {

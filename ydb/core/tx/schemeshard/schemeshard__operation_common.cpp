@@ -244,6 +244,8 @@ bool TCreateParts::HandleReply(TEvHive::TEvCreateTabletReply::TPtr& ev, TOperati
 
     if (shardInfo.TabletID == InvalidTabletId) {
         if (txState.TxType == TTxState::TxCopyTable && NExportPrepare::FindBatches(*context.SS, txState.TargetPathId)) {
+            shardInfo.BackupHive = hive;
+            context.SS->PersistBackupHive(db, shardIdx, hive);
             context.SS->TabletCounters->Cumulative()[COUNTER_COPY_ADDITIONAL_CREATED].Increment(1);
         }
         switch (shardInfo.TabletType) {
@@ -358,12 +360,14 @@ bool TCreateParts::ProgressState(TOperationContext& context) {
             continue;
         }
         if (prepared) {
-            const auto tablet = NExportPrepare::PreparedTablet(*prepared, shard.Idx);
-            if (tablet != InvalidTabletId) {
+            if (const auto* slot = NExportPrepare::PreparedTablet(*prepared, shard.Idx)) {
+                const TTabletId tablet(slot->GetTabletId());
                 auto& mapping = context.SS->ShardInfos.at(shard.Idx);
                 Y_ABORT_UNLESS(mapping.TabletID == InvalidTabletId || mapping.TabletID == tablet);
                 if (mapping.TabletID == InvalidTabletId) {
                     mapping.TabletID = tablet;
+                    mapping.BackupHive = TTabletId(slot->GetHive());
+                    context.SS->PersistBackupHive(db, shard.Idx, mapping.BackupHive);
                     context.SS->TabletCounters->Cumulative()[COUNTER_COPY_PREPARED_REUSED].Increment(1);
                     context.SS->TabletIdToShardIdx[tablet] = shard.Idx;
                     context.SS->TabletCounters->Simple()[COUNTER_TABLE_SHARD_ACTIVE_COUNT].Add(1);

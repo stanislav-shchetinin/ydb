@@ -14,21 +14,22 @@ using namespace NTabletFlatExecutor;
 
 struct TSchemeShard::TTxDeleteTabletReply : public TSchemeShard::TRwTxBase {
     NKikimrProto::EReplyStatus Status = NKikimrProto::EReplyStatus::UNKNOWN;
-    TShardIdx ShardIdx = InvalidShardIdx;
-    TTabletId TabletId = InvalidTabletId;
+    const ui64 Cookie;
+    TVector<std::pair<TShardIdx, TTabletId>> Deleted;
     TTabletId HiveId = InvalidTabletId;
     TTabletId ForwardToHiveId = InvalidTabletId;
 
     TTxDeleteTabletReply(TSelf* self, TEvHive::TEvDeleteTabletReply::TPtr& ev)
         : TRwTxBase(self)
+        , Cookie(ev->Cookie)
     {
         const auto& record = ev->Get()->Record;
         Status = record.GetStatus();
         HiveId = TTabletId(record.GetOrigin());
 
-        Y_ABORT_UNLESS(record.HasShardOwnerId());
-        Y_ABORT_UNLESS(record.ShardLocalIdxSize() == 1);
-        ShardIdx = TShardIdx(record.GetShardOwnerId(), record.GetShardLocalIdx(0));
+        for (ui64 idx : record.GetShardLocalIdx()) {
+            Deleted.emplace_back(TShardIdx(record.GetShardOwnerId(), idx), InvalidTabletId);
+        }
 
         if (record.HasForwardRequest()) {
             ForwardToHiveId = TTabletId(record.GetForwardRequest().GetHiveTabletId());
@@ -39,28 +40,35 @@ struct TSchemeShard::TTxDeleteTabletReply : public TSchemeShard::TRwTxBase {
 
     void DoExecute(TTransactionContext &txc, const TActorContext &ctx) override {
         if (Status != NKikimrProto::OK) {
+            auto shardIdx = Deleted.front().first;
             if (Status == NKikimrProto::INVALID_OWNER) {
                 YDB_LOG_WARN_CTX(ctx, "Got DeleteTabletReply with Forward response from Hive",
                     {"hiveId", HiveId},
                     {"forwardToHiveId", ForwardToHiveId},
-                    {"shardIdx", ShardIdx},
+                    {"shardIdx", shardIdx},
                 );
                 Y_ABORT_UNLESS(ForwardToHiveId);
-                Self->ShardDeleter.RedirectDeleteRequest(HiveId, ForwardToHiveId, ShardIdx, Self->ShardInfos, ctx);
+                Self->ShardDeleter.RedirectDeleteRequest(HiveId, ForwardToHiveId, shardIdx, Self->ShardInfos, ctx);
                 return;
             }
             // WTF could happen that hive failed to delete the freaking tablet?
             YDB_LOG_ALERT_CTX(ctx, "Got DeleteTabletReply from Hive",
                 {"hiveId", HiveId},
-                {"shardIdx", ShardIdx},
+                {"shardIdx", shardIdx},
                 {"status", Status},
             );
             return;
         }
 
+        for (auto& [shardIdx, tabletId] : Deleted) {
+            ForgetShard(shardIdx, tabletId, txc, ctx);
+        }
+    }
+
+    void ForgetShard(TShardIdx shardIdx, TTabletId& tabletId, TTransactionContext& txc, const TActorContext& ctx) {
         // "Forget" the deleted shard
-        if (Self->ShardInfos.contains(ShardIdx)) {
-            auto tabletType = Self->ShardInfos[ShardIdx].TabletType;
+        if (Self->ShardInfos.contains(shardIdx)) {
+            auto tabletType = Self->ShardInfos[shardIdx].TabletType;
             switch (tabletType) {
             case ETabletType::DataShard:
                 Self->TabletCounters->Simple()[COUNTER_TABLE_SHARD_INACTIVE_COUNT].Sub(1);
@@ -142,76 +150,80 @@ struct TSchemeShard::TTxDeleteTabletReply : public TSchemeShard::TRwTxBase {
                 break;
             default:
                 Y_FAIL_S("Unknown TabletType"
-                         << ", ShardIdx " << ShardIdx
+                         << ", shardIdx " << shardIdx
                          << ", (ui32)TabletType" << (ui32)tabletType);
             };
 
-            auto& shardInfo = Self->ShardInfos.at(ShardIdx);
+            auto& shardInfo = Self->ShardInfos.at(shardIdx);
 
             auto pathId = shardInfo.PathId;
             auto it = Self->Tables.find(pathId);
             if (it != Self->Tables.end()) {
-                it->second->PerShardPartitionConfig.erase(ShardIdx);
+                it->second->PerShardPartitionConfig.erase(shardIdx);
             }
 
             NIceDb::TNiceDb db(txc.DB);
-            Self->PersistShardDeleted(db, ShardIdx, shardInfo.BindedChannels);
+            Self->PersistShardDeleted(db, shardIdx, shardInfo.BindedChannels);
 
             Y_VERIFY_S(Self->PathsById.contains(pathId), "pathid: " << pathId);
             auto path = Self->PathsById.at(pathId);
             path->DecShardsInside();
 
             auto domain = Self->ResolveDomainInfo(path);
-            domain->RemoveInternalShard(ShardIdx, Self);
+            domain->RemoveInternalShard(shardIdx, Self);
             switch (tabletType) {
             case ETabletType::SequenceShard:
-                domain->RemoveSequenceShard(ShardIdx);
+                domain->RemoveSequenceShard(shardIdx);
                 break;
             default:
                 break;
             }
 
-            TabletId = shardInfo.TabletID;
-            Self->TabletIdToShardIdx[TabletId] = ShardIdx;
+            tabletId = shardInfo.TabletID;
+            Self->TabletIdToShardIdx[tabletId] = shardIdx;
 
-            Self->ShardInfos.erase(ShardIdx);
+            Self->ShardInfos.erase(shardIdx);
 
             Self->DecrementPathDbRefCount(pathId, "shard deleted");
 
             // This is for tests, so it's kinda ok to reply from execute
-            auto itSubscribers = Self->ShardDeletionSubscribers.find(ShardIdx);
+            auto itSubscribers = Self->ShardDeletionSubscribers.find(shardIdx);
             if (itSubscribers != Self->ShardDeletionSubscribers.end()) {
                 for (const auto& subscriber : itSubscribers->second) {
-                    ctx.Send(subscriber, new TEvPrivate::TEvNotifyShardDeleted(ShardIdx));
+                    ctx.Send(subscriber, new TEvPrivate::TEvNotifyShardDeleted(shardIdx));
                 }
                 Self->ShardDeletionSubscribers.erase(itSubscribers);
             }
         } else {
             NIceDb::TNiceDb db(txc.DB);
-            Self->PersistUnknownShardDeleted(db, ShardIdx);
+            Self->PersistUnknownShardDeleted(db, shardIdx);
         }
 
-        Self->OnShardRemoved(ShardIdx);
+        Self->OnShardRemoved(shardIdx);
     }
 
     void DoComplete(const TActorContext &ctx) override {
-        if (Status == NKikimrProto::OK) {
-            YDB_LOG_DEBUG_CTX(ctx, "Deleted shardIdx",
-                {"shardIdx", ShardIdx},
-            );
-
-            Self->ShardDeleter.ShardDeleted(ShardIdx, ctx);
-
-            if (TabletId != InvalidTabletId) {
-                YDB_LOG_DEBUG_CTX(ctx, "Close pipe to deleted shardIdx",
-                    {"shardIdx", ShardIdx},
-                    {"tabletId", TabletId},
-                );
-                Self->PipeClientCache->ForceClose(ctx, ui64(TabletId));
+        if (Status != NKikimrProto::OK) {
+            return;
+        }
+        std::vector<TShardIdx> shredded;
+        const bool shred = Self->EnableShred && Self->TenantShredManager->GetStatus() == EShredStatus::IN_PROGRESS;
+        for (const auto& [shardIdx, tabletId] : Deleted) {
+            if (!Cookie) {
+                Self->ShardDeleter.ShardDeleted(shardIdx, ctx);
             }
-            if (Self->EnableShred && Self->TenantShredManager->GetStatus() == EShredStatus::IN_PROGRESS) {
-                Self->Execute(Self->CreateTxCancelShredShards({ShardIdx}));
+            if (tabletId != InvalidTabletId) {
+                Self->PipeClientCache->ForceClose(ctx, ui64(tabletId));
             }
+            if (shred) {
+                shredded.push_back(shardIdx);
+            }
+        }
+        if (!shredded.empty()) {
+            Self->Execute(Self->CreateTxCancelShredShards(shredded));
+        }
+        if (Cookie) {
+            Self->ShardDeleter.BackupCommitted(Cookie, *Self, ctx);
         }
     }
 };

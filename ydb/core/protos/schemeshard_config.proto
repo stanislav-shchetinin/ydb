@@ -50,4 +50,5 @@ message TSchemeShardConfig {
 
     // Shared by all paced exports from this SchemeShard to the same Hive.
     optional uint32 MaxBackupCreateBatchesInFlightPerHive = 12 [default = 2];
+    optional uint32 MaxBackupDeleteBatchesInFlightPerHive = 13 [default = 2];
 }
